@@ -86,7 +86,11 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 	_dtapeTask = dtape_task_create(parentProcess ? parentProcess->_dtapeTask : nullptr, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
 	_dtapeForkWaitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
 
-	processLog.info() << "New process created with ID " << _pid << " and NSID " << _nspid;
+	if (parentProcess) {
+		processLog.info() << *this << ": process created with parent " << *parentProcess << processLog.endLog;
+	} else {
+		processLog.info() << *this << ": process created without registered parent" << processLog.endLog;
+	}
 };
 
 DarlingServer::Process::Process(KernelProcessConstructorTag tag):
@@ -369,8 +373,11 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	} else {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
+			processLog.info() << *this << ": notifying fork parent " << *parent << " after checkin" << processLog.endLog;
 			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
+		} else {
+			processLog.info() << *this << ": checkin without registered fork parent" << processLog.endLog;
 		}
 	}
 };
@@ -399,8 +406,12 @@ bool DarlingServer::Process::waitForChildAfterFork() {
 	// this function is always called within a microthread
 	constexpr unsigned int forkWaitTimeoutSeconds = 30;
 
+	processLog.info() << *this << ": waiting up to " << forkWaitTimeoutSeconds
+			<< " seconds for fork child checkin" << processLog.endLog;
+
 	switch (dtape_semaphore_down_timeout(_dtapeForkWaitSemaphore, forkWaitTimeoutSeconds)) {
 		case dtape_semaphore_wait_result_ok:
+			processLog.info() << *this << ": fork child checkin observed" << processLog.endLog;
 			return true;
 		case dtape_semaphore_wait_result_interrupted:
 			return false;
