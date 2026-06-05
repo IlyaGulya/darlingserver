@@ -395,9 +395,23 @@ void DarlingServer::Process::unregisterKqchan(std::shared_ptr<Kqchan> kqchan) {
 	_kqchannels.erase(kqchan->_idForProcess());
 };
 
-void DarlingServer::Process::waitForChildAfterFork() {
+bool DarlingServer::Process::waitForChildAfterFork() {
 	// this function is always called within a microthread
-	dtape_semaphore_down_simple(_dtapeForkWaitSemaphore);
+	constexpr unsigned int forkWaitTimeoutSeconds = 30;
+
+	switch (dtape_semaphore_down_timeout(_dtapeForkWaitSemaphore, forkWaitTimeoutSeconds)) {
+		case dtape_semaphore_wait_result_ok:
+			return true;
+		case dtape_semaphore_wait_result_interrupted:
+			return false;
+		case dtape_semaphore_wait_result_timed_out:
+			processLog.error() << *this << ": timed out waiting " << forkWaitTimeoutSeconds
+					<< " seconds for fork child checkin" << processLog.endLog;
+			return false;
+		default:
+			processLog.error() << *this << ": failed while waiting for fork child checkin" << processLog.endLog;
+			return false;
+	}
 };
 
 void DarlingServer::Process::registerListeningKqchan(std::shared_ptr<Kqchan::Process> kqchan) {
