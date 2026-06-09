@@ -608,8 +608,17 @@ void DarlingServer::Server::start() {
 				// we don't need to lock anymore (and the following call might need to arm the timer again)
 				lock.unlock();
 
-				// dtape_timer_fired() calls duct-taped functions that may need to wait (briefly), so it needs to be called in a microthread
-				Thread::kernelAsync(dtape_timer_fired);
+				// Timer expiry cannot use the shared kernelAsync runner: a lost
+				// runner-semaphore wakeup would strand this one-shot timerfd and
+				// every timer still in the queue. Use a dedicated microthread and
+				// terminate it after delivery so its resources can be reclaimed.
+				auto timerThread = std::make_shared<Thread>(Thread::KernelThreadConstructorTag());
+				timerThread->registerWithProcess();
+				threadRegistry().registerEntry(timerThread, true);
+				timerThread->startKernelThread([timerThread]() {
+					dtape_timer_fired();
+					timerThread->terminate();
+				});
 			} else {
 				Monitor* monitor = static_cast<Monitor*>(event->data.ptr);
 				std::shared_ptr<Monitor> aliveMonitor = nullptr;
