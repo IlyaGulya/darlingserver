@@ -168,25 +168,26 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 		replyToSave.setAddress(requestMessage.address());
 
+		bool pending = false;
 		{
 			std::unique_lock lock(thread->_rwlock);
 			if (thread->_pendingCall && thread->_pendingCall->number() == Call::Number::InterruptEnter) {
 				// this means the client got interrupted after we had already sent a reply for the interrupted call,
 				// the client saw this unexpected reply while waiting for interrupt_enter to respond and sent it back to us,
-				// and we received both calls (interrupt_enter and push_reply) at the same time
+				// and we received both calls (interrupt_enter and push_reply) at the same time.
+				// _handleInterruptEnterForCurrentThread folds this into the deferred-reply FIFO.
 				thread->_pendingSavedReply = std::move(replyToSave);
+				pending = true;
 			} else {
-				if (thread->_interrupts.empty()) {
-					throw std::runtime_error("Client tried to push reply outside of interrupt");
-				}
-				if (thread->_interrupts.top().savedReply) {
-					throw std::runtime_error("Client-pushed reply overwriting existing saved reply");
-				}
-				thread->_interrupts.top().savedReply = std::move(replyToSave);
+				// Hold the pushed-back reply in the per-thread FIFO; it is flushed at the
+				// outermost interrupt_exit. A FIFO (rather than a single InterruptContext slot)
+				// is required because a signal storm can push back several replies across
+				// nested interrupts; the old single-slot scheme dropped/overwrote them.
+				thread->_deferredInterruptReplies.push(std::move(replyToSave));
 			}
 		}
 
-		callLog.debug() << *thread << ": Saved client-pushed reply (" << ((thread->_pendingSavedReply) ? "pending" : "normal") << ")" << callLog.endLog;
+		callLog.debug() << *thread << ": Saved client-pushed reply (" << (pending ? "pending" : "normal") << ")" << callLog.endLog;
 
 		// write a byte to the pipe so the caller can continue
 		write(pipeDesc, &tmp, sizeof(tmp));
@@ -761,14 +762,18 @@ void DarlingServer::Call::InterruptExit::processCall() {
 	{
 		std::unique_lock lock(thread->_rwlock);
 
-		auto tmp = std::move(thread->_interrupts.top());
-
 		thread->_interrupts.pop();
 
-		if (tmp.savedReply) {
-			callLog.debug() << *thread << ": Going to send saved reply" << callLog.endLog;
-			Server::sharedInstance().sendMessage(std::move(*tmp.savedReply));
-			tmp.savedReply = std::nullopt;
+		// Only once the interrupt stack is fully unwound is the client about to return to
+		// the original interrupted recvmsg, so only then may we release the deferred replies.
+		// Flushing at an inner interrupt_exit would deliver the interrupted call's reply into
+		// an outer signal handler's recvmsg (which has no PUSH_UNKNOWN handling) and desync.
+		if (thread->_interrupts.empty()) {
+			while (!thread->_deferredInterruptReplies.empty()) {
+				callLog.debug() << *thread << ": Going to send deferred interrupt reply" << callLog.endLog;
+				Server::sharedInstance().sendMessage(std::move(thread->_deferredInterruptReplies.front()));
+				thread->_deferredInterruptReplies.pop();
+			}
 		}
 	}
 };

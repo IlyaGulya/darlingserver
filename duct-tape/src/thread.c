@@ -162,6 +162,7 @@ void dtape_thread_destroy(dtape_thread_t* thread) {
 };
 
 void dtape_thread_entering(dtape_thread_t* thread) {
+	dtape_log_error("[PH] ENTERING dt=%p state=%x", thread, thread->xnu_thread.state);
 	// if the thread is entering, it cannot be waiting
 	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
 	thread->xnu_thread.state |= TH_RUN;
@@ -169,6 +170,7 @@ void dtape_thread_entering(dtape_thread_t* thread) {
 };
 
 void dtape_thread_exiting(dtape_thread_t* thread) {
+	dtape_log_error("[PH] EXITING dt=%p state=%x", thread, thread->xnu_thread.state);
 	thread->xnu_thread.state &= ~TH_RUN;
 };
 
@@ -524,6 +526,8 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 
 	thread_unlock(&thread->xnu_thread);
 
+	dtape_log_error("[PH] BLOCK dt=%p waiting=%d cont=%p state=%x", thread, (int)waiting, continuation, thread->xnu_thread.state);
+
 	if (waiting) {
 		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, NULL);
 	}
@@ -531,6 +535,8 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 	thread_lock(&thread->xnu_thread);
 	wait_result_t wait_result = thread->xnu_thread.wait_result;
 	thread_unlock(&thread->xnu_thread);
+
+	dtape_log_error("[PH] BLOCK_RESUMED dt=%p wait_result=%d state=%x", thread, (int)wait_result, thread->xnu_thread.state);
 
 	if (continuation) {
 		// TODO: we should add a thread hook to jump to a continuation without suspending
@@ -548,6 +554,7 @@ wait_result_t thread_block(thread_continue_t continuation) {
 // thread locked
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+	dtape_log_error("[PH] UNBLOCK dt=%p wresult=%d state=%x (TH_WAIT=%d)", thread, (int)wresult, thread->xnu_thread.state, (int)((thread->xnu_thread.state & TH_WAIT) != 0));
 	thread->xnu_thread.wait_result = wresult;
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;
@@ -560,6 +567,7 @@ kern_return_t thread_go(thread_t thread, wait_result_t wresult, waitq_options_t 
 
 wait_result_t thread_mark_wait_locked(thread_t thread, wait_interrupt_t interruptible_orig) {
 	dtape_stub_safe();
+	dtape_log_error("[PH] MARKWAIT dt=%p oldstate=%x", dtape_thread_for_xnu_thread(thread), thread->state);
 	thread->state = TH_WAIT;
 	thread->wait_result = THREAD_WAITING;
 	thread->block_hint = thread->pending_block_hint;

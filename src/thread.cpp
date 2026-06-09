@@ -1365,12 +1365,19 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 		_deactivateCallLocked(expectedCall);
 	}
 
+	// `_interruptedForSignal` is true only while _handleInterruptEnterForCurrentThread is
+	// running the interrupted call inline; a reply produced in that window belongs to the
+	// interrupted call and must not reach the client now (it is still inside its signal
+	// handler, draining the socket for interrupt_enter/sigprocess/interrupt_exit replies).
+	// Hold it in a FIFO and flush at the OUTERMOST interrupt_exit, when the client unwinds
+	// back to the original interrupted recvmsg.
+	//
+	// NOTE: we must NOT key on `!_interrupts.empty()` here: the interrupt_enter / sigprocess
+	// / interrupt_exit calls themselves generate replies while their interrupt context is
+	// still on the stack (with _interruptedForSignal already false). Those control-plane
+	// replies must go out immediately, or the client hangs waiting for interrupt_enter.
 	if (_interruptedForSignal) {
-		if (_interrupts.top().savedReply) {
-			throw std::runtime_error("New reply would overwrite existing saved reply");
-		}
-
-		_interrupts.top().savedReply = std::move(reply);
+		_deferredInterruptReplies.push(std::move(reply));
 	} else if (_deferReplyForS2C) {
 		_deferredReply = std::move(reply);
 	} else if (!_dead) {
@@ -1526,11 +1533,10 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 		std::unique_lock lock(currentThreadVar->_rwlock);
 
 		if (currentThreadVar->_pendingSavedReply) {
-			if (currentThreadVar->_interrupts.top().savedReply) {
-				throw std::runtime_error("Pending saved reply would overwrite saved reply");
-			}
-
-			currentThreadVar->_interrupts.top().savedReply = std::move(*currentThreadVar->_pendingSavedReply);
+			// interrupt_enter and the client's push_reply for the interrupted call arrived
+			// together; hold the pushed-back reply in the per-thread FIFO to be flushed at
+			// the outermost interrupt_exit.
+			currentThreadVar->_deferredInterruptReplies.push(std::move(*currentThreadVar->_pendingSavedReply));
 			currentThreadVar->_pendingSavedReply = std::nullopt;
 		}
 

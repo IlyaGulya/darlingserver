@@ -3,6 +3,7 @@
 #include <darlingserver/duct-tape/task.h>
 #include <darlingserver/duct-tape/thread.h>
 #include <darlingserver/duct-tape/hooks.internal.h>
+#include <darlingserver/duct-tape/log.h>
 
 #include <sys/proc.h>
 #include <sys/pthread_shims.h>
@@ -41,15 +42,24 @@ int dtape_psynch_cvsignal(uint64_t cv, uint64_t cvlsgen, uint32_t cvugen, int32_
 };
 
 int dtape_psynch_cvwait(uint64_t cv, uint64_t cvlsgen, uint32_t cvugen, uint64_t mutex, uint64_t mugen, uint32_t flags, int64_t sec, uint32_t nsec, uint32_t* retval) {
-	return _psynch_cvwait(current_proc(), cv, cvlsgen, cvugen, mutex, mugen, flags, sec, nsec, retval);
+	dtape_log_error("[PH] cvwait ENTER cv=%llx mutex=%llx", (unsigned long long)cv, (unsigned long long)mutex);
+	int _r = _psynch_cvwait(current_proc(), cv, cvlsgen, cvugen, mutex, mugen, flags, sec, nsec, retval);
+	dtape_log_error("[PH] cvwait RETURN cv=%llx res=%d retval=%x", (unsigned long long)cv, _r, retval ? *retval : 0);
+	return _r;
 };
 
 int dtape_psynch_mutexdrop(uint64_t mutex, uint32_t mgen, uint32_t ugen, uint64_t tid, uint32_t flags, uint32_t* retval) {
-	return _psynch_mutexdrop(current_proc(), mutex, mgen, ugen, tid, flags, retval);
+	dtape_log_error("[PH] mutexdrop ENTER mutex=%llx mgen=%x ugen=%x", (unsigned long long)mutex, mgen, ugen);
+	int _r = _psynch_mutexdrop(current_proc(), mutex, mgen, ugen, tid, flags, retval);
+	dtape_log_error("[PH] mutexdrop RETURN mutex=%llx res=%d retval=%x", (unsigned long long)mutex, _r, retval ? *retval : 0);
+	return _r;
 };
 
 int dtape_psynch_mutexwait(uint64_t mutex, uint32_t mgen, uint32_t ugen, uint64_t tid, uint32_t flags, uint32_t* retval) {
-	return _psynch_mutexwait(current_proc(), mutex, mgen, ugen, tid, flags, retval);
+	dtape_log_error("[PH] mutexwait ENTER mutex=%llx mgen=%x ugen=%x", (unsigned long long)mutex, mgen, ugen);
+	int _rw = _psynch_mutexwait(current_proc(), mutex, mgen, ugen, tid, flags, retval);
+	dtape_log_error("[PH] mutexwait RETURN mutex=%llx res=%d retval=%x", (unsigned long long)mutex, _rw, retval ? *retval : 0);
+	return _rw;
 };
 
 int dtape_psynch_rw_rdlock(uint64_t rwlock, uint32_t lgenval, uint32_t ugenval, uint32_t rw_wc, int32_t flags, uint32_t* retval) {
