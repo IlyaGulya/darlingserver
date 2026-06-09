@@ -558,9 +558,7 @@ _psynch_mutexdrop_internal(ksyn_wait_queue_t kwq, uint32_t mgen, uint32_t ugen,
 	uint32_t nextgen = (ugen + PTHRW_INC);
 	thread_t old_owner = THREAD_NULL;
 
-	dtape_log_error("[PH] mtxdrop_internal LOCKING kwq=%p mgen=%x ugen=%x firstfit=%d", kwq, mgen, ugen, firstfit);
 	ksyn_wqlock(kwq);
-	dtape_log_error("[PH] mtxdrop_internal LOCKED kwq=%p inqueue=%d prepost=%d", kwq, kwq->kw_inqueue, kwq->kw_prepost.count);
 	kwq->kw_lastunlockseq = (ugen & PTHRW_COUNT_MASK);
 
 redrive:
@@ -583,15 +581,12 @@ redrive:
 					kwq->kw_prepost.lseq, count, 0);
 		} else {
 			// signal first waiter
-			dtape_log_error("[PH] mtxdrop_internal FF signal kwq=%p inqueue=%d", kwq, kwq->kw_inqueue);
 			ret = ksyn_mtxsignal(kwq, NULL, updatebits, &old_owner);
-			dtape_log_error("[PH] mtxdrop_internal FF signaled kwq=%p ret=%d", kwq, ret);
 			if (ret == KERN_NOT_WAITING) {
 				// <rdar://problem/39093536> ksyn_mtxsignal attempts to signal
 				// the thread but it sets up the turnstile inheritor first.
 				// That means we can't redrive the mutex in a loop without
 				// dropping the wq lock and cleaning up the turnstile state.
-				dtape_log_error("[PH] mtxdrop_internal FF REDRIVE kwq=%p", kwq);
 				ksyn_wqunlock(kwq);
 				pthread_kern->psynch_wait_cleanup();
 				_kwq_cleanup_old_owner(&old_owner);
@@ -609,10 +604,8 @@ redrive:
 			if (low_writer == nextgen) {
 				/* next seq to be granted found */
 				/* since the grant could be cv, make sure mutex wait is set incase the thread interrupted out */
-				dtape_log_error("[PH] mtxdrop_internal NFF signal kwq=%p low_writer=%x", kwq, low_writer);
 				ret = ksyn_mtxsignal(kwq, NULL,
 						updatebits | PTH_RWL_MTX_WAIT, &old_owner);
-				dtape_log_error("[PH] mtxdrop_internal NFF signaled kwq=%p ret=%d", kwq, ret);
 				if (ret == KERN_NOT_WAITING) {
 					/* interrupt post */
 					_kwq_mark_interruped_wakeup(kwq, KWQ_INTR_WRITE, 1,
@@ -651,13 +644,10 @@ redrive:
 		}
 	}
 
-	dtape_log_error("[PH] mtxdrop_internal UNLOCKED kwq=%p -> wait_cleanup", kwq);
 	ksyn_wqunlock(kwq);
 	pthread_kern->psynch_wait_cleanup();
-	dtape_log_error("[PH] mtxdrop_internal cleanup_owner kwq=%p old_owner=%p", kwq, old_owner);
 	_kwq_cleanup_old_owner(&old_owner);
 	ksyn_wqrelease(kwq, 1, KSYN_WQTYPE_MUTEXDROP);
-	dtape_log_error("[PH] mtxdrop_internal DONE kwq=%p returnbits=%x", kwq, returnbits);
 	return returnbits;
 }
 

@@ -107,9 +107,7 @@ namespace DarlingServer {
 		std::optional<Message> _deferredReply = std::nullopt;
 
 		struct InterruptContext {
-			// Replies for interrupted calls are no longer stashed per-context; they live in
-			// the per-thread _deferredInterruptReplies FIFO and are flushed at the outermost
-			// interrupt_exit. See pushCallReply() and Call::InterruptExit::processCall().
+			std::optional<Message> savedReply = std::nullopt;
 			std::shared_ptr<Call> interruptedCall = nullptr;
 			StackPool::Stack savedStack;
 			int signal = 0;
@@ -117,13 +115,6 @@ namespace DarlingServer {
 		std::stack<InterruptContext> _interrupts;
 		std::queue<std::shared_ptr<Call>> _pendingInterrupts;
 		std::optional<Message> _pendingSavedReply = std::nullopt;
-		// Replies for calls that were interrupted by a signal must be held until the
-		// client unwinds back to the original interrupted recvmsg, i.e. until the
-		// OUTERMOST interrupt_exit. A signal storm (e.g. Homebrew's curl fork storm)
-		// can produce nested interrupts and multiple in-flight replies, so this must be
-		// a FIFO rather than the old single-slot InterruptContext::savedReply, which
-		// could silently drop or overwrite a reply and wedge the client in recvmsg.
-		std::queue<Message> _deferredInterruptReplies;
 		bool _dead = false;
 		std::shared_ptr<Thread> _selfReference = nullptr;
 
