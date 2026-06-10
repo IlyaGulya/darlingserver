@@ -21,6 +21,7 @@
 #include <darlingserver/call.hpp>
 #include <darlingserver/server.hpp>
 #include <sys/uio.h>
+#include <errno.h>
 
 #include <darlingserver/logging.hpp>
 #include <darlingserver/duct-tape.h>
@@ -699,7 +700,9 @@ void DarlingServer::Call::ForkWaitForChild::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
-			process->waitForChildAfterFork();
+			if (!process->waitForChildAfterFork()) {
+				code = -ETIMEDOUT;
+			}
 		} else {
 			code = -ESRCH;
 		}
