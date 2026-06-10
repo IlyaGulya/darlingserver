@@ -180,7 +180,7 @@ namespace DarlingServer {
 		void registerListeningKqchan(std::shared_ptr<Kqchan::Process> kqchan);
 		void unregisterListeningKqchan(uintptr_t kqchanID);
 
-		void waitForChildAfterFork();
+		bool waitForChildAfterFork();
 
 		bool is64Bit() const;
 		Architecture architecture() const;

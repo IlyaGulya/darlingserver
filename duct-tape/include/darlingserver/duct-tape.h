@@ -103,6 +103,7 @@ bool dtape_kqchan_mach_port_has_events(dtape_kqchan_mach_port_t* kqchan);
 
 void dtape_semaphore_up(dtape_semaphore_t* semaphore);
 dtape_semaphore_wait_result_t dtape_semaphore_down(dtape_semaphore_t* semaphore);
+dtape_semaphore_wait_result_t dtape_semaphore_down_timeout(dtape_semaphore_t* semaphore, unsigned int seconds);
 bool dtape_semaphore_down_simple(dtape_semaphore_t* semaphore);
 
 uint64_t dtape_debug_task_port_count(dtape_task_t* task);

@@ -18,6 +18,7 @@
  */
 
 #include <darlingserver/process.hpp>
+#include <darlingserver/fork-checkin.hpp>
 #include <darlingserver/registry.hpp>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -86,7 +87,11 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 	_dtapeTask = dtape_task_create(parentProcess ? parentProcess->_dtapeTask : nullptr, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
 	_dtapeForkWaitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
 
-	processLog.info() << "New process created with ID " << _pid << " and NSID " << _nspid;
+	if (parentProcess) {
+		processLog.info() << *this << ": process created with parent " << *parentProcess << processLog.endLog;
+	} else {
+		processLog.info() << *this << ": process created without registered parent" << processLog.endLog;
+	}
 };
 
 DarlingServer::Process::Process(KernelProcessConstructorTag tag):
@@ -369,8 +374,11 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	} else {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
+			processLog.info() << *this << ": notifying fork parent " << *parent << " after checkin" << processLog.endLog;
 			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
+		} else {
+			processLog.info() << *this << ": checkin without registered fork parent" << processLog.endLog;
 		}
 	}
 };
@@ -395,9 +403,25 @@ void DarlingServer::Process::unregisterKqchan(std::shared_ptr<Kqchan> kqchan) {
 	_kqchannels.erase(kqchan->_idForProcess());
 };
 
-void DarlingServer::Process::waitForChildAfterFork() {
+bool DarlingServer::Process::waitForChildAfterFork() {
 	// this function is always called within a microthread
-	dtape_semaphore_down_simple(_dtapeForkWaitSemaphore);
+	processLog.info() << *this << ": waiting up to " << ForkCheckinWaitTimeoutSeconds
+			<< " seconds for fork child checkin" << processLog.endLog;
+
+	switch (waitForForkCheckin(_dtapeForkWaitSemaphore)) {
+		case ForkCheckinWaitResult::Observed:
+			processLog.info() << *this << ": fork child checkin observed" << processLog.endLog;
+			return true;
+		case ForkCheckinWaitResult::Interrupted:
+			return false;
+		case ForkCheckinWaitResult::TimedOut:
+			processLog.error() << *this << ": timed out waiting " << ForkCheckinWaitTimeoutSeconds
+					<< " seconds for fork child checkin" << processLog.endLog;
+			return false;
+		default:
+			processLog.error() << *this << ": failed while waiting for fork child checkin" << processLog.endLog;
+			return false;
+	}
 };
 
 void DarlingServer::Process::registerListeningKqchan(std::shared_ptr<Kqchan::Process> kqchan) {
