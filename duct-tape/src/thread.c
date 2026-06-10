@@ -549,6 +549,23 @@ wait_result_t thread_block(thread_continue_t continuation) {
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	thread->xnu_thread.wait_result = wresult;
+
+	// Cancel the wait timer if one was armed for a timed wait. XNU's
+	// thread_unblock() does this; duct-tape previously only cancelled it in
+	// dtape_thread_destroy(). Without it, a timed wait that is woken early
+	// (e.g. by a signal or a normal condvar/mutex wakeup before its deadline)
+	// leaves its wait_timer armed. The stale timer later fires
+	// thread_timer_expire() -> clear_wait_internal(THREAD_TIMED_OUT), which
+	// delivers a SPURIOUS timeout to whatever the thread is doing then --
+	// typically a subsequent deadline-less psynch wait -- aborting it with
+	// ETIMEDOUT and stranding a condvar/mutex handoff (intermittent hang).
+	if (thread->xnu_thread.wait_timer_is_set) {
+		if (timer_call_cancel(&thread->xnu_thread.wait_timer)) {
+			thread->xnu_thread.wait_timer_active--;
+		}
+		thread->xnu_thread.wait_timer_is_set = FALSE;
+	}
+
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;
 };
