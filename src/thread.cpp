@@ -423,6 +423,10 @@ void DarlingServer::Thread::doWork() {
 		goto doneWorking;
 	}
 
+	if (_suspended) {
+		// A pending resume scheduled this execution; consume its permit now.
+		_resumePending = false;
+	}
 	_running = true;
 	currentThreadVar = shared_from_this();
 	dtape_thread_entering(_dtapeThread);
@@ -545,6 +549,7 @@ doneWorking:
 		currentThreadVar = nullptr;
 		_running = false;
 	}
+	bool resumeAfterWorking = _resumePending && _suspended && !_terminating && !_dead;
 	bool canRelease = false;
 	if (_dead) {
 		threadLog.debug() << *this << ": dead thread returning. active call? " << (!!_activeCall ? "true" : "false") << " terminating? " << (_terminating ? "true" : "false") << threadLog.endLog;
@@ -581,6 +586,9 @@ doneWorking:
 		unlockMeWhenSuspending = nullptr;
 	}
 	_runningCondvar.notify_all();
+	if (resumeAfterWorking) {
+		Server::sharedInstance().scheduleThread(shared_from_this());
+	}
 	if (canRelease) {
 		_scheduleRelease();
 	}
@@ -597,6 +605,14 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	}
 
 	_rwlock.lock();
+	if (_resumePending) {
+		_resumePending = false;
+		_rwlock.unlock();
+		if (unlockMe) {
+			libsimple_lock_unlock(unlockMe);
+		}
+		return;
+	}
 	_suspended = true;
 	_rwlock.unlock();
 
@@ -605,6 +621,16 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	getcontext(&_resumeContext);
 
 	_rwlock.lock();
+	if (_resumePending) {
+		_resumePending = false;
+		_suspended = false;
+		_rwlock.unlock();
+		if (unlockMeWhenSuspending) {
+			libsimple_lock_unlock(unlockMeWhenSuspending);
+			unlockMeWhenSuspending = nullptr;
+		}
+		return;
+	}
 	if (_suspended) {
 		if (continuationCallback) {
 			// when suspendeding with a continuation, the current continuation and call are discarded (since they can no longer be safely returned to)
@@ -639,15 +665,22 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 };
 
 void DarlingServer::Thread::resume() {
+	bool schedule = false;
 	{
-		std::shared_lock lock(_rwlock);
-		if (!_suspended) {
-			// maybe we should throw an error here?
+		std::unique_lock lock(_rwlock);
+		if (!_running && !_suspended) {
 			return;
 		}
+		if (_resumePending) {
+			return;
+		}
+		_resumePending = true;
+		schedule = _suspended && !_running;
 	}
 
-	Server::sharedInstance().scheduleThread(shared_from_this());
+	if (schedule) {
+		Server::sharedInstance().scheduleThread(shared_from_this());
+	}
 };
 
 void DarlingServer::Thread::terminate() {

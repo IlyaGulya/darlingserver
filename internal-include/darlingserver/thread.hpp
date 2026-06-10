@@ -81,6 +81,7 @@ namespace DarlingServer {
 		mutable std::shared_mutex _rwlock;
 		StackPool::Stack _stack;
 		bool _suspended = false;
+		bool _resumePending = false;
 		ucontext_t _resumeContext;
 		dtape_thread_t* _dtapeThread;
 		std::function<void()> _continuationCallback = nullptr;
