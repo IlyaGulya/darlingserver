@@ -80,8 +80,12 @@ namespace DarlingServer {
 		Address _address;
 		mutable std::shared_mutex _rwlock;
 		StackPool::Stack _stack;
+		// These are orthogonal lifecycle dimensions, not one enum state:
+		// _running means a worker currently owns this microthread;
+		// _suspended means it has a resumable context; and _resumePermit is a
+		// coalesced wake request that bridges the transition between the two.
 		bool _suspended = false;
-		bool _resumePending = false;
+		bool _resumePermit = false;
 		ucontext_t _resumeContext;
 		dtape_thread_t* _dtapeThread;
 		std::function<void()> _continuationCallback = nullptr;

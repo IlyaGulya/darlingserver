@@ -424,8 +424,8 @@ void DarlingServer::Thread::doWork() {
 	}
 
 	if (_suspended) {
-		// A pending resume scheduled this execution; consume its permit now.
-		_resumePending = false;
+		// This execution was scheduled by resume(); consume that wake permit.
+		_resumePermit = false;
 	}
 	_running = true;
 	currentThreadVar = shared_from_this();
@@ -549,7 +549,10 @@ doneWorking:
 		currentThreadVar = nullptr;
 		_running = false;
 	}
-	bool resumeAfterWorking = _resumePending && _suspended && !_terminating && !_dead;
+	// A wake can arrive after suspend()'s final permit check but before it
+	// physically switches back here. Now that _running is false, rescheduling
+	// is safe and cannot race another worker running this microthread.
+	bool resumeAfterWorking = _resumePermit && _suspended && !_terminating && !_dead;
 	bool canRelease = false;
 	if (_dead) {
 		threadLog.debug() << *this << ": dead thread returning. active call? " << (!!_activeCall ? "true" : "false") << " terminating? " << (_terminating ? "true" : "false") << threadLog.endLog;
@@ -605,8 +608,9 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	}
 
 	_rwlock.lock();
-	if (_resumePending) {
-		_resumePending = false;
+	// Consume a wake that arrived before suspend() marked us suspended.
+	if (_resumePermit) {
+		_resumePermit = false;
 		_rwlock.unlock();
 		if (unlockMe) {
 			libsimple_lock_unlock(unlockMe);
@@ -621,8 +625,9 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	getcontext(&_resumeContext);
 
 	_rwlock.lock();
-	if (_resumePending) {
-		_resumePending = false;
+	// Consume a wake that arrived while the resume context was being captured.
+	if (_resumePermit) {
+		_resumePermit = false;
 		_suspended = false;
 		_rwlock.unlock();
 		if (unlockMeWhenSuspending) {
@@ -671,10 +676,13 @@ void DarlingServer::Thread::resume() {
 		if (!_running && !_suspended) {
 			return;
 		}
-		if (_resumePending) {
+		if (_resumePermit) {
 			return;
 		}
-		_resumePending = true;
+		// Coalesce repeated wakes into one permit. If the microthread is still
+		// running, it will either consume the permit in suspend() or reschedule
+		// itself from doWork() after physically stopping.
+		_resumePermit = true;
 		schedule = _suspended && !_running;
 	}
 
