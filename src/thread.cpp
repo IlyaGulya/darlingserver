@@ -20,6 +20,7 @@
 #include "darlingserver/registry.hpp"
 #include <darlingserver/thread.hpp>
 #include <darlingserver/microthread-resume.hpp>
+#include <darlingserver/processcall-guard.hpp>
 #include <darlingserver/process.hpp>
 #include <darlingserver/call.hpp>
 #include <darlingserver/server.hpp>
@@ -44,6 +45,8 @@
 #include <assert.h>
 
 #include <limits>
+#include <system_error>
+#include <cerrno>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -344,7 +347,30 @@ void DarlingServer::Thread::microthreadWorker() {
 
 	currentContinuation = nullptr;
 	currentThreadVar->makePendingCallActive();
-	currentThreadVar->_activeCall->processCall();
+
+	// A processCall() implementation may throw (e.g. std::system_error from a memory
+	// operation on a guest that died concurrently, or std::runtime_error from the
+	// exec-replacement path). This worker runs on a makecontext()-established fiber
+	// stack and never returns normally (it always setcontext()s away below), so an
+	// uncaught exception unwinding out of here is undefined behavior -> std::terminate
+	// -> the whole darlingserver process dies, stranding every other guest with an
+	// in-flight RPC blocked forever in recvmsg. Contain it: turn the failure into an
+	// error reply when the call supports one, otherwise just log and drop it, and
+	// continue the normal post-call flow so the server stays alive.
+	int guardedReplyCode = DarlingServer::processCallBasicReplyCode([&]() {
+		currentThreadVar->_activeCall->processCall();
+	});
+	if (guardedReplyCode < 0) {
+		microthreadLog.error()
+			<< "Uncaught exception from processCall (call "
+			<< DarlingServer::Call::callNumberToString(currentThreadVar->_activeCall->number())
+			<< "); replying " << guardedReplyCode << microthreadLog.endLog;
+		try {
+			currentThreadVar->_activeCall->sendBasicReply(guardedReplyCode);
+		} catch (...) {
+			// call has no basic reply (returns data); nothing more we can do but survive
+		}
+	}
 
 	if (currentThreadVar->_handlingInterruptedCall) {
 		currentThreadVar->_didSyscallReturnDuringInterrupt = true;

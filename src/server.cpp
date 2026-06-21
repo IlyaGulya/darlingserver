@@ -538,9 +538,31 @@ void DarlingServer::Server::start() {
 
 			while (auto msg = _inbox.pop()) {
 				// TODO: this could be done concurrently
-				auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
-				if (call) {
-					_workQueue.push(call->thread());
+				//
+				// callFromMessage() runs here on the main event loop and can throw:
+				//   * std::invalid_argument for a malformed/unknown call,
+				//   * std::runtime_error("Thread's pending call overwritten while active")
+				//     from Thread::setPendingCall when an RPC races a still-pending call
+				//     (routinely under a heavy fork/signal storm, e.g. building Homebrew),
+				//   * std::system_error from the dtape/registry machinery.
+				// There is no try/catch anywhere above this in Server::start(), so an
+				// uncaught throw here unwinds out of the event loop -> std::terminate ->
+				// the whole darlingserver process dies, orphaning every guest. (This is a
+				// distinct server-exit path from the processCall() guards in
+				// Thread::microthreadWorker / Call::kernelAsync, which do NOT cover message
+				// construction/dispatch.) Contain it: log and drop just this one message so
+				// the server keeps serving every other guest.
+				try {
+					auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
+					if (call) {
+						_workQueue.push(call->thread());
+					}
+				} catch (const std::exception& ex) {
+					static DarlingServer::Log serverLog("server");
+					serverLog.error() << "Dropping message: callFromMessage threw: " << ex.what() << serverLog.endLog;
+				} catch (...) {
+					static DarlingServer::Log serverLog("server");
+					serverLog.error() << "Dropping message: callFromMessage threw a non-std exception" << serverLog.endLog;
 				}
 			}
 		}
