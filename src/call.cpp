@@ -29,6 +29,7 @@
 #include <sys/fcntl.h>
 #include <sys/syscall.h>
 #include <darlingserver/kqchan.hpp>
+#include <system_error>
 
 static DarlingServer::Log callLog("calls");
 
@@ -220,7 +221,22 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		return result;
 	} else {
 		Thread::kernelAsync([result]() {
-			result->processCall();
+			// Contain a throwing processCall so it cannot terminate the whole server
+			// (see the matching guard in Thread::microthreadWorker). This path has no
+			// client thread to reply to, so just log and drop.
+			try {
+				result->processCall();
+			} catch (const std::system_error& err) {
+				callLog.error() << "Uncaught std::system_error from kernel-async processCall (call "
+					<< DarlingServer::Call::callNumberToString(result->number()) << "): " << err.what()
+					<< " (code " << err.code().value() << ")" << callLog.endLog;
+			} catch (const std::exception& ex) {
+				callLog.error() << "Uncaught exception from kernel-async processCall (call "
+					<< DarlingServer::Call::callNumberToString(result->number()) << "): " << ex.what() << callLog.endLog;
+			} catch (...) {
+				callLog.error() << "Uncaught non-std exception from kernel-async processCall (call "
+					<< DarlingServer::Call::callNumberToString(result->number()) << ")" << callLog.endLog;
+			}
 		});
 		return nullptr;
 	}
