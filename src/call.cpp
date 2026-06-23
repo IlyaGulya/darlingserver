@@ -20,6 +20,7 @@
 #define _GNU_SOURCE 1
 #include <darlingserver/call.hpp>
 #include <darlingserver/rpc-error-reply.hpp>
+#include <darlingserver/push-reply-sync-pipe.hpp>
 #include <darlingserver/server.hpp>
 #include <sys/uio.h>
 #include <errno.h>
@@ -159,15 +160,29 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		auto pushReplyCall = reinterpret_cast<const dserver_rpc_call_push_reply_t*>(requestMessage.data().data());
 		Message replyToSave(pushReplyCall->reply_size, 0);
 
-		// extract the reply-push synchronization pipe
-		auto pipeDesc = requestMessage.extractDescriptorAtIndex(requestMessage.descriptors().size() - 1);
-		char tmp = 1;
+		// Extract the reply-push synchronization pipe and take RAII ownership of it
+		// IMMEDIATELY. The client's push-reply hook
+		// (dserver-rpc-defs.c:__dserver_rpc_hooks_push_reply) blocks in a
+		// `read()` on the read end of this pipe until we either write a byte to
+		// our write end or close it (EOF). If ANY code below throws before we
+		// resolve the pipe, the raw fd would leak (never written, never closed):
+		// the client's read() would then block forever, the interrupted call's
+		// reply would never be re-delivered, and the guest's recvmsg would hang
+		// indefinitely (semaphore_timedwait -111 on siblings) while darlingserver
+		// stays alive but idle. That is exactly the dar-gwn.1.7 flavor-C hang,
+		// and the Server::start() throw-containment guard (which drops the
+		// message on an uncaught throw) makes it a silent leak rather than a
+		// crash. Binding the fd to an FD here guarantees it is always closed on
+		// every path -- so the client's read() always returns (a byte on success,
+		// EOF on failure) and never strands the guest. (dar-gwn.1.7)
+		PushReplySyncPipe pipeDesc(requestMessage.extractDescriptorAtIndex(requestMessage.descriptors().size() - 1));
 
-		if (pipeDesc < 0) {
+		if (!pipeDesc) {
 			throw std::runtime_error("Failed to extract reply-push synchronization pipe");
 		}
 
 		if (!process->readMemory(pushReplyCall->reply, replyToSave.data().data(), pushReplyCall->reply_size)) {
+			// pipeDesc's FD dtor closes the pipe -> client read() sees EOF and unblocks.
 			throw std::runtime_error("Failed to read client-pushed reply body");
 		}
 
@@ -183,10 +198,23 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 				// the client saw this unexpected reply while waiting for interrupt_enter to respond and sent it back to us,
 				// and we received both calls (interrupt_enter and push_reply) at the same time
 				thread->_pendingSavedReply = std::move(replyToSave);
-			} else {
-				if (thread->_interrupts.empty()) {
-					throw std::runtime_error("Client tried to push reply outside of interrupt");
+			} else if (thread->_interrupts.empty()) {
+				// The push_reply races the interrupt's lifetime: the interrupt was
+				// already torn down (interrupt_exit popped it) by the time this
+				// pushed-back reply arrived, so there is no saved-reply slot to
+				// stash it in. The pushed reply IS the reply to the interrupted
+				// call, and the client is still waiting for it -- so DON'T drop it
+				// (that would hang the call forever). Send it straight back to the
+				// client now. (dar-gwn.1.7)
+				lock.unlock();
+				callLog.debug() << *thread << ": push_reply arrived with no live interrupt; re-sending pushed reply directly" << callLog.endLog;
+				if (!thread->isDead()) {
+					Server::sharedInstance().sendMessage(std::move(replyToSave));
 				}
+				// signal the client's push hook so it can continue
+				pipeDesc.acknowledge();
+				return nullptr;
+			} else {
 				if (thread->_interrupts.top().savedReply) {
 					throw std::runtime_error("Client-pushed reply overwriting existing saved reply");
 				}
@@ -197,9 +225,8 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		callLog.debug() << *thread << ": Saved client-pushed reply (" << ((thread->_pendingSavedReply) ? "pending" : "normal") << ")" << callLog.endLog;
 
 		// write a byte to the pipe so the caller can continue
-		write(pipeDesc, &tmp, sizeof(tmp));
-		// and close it
-		close(pipeDesc);
+		// (pipeDesc's FD dtor closes the fd when this scope exits)
+		pipeDesc.acknowledge();
 
 		return nullptr;
 	}
