@@ -75,6 +75,7 @@
 #include <kern/zalloc.h>
 #include <kern/policy_internal.h>
 #include <kern/turnstile.h>
+#include <darlingserver/duct-tape/wait-timer.h>
 
 #include <os/hash.h>
 #include <libkern/OSAtomic.h>
@@ -2914,6 +2915,21 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 		/* mark the event and real waitq, even if enqueued on a global safeq */
 		thread->wait_event = wait_event;
 		thread->waitq = waitq;
+
+		// dar-gwn.1.8/.1.9: A thread can only be in one wait at a time, so any
+		// wait_timer still armed here is a leftover from a PRIOR wait that was
+		// woken through a path which did not cancel it (XNU relies on
+		// thread_unblock() cancelling it on every wakeup; in duct-tape some
+		// wakeup/continuation paths can complete a timed wait without routing
+		// through thread_unblock). If left armed, that stale timer fires
+		// thread_timer_expire() -> clear_wait_internal(THREAD_TIMED_OUT) on THIS
+		// new wait, delivering a spurious timeout. For an untimed wait
+		// (deadline == 0) that becomes a bogus ETIMEDOUT, which Ruby's
+		// rb_native_cond_wait treats as a fatal [BUG] (Homebrew download_queue
+		// abort). Cancel any such leftover before (re)arming for this wait so
+		// the wait_timer state starts clean. Matches XNU's invariant that a
+		// thread entering assert_wait has no live wait_timer.
+		dtape_thread_prepare_for_wait(thread);
 
 		if (deadline != 0) {
 			boolean_t act;
