@@ -14,4 +14,8 @@ static inline bool dtape_thread_cancel_wait_timer(thread_t thread) {
 	return true;
 }
 
+static inline bool dtape_thread_prepare_for_wait(thread_t thread) {
+	return dtape_thread_cancel_wait_timer(thread);
+}
+
 #endif
