@@ -345,7 +345,27 @@ void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, 
 
 	dtape_log_debug("calling exception_triage_thread(%d, [%lld, %lld])", mach_exception, codes[0], codes[1]);
 
+	// For a fatal bad-memory-access fault, bound the synchronous reply wait on
+	// the user EXCEPTION_DEFAULT handler. If a handler consumes the exception
+	// but never resumes us (it just exit()s, like gnulib's printf-OOM
+	// nocrash_init handler), the reply never comes; on macOS task teardown would
+	// unwedge us, but here we would block forever holding any guest locks we
+	// faulted with. On timeout the user-level delivery fails and
+	// exception_triage falls through to the host ux_handler -> default SIGSEGV
+	// -> guest terminates, which is macOS's "unhandled fatal exception"
+	// behavior. See dar-gwn.1.10.
+	//
+	// Scoped to EXC_BAD_ACCESS only: that is the proven deadlock case, and other
+	// exception types (EXC_BAD_INSTRUCTION / EXC_ARITHMETIC / EXC_BREAKPOINT)
+	// have legitimate catch-and-resume handlers in real workloads (e.g. the
+	// brew/Ruby download path raises and recovers from SIGILL) that we must not
+	// time out and turn into a forced termination.
+	bool fatal = (mach_exception == EXC_BAD_ACCESS);
+	thread->fatal_exception_delivery = fatal;
+
 	exception_triage_thread(mach_exception, codes, EXCEPTION_CODE_MAX, &thread->xnu_thread);
+
+	thread->fatal_exception_delivery = false;
 
 	dtape_log_debug("exception_triage_thread returned");
 

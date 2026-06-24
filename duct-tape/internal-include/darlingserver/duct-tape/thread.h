@@ -37,6 +37,22 @@ struct dtape_thread {
 	dtape_thread_user_state_t default_state;
 	bool processing_signal;
 
+	// Set while this microthread is synchronously delivering a *fatal* Mach
+	// exception (EXC_BAD_ACCESS and friends) to a user EXCEPTION_DEFAULT handler
+	// via mach_exception_raise. macOS lets the faulting thread block for the
+	// handler's reply indefinitely because, if the handler never resumes the
+	// thread (e.g. it just calls exit(), as gnulib's printf-OOM nocrash_init
+	// handler does), task termination tears the whole task down and frees any
+	// locks the faulting thread held. darlingserver has no such teardown
+	// (task_terminate is a stub), so an unreplied fatal exception wedges the
+	// faulting microthread forever -- and any thread that needs a lock the
+	// faulting thread is holding deadlocks behind it. When this flag is set we
+	// bound the reply receive; on timeout the delivery fails so exception_triage
+	// falls through to the host-level ux_handler, which raises the default fatal
+	// signal (SIGSEGV) and terminates the guest process -- matching the macOS
+	// "handler didn't handle it -> default action" outcome. See dar-gwn.1.10.
+	bool fatal_exception_delivery;
+
 	bool waiting_suspended;
 	dtape_mutex_t suspension_mutex;
 	dtape_condvar_t suspension_condvar;
