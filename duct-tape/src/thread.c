@@ -53,6 +53,9 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	thread->context = context;
 	thread->processing_signal = false;
 	thread->name = NULL;
+	thread->cancel_disable = false;
+	thread->cancel_pending = false;
+	thread->canceled = false;
 	thread->waiting_suspended = false;
 	LIST_INIT(&thread->user_states);
 	dtape_mutex_init(&thread->suspension_mutex);
@@ -178,6 +181,52 @@ void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, 
 	thread->pthread_handle = pthread_handle;
 	thread->dispatch_qaddr = dispatch_qaddr;
 	thread_unlock(&thread->xnu_thread);
+};
+
+// Implements XNU's __pthread_canceled(action) (bsd/kern/kern_sig.c) on the
+// duct-tape thread's cancellation bits. Operates on the *current* thread (the
+// caller of the syscall), exactly like the XNU version which uses
+// current_thread(). Returns the XNU return code (0 / EINVAL), which the call
+// layer negates to the BSD-errno convention the guest expects.
+//
+//   action 1 -> clear cancel-disable, return 0
+//   action 2 -> set   cancel-disable, return 0
+//   action 0 (or default) -> if a cancel is pending and not disabled/already
+//       acted upon, mark it canceled and return 0; otherwise return EINVAL.
+int dtape_thread_canceled(dtape_thread_t* thread, int action) {
+	switch (action) {
+		case 1:
+			thread->cancel_disable = false;
+			return 0;
+		case 2:
+			thread->cancel_disable = true;
+			return 0;
+		case 0:
+		default:
+			// Mirror XNU: act only when UT_CANCEL is set and neither
+			// UT_CANCELDISABLE nor UT_CANCELED is set, i.e.
+			// (uu_flag & (CANCELDISABLE|CANCEL|CANCELED)) == UT_CANCEL.
+			if (thread->cancel_pending && !thread->cancel_disable && !thread->canceled) {
+				thread->cancel_pending = false;
+				thread->canceled = true;
+				return 0;
+			}
+			return EINVAL;
+	}
+};
+
+// Implements XNU's __pthread_markcancel(thread_port): requests cancellation of
+// the *target* thread by setting its pending-cancel bit. This is how one thread
+// asks another to cancel (the kernel side of pthread_cancel). The target later
+// observes the request via dtape_thread_canceled(action 0) at its next
+// cancellation point. Returns 0 on success.
+int dtape_thread_markcancel(dtape_thread_t* thread) {
+	// Mirror XNU's guard: only arm a cancel if one is not already in flight
+	// or acted upon ((uu_flag & (CANCEL|CANCELED)) == 0; we have no vfork bit).
+	if (!thread->cancel_pending && !thread->canceled) {
+		thread->cancel_pending = true;
+	}
+	return 0;
 };
 
 dtape_thread_t* dtape_thread_for_port(uint32_t thread_port) {

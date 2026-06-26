@@ -63,6 +63,16 @@ void dtape_thread_entering(dtape_thread_t* thread);
 void dtape_thread_exiting(dtape_thread_t* thread);
 void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, uintptr_t dispatch_qaddr);
 /**
+ * Implements __pthread_canceled(action) for the current thread. See dar-gwn.6.3.
+ * Returns the XNU-style code (0 or EINVAL); the caller negates it for the guest.
+ */
+int dtape_thread_canceled(dtape_thread_t* thread, int action);
+/**
+ * Implements __pthread_markcancel for the given target thread (requests its
+ * cancellation). See dar-gwn.6.3. Returns 0.
+ */
+int dtape_thread_markcancel(dtape_thread_t* thread);
+/**
  * Returns the thread corresponding to the given thread port.
  *
  * @warning It is VERY important that the caller ensures the thread cannot die while we're looking it up.
