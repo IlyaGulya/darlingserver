@@ -53,6 +53,21 @@ struct dtape_thread {
 	// "handler didn't handle it -> default action" outcome. See dar-gwn.1.10.
 	bool fatal_exception_delivery;
 
+	// POSIX thread-cancellation state, mirroring XNU's per-uthread uu_flag bits
+	// (UT_CANCELDISABLE / UT_CANCEL / UT_CANCELED). The guest libpthread drives
+	// these through the __pthread_canceled / __pthread_markcancel syscalls. The
+	// old server stub returned -ENOSYS for every call, which broke the guest's
+	// cancellation handshake and made cancelable syscalls (and thus brew's
+	// portable-ruby) spin re-issuing pthread_canceled forever -- a livelock.
+	// See dar-gwn.6.3.
+	//
+	//   cancel_disable == UT_CANCELDISABLE: cancellation deferred/blocked
+	//   cancel_pending == UT_CANCEL:        cancel requested (pthread_cancel)
+	//   canceled       == UT_CANCELED:      request has been acted upon
+	bool cancel_disable;
+	bool cancel_pending;
+	bool canceled;
+
 	bool waiting_suspended;
 	dtape_mutex_t suspension_mutex;
 	dtape_condvar_t suspension_condvar;
