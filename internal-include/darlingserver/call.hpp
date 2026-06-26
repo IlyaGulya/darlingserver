@@ -55,6 +55,16 @@ namespace DarlingServer {
 		static void sendReply(Message&& reply);
 
 	public:
+		// Send a minimal error reply (header only: {number, code}) to the client that
+		// sent `requestMessage`, WITHOUT a constructed Call object. Used at the message
+		// ingest paths in callFromMessage() that would otherwise silently drop a message
+		// (non-existent process/thread, pending-call-overwrite). A waiting guest thread
+		// is parked in recvmsg on its per-thread RPC socket; if its call is dropped with
+		// no reply it hangs forever (and under a fork/signal storm degrades into a SEGV).
+		// For a call that expects a reply *body*, the guest's RPC wrapper sees a short
+		// reply and returns -ECOMM; for a body-less call it returns `code` (e.g. -ESRCH).
+		// Either way the guest syscall RETURNS instead of hanging. (dar-gwn.6.2)
+		static void sendErrorReplyFromHeader(const dserver_rpc_callhdr_t* header, Address replyAddress, int code);
 		Call(std::shared_ptr<Thread> thread, Address replyAddress, dserver_rpc_callhdr_t* callHeader);
 		virtual ~Call();
 
