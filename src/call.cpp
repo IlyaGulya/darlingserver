@@ -701,20 +701,28 @@ void DarlingServer::Call::PthreadKill::processCall() {
 };
 
 void DarlingServer::Call::PthreadCanceled::processCall() {
-	int code = 0;
+	// Implements XNU __pthread_canceled(action) on the calling thread's
+	// duct-tape cancellation bits (dar-gwn.6.3). dtape_thread_canceled returns
+	// the XNU-style code (0 / EINVAL); we negate to the guest's BSD-errno
+	// convention. The old TODO stub replied -ENOSYS for every action, which
+	// broke libpthread's cancellation handshake and made cancelable syscalls
+	// (brew's portable-ruby) livelock re-issuing this call ~670x/sec.
+	int code = -ESRCH;
 
-	callLog.warning() << "TODO: " << __PRETTY_FUNCTION__ << callLog.endLog;
-	code = -ENOSYS;
+	if (auto thread = _thread.lock()) {
+		code = -dtape_thread_canceled(thread->_dtapeThread, _body.action);
+	}
 
 	_sendReply(code);
 };
 
 void DarlingServer::Call::PthreadMarkcancel::processCall() {
+	// Implements XNU __pthread_markcancel(thread_port): arm the cancel-pending
+	// bit on the target thread (the kernel side of pthread_cancel). dar-gwn.6.3.
 	int code = 0;
 
 	if (auto targetThread = Thread::threadForPort(_body.thread_port)) {
-		callLog.warning() << "TODO: " << __PRETTY_FUNCTION__ << callLog.endLog;
-		code = -ENOSYS;
+		code = -dtape_thread_markcancel(targetThread->_dtapeThread);
 	} else {
 		code = -ESRCH;
 	}
