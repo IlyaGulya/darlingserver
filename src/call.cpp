@@ -19,6 +19,7 @@
 
 #define _GNU_SOURCE 1
 #include <darlingserver/call.hpp>
+#include <darlingserver/rpc-error-reply.hpp>
 #include <darlingserver/server.hpp>
 #include <sys/uio.h>
 #include <errno.h>
@@ -30,6 +31,7 @@
 #include <sys/syscall.h>
 #include <darlingserver/kqchan.hpp>
 #include <system_error>
+#include <cerrno>
 
 static DarlingServer::Log callLog("calls");
 
@@ -82,10 +84,13 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		});
 
 		if (!process) {
-			callLog.error() << "Received call from non-existent process?" << callLog.endLog;
+			callLog.error() << "Received call from non-existent process (number "
+				<< header->number << "); replying -ESRCH instead of dropping" << callLog.endLog;
 
-			// ignore this call
-			// TODO: instead of ignoring it, we should return a generic reply indicating `-ESRCH` or something like that.
+			// Don't drop silently: the guest thread is parked in recvmsg waiting for a
+			// reply, and dropping leaves it hung forever (-> SEGV under a fork/signal
+			// storm). Reply -ESRCH so the guest syscall returns. (dar-gwn.6.2)
+			sendErrorReplyFromHeader(header, requestMessage.address(), -ESRCH);
 			return nullptr;
 		}
 
@@ -111,10 +116,12 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		});
 
 		if (!thread) {
-			callLog.error() << "Received call from non-existent thread?" << callLog.endLog;
+			callLog.error() << "Received call from non-existent thread (number "
+				<< header->number << "); replying -ESRCH instead of dropping" << callLog.endLog;
 
-			// ignore this call
-			// TODO: instead of ignoring it, we should return a generic reply indicating `-ESRCH` or something like that.
+			// Same as the non-existent-process case: reply -ESRCH so the parked guest
+			// thread's recvmsg returns instead of hanging forever. (dar-gwn.6.2)
+			sendErrorReplyFromHeader(header, requestMessage.address(), -ESRCH);
 			return nullptr;
 		}
 
@@ -217,7 +224,22 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 	#undef CALL_CASE
 
 	if (thread) {
-		thread->setPendingCall(result);
+		try {
+			thread->setPendingCall(result);
+		} catch (const std::exception& ex) {
+			// setPendingCall throws "pending call overwritten while active" when a
+			// non-interrupt call races a still-pending call on the same thread (seen
+			// under the Homebrew fork/signal storm). Previously this unwound to the
+			// Server::start() guard, which dropped the message silently -> the guest
+			// thread that sent THIS call stayed parked in recvmsg forever (-> SEGV under
+			// the storm). Reply -EAGAIN here instead, so that guest syscall returns and
+			// the guest can retry, while leaving the genuinely-pending call untouched.
+			// (dar-gwn.6.2)
+			callLog.error() << "setPendingCall rejected call (number " << header->number
+				<< "): " << ex.what() << "; replying -EAGAIN instead of dropping" << callLog.endLog;
+			sendErrorReplyFromHeader(header, requestMessage.address(), -EAGAIN);
+			return nullptr;
+		}
 		return result;
 	} else {
 		Thread::kernelAsync([result]() {
@@ -277,6 +299,19 @@ bool DarlingServer::Call::isBSDTrap() const {
 
 void DarlingServer::Call::sendReply(Message&& reply) {
 	Server::sharedInstance().sendMessage(std::move(reply));
+};
+
+void DarlingServer::Call::sendErrorReplyFromHeader(const dserver_rpc_callhdr_t* header, Address replyAddress, int code) {
+	// Build a minimal reply (just the reply header) from the raw call header. We don't
+	// have a Call object here, so we can't size the reply to the specific call's reply
+	// struct -- but the guest's RPC wrapper will still return (with -ECOMM for a call
+	// that expected a larger reply body, or with `code` for a body-less call) rather
+	// than blocking forever in recvmsg. The point is to UNBLOCK the parked guest thread.
+	Message reply(sizeof(dserver_rpc_replyhdr_t), 0);
+	reply.setAddress(replyAddress);
+	auto replyStruct = reinterpret_cast<dserver_rpc_replyhdr_t*>(reply.data().data());
+	*replyStruct = rpcErrorReplyHeaderFromCall<dserver_rpc_replyhdr_t>(header, code);
+	sendReply(std::move(reply));
 };
 
 //
