@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <darlingserver/fork-checkin.hpp>
 #include <darlingserver/duct-tape.h>
 #include <darlingserver/utility.hpp>
 #include <darlingserver/kqchan.hpp>
@@ -99,6 +100,7 @@ namespace DarlingServer {
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
+		ForkCheckinState _forkChildCheckin;
 		Architecture _architecture;
 		std::weak_ptr<Process> _tracerProcess;
 		std::string _executablePath;
