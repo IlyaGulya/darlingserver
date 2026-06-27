@@ -350,6 +350,7 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 
 		// create a new fork-wait semaphore for the new task
 		_dtapeForkWaitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
+		_forkChildCheckin.reset();
 
 		// create new S2C semaphores for the main thread
 		mainThread->_s2cPerformSempahore = dtape_semaphore_create(_dtapeTask, 1);
@@ -375,6 +376,7 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
 			processLog.info() << *this << ": notifying fork parent " << *parent << " after checkin" << processLog.endLog;
+			parent->_forkChildCheckin.markChildCheckedIn();
 			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
 		} else {
@@ -408,7 +410,7 @@ bool DarlingServer::Process::waitForChildAfterFork() {
 	processLog.info() << *this << ": waiting up to " << ForkCheckinWaitTimeoutSeconds
 			<< " seconds for fork child checkin" << processLog.endLog;
 
-	switch (waitForForkCheckin(_dtapeForkWaitSemaphore)) {
+	switch (_forkChildCheckin.wait(_dtapeForkWaitSemaphore)) {
 		case ForkCheckinWaitResult::Observed:
 			processLog.info() << *this << ": fork child checkin observed" << processLog.endLog;
 			return true;
