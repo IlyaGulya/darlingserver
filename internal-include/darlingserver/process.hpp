@@ -27,6 +27,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
 
 #include <darlingserver/duct-tape.h>
 #include <darlingserver/utility.hpp>
@@ -99,6 +100,10 @@ namespace DarlingServer {
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
+		// dar-gwn.6.5: sticky flag set by a child's checkin (notifyCheckin) and
+		// consumed by waitForChildAfterFork. Backstops the fork-wait semaphore,
+		// whose wakeup can be lost when a signal forcibly aborts the wait.
+		std::atomic<bool> _forkChildCheckedIn{false};
 		Architecture _architecture;
 		std::weak_ptr<Process> _tracerProcess;
 		std::string _executablePath;
