@@ -18,6 +18,7 @@
  */
 
 #include <darlingserver/message.hpp>
+#include <darlingserver/metrics.hpp>
 #include <unistd.h>
 #include <cstdlib>
 #include <stdexcept>
@@ -546,6 +547,15 @@ bool DarlingServer::MessageQueue::sendMany(int socket) {
 			} else {
 				throw std::system_error(errno, std::generic_category(), "Failed to send messages through socket");
 			}
+		}
+
+		if (ret > 0) {
+			// perf #0 (dar-dar6x4-perf-5dq.6): count reply datagrams sent and stamp the
+			// last-reply time so the watcher can compute last_reply_age_ms (a frozen age
+			// while clients are blocked is the wedged signal).
+			auto& metrics = Metrics::shared();
+			metrics.repliesSent.fetch_add(static_cast<uint64_t>(ret), std::memory_order_relaxed);
+			metrics.lastReplyMonoUs.store(Metrics::nowMonoUs(), std::memory_order_relaxed);
 		}
 
 		for (size_t i = 0; i < ret; ++i) {

@@ -30,6 +30,8 @@
 #include <system_error>
 #include <thread>
 #include <array>
+#include <sstream>
+#include <cstddef>
 #include <darlingserver/registry.hpp>
 #include <sys/eventfd.h>
 #include <darlingserver/duct-tape.h>
@@ -39,6 +41,7 @@
 #include <sys/wait.h>
 
 #include <darlingserver/logging.hpp>
+#include <darlingserver/metrics.hpp>
 
 static DarlingServer::Server* sharedInstancePointer = nullptr;
 
@@ -441,9 +444,15 @@ struct DTapeHooks {
 DarlingServer::Server::Server(std::string prefix):
 	_prefix(prefix),
 	_socketPath(_prefix + "/.darlingserver.sock"),
+	// abstract-namespace name for the stat socket (see the stat-socket setup below for
+	// why abstract and not a pathname). Keyed off the prefix so distinct prefixes differ.
+	_statSocketPath("darlingserver-stat:" + _prefix),
 	_workQueue(std::bind(&Server::_worker, this, std::placeholders::_1))
 {
 	sharedInstancePointer = this;
+
+	// perf #0 (dar-dar6x4-perf-5dq.6): record the server start time for uptime.
+	Metrics::shared().startMonoUs = Metrics::nowMonoUs();
 
 	// remove the old socket (if it exists)
 	unlink(_socketPath.c_str());
@@ -512,6 +521,54 @@ DarlingServer::Server::Server(std::string prefix):
 	if (epoll_ctl(_epollFD, EPOLL_CTL_ADD, _timerFD, &settings) < 0) {
 		throw std::system_error(errno, std::generic_category(), "Failed to add timer descriptor to epoll context");
 	}
+
+	// perf #0 (dar-dar6x4-perf-5dq.6): set up the stat socket. Best-effort: any failure
+	// here logs and leaves _statListenerSocket == -1; the server runs normally without it.
+	//
+	// IMPORTANT: the darlingserver runs inside a private MOUNT namespace (the launcher
+	// joins the darling-init mnt namespace), so a pathname socket under the prefix is
+	// NOT reachable from the host -- only from inside the namespace. The NETWORK namespace
+	// is shared with the host, though, so we bind in the ABSTRACT namespace (leading NUL):
+	// abstract names live in the net namespace, not the filesystem, so host-side tooling
+	// (darling-stat / darling-progress-watch) can connect. The abstract name is keyed off
+	// the prefix so multiple prefixes don't collide. _statSocketPath holds that name (the
+	// part after the NUL) for logging.
+	{
+		static DarlingServer::Log metricsLog("metrics");
+		_statListenerSocket = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+		if (_statListenerSocket < 0) {
+			metricsLog.warning() << "Failed to create stat socket: " << strerror(errno) << "; metrics disabled" << metricsLog.endLog;
+		} else {
+			struct sockaddr_un statAddr;
+			memset(&statAddr, 0, sizeof(statAddr));
+			statAddr.sun_family = AF_UNIX;
+			// abstract name: sun_path[0] == '\0', then the name bytes. Address length is
+			// offsetof(sun_path) + 1 (the NUL) + strlen(name), and the name is NOT NUL-terminated.
+			size_t nameLen = _statSocketPath.size();
+			if (nameLen > sizeof(statAddr.sun_path) - 1) {
+				nameLen = sizeof(statAddr.sun_path) - 1;
+			}
+			statAddr.sun_path[0] = '\0';
+			memcpy(statAddr.sun_path + 1, _statSocketPath.data(), nameLen);
+			socklen_t addrLen = offsetof(struct sockaddr_un, sun_path) + 1 + nameLen;
+			if (bind(_statListenerSocket, (struct sockaddr*)&statAddr, addrLen) != 0 ||
+			    listen(_statListenerSocket, 16) != 0) {
+				metricsLog.warning() << "Failed to bind/listen stat socket: " << strerror(errno) << "; metrics disabled" << metricsLog.endLog;
+				close(_statListenerSocket);
+				_statListenerSocket = -1;
+			} else {
+				settings.data.ptr = &_statListenerSocket;
+				settings.events = EPOLLIN;
+				if (epoll_ctl(_epollFD, EPOLL_CTL_ADD, _statListenerSocket, &settings) < 0) {
+					metricsLog.warning() << "Failed to add stat socket to epoll: " << strerror(errno) << "; metrics disabled" << metricsLog.endLog;
+					close(_statListenerSocket);
+					_statListenerSocket = -1;
+				} else {
+					metricsLog.info() << "Stat socket listening at abstract:" << _statSocketPath << metricsLog.endLog;
+				}
+			}
+		}
+	}
 };
 
 DarlingServer::Server::~Server() {
@@ -519,6 +576,60 @@ DarlingServer::Server::~Server() {
 	close(_wakeupFD);
 	close(_listenerSocket);
 	unlink(_socketPath.c_str());
+	if (_statListenerSocket >= 0) {
+		// abstract socket: no filesystem entry to unlink; closing frees the name.
+		close(_statListenerSocket);
+	}
+};
+
+void DarlingServer::Server::_handleStatConnection() {
+	static DarlingServer::Log metricsLog("metrics");
+
+	// accept every pending connection (the listener is non-blocking)
+	while (true) {
+		int client = accept4(_statListenerSocket, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+		if (client < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+				break;
+			}
+			metricsLog.warning() << "stat accept failed: " << strerror(errno) << metricsLog.endLog;
+			break;
+		}
+
+		// gauges we own (work queue state). Everything else is read from atomics inside
+		// the snapshot. clients_blocked_in_rpc == work items still queued + in-flight is
+		// approximated by depth (a parked guest's call sits in the queue until serviced);
+		// we expose the raw queue stats so the watcher can apply its decision rule.
+		auto wq = _workQueue.stats();
+		std::ostringstream gauges;
+		gauges << "\"workqueue_depth\": " << wq.depth
+		       << ", \"workers_total\": " << wq.threadsTotal
+		       << ", \"workers_busy\": " << wq.threadsBusy
+		       << ", \"workers_available\": " << wq.threadsAvailable
+		       << ", \"clients_blocked_in_rpc\": " << (wq.depth + wq.threadsBusy);
+
+		std::string json = Metrics::shared().snapshotJSON(gauges.str());
+
+		// best-effort blocking-ish write; the payload is tiny (<1KB) so a single write
+		// almost always completes. Loop for partial writes; give up on hard error.
+		size_t off = 0;
+		while (off < json.size()) {
+			ssize_t n = write(client, json.data() + off, json.size() - off);
+			if (n < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					// the tiny snapshot didn't fit the socket buffer and the client isn't
+					// reading; don't block the event loop -- drop the rest.
+					break;
+				}
+				break;
+			}
+			off += static_cast<size_t>(n);
+		}
+		close(client);
+	}
 };
 
 void DarlingServer::Server::start() {
@@ -537,6 +648,8 @@ void DarlingServer::Server::start() {
 			_canRead = _inbox.receiveMany(_listenerSocket);
 
 			while (auto msg = _inbox.pop()) {
+				// perf #0 (dar-dar6x4-perf-5dq.6): count every inbound message.
+				Metrics::shared().messagesReceived.fetch_add(1, std::memory_order_relaxed);
 				// TODO: this could be done concurrently
 				//
 				// callFromMessage() runs here on the main event loop and can throw:
@@ -608,6 +721,11 @@ void DarlingServer::Server::start() {
 			} else if (event->data.ptr == &_wakeupFD) {
 				// we allow the loop to go back to the top and try to send some messages
 				// (if _canWrite is true, the eventfd will be reset; otherwise, there's no point in resetting it)
+			} else if (event->data.ptr == &_statListenerSocket) {
+				// perf #0 (dar-dar6x4-perf-5dq.6): a metrics client connected; serve the
+				// snapshot. Drain all pending connections (level-triggered would re-fire,
+				// but we accept in a loop to be safe and cheap).
+				_handleStatConnection();
 			} else if (event->data.ptr == &_timerFD) {
 				std::unique_lock lock(_timerLock);
 				uint64_t expirations = 0;

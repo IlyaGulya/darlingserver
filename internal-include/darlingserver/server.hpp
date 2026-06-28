@@ -40,6 +40,15 @@ namespace DarlingServer {
 		int _listenerSocket;
 		std::string _prefix;
 		std::string _socketPath;
+		// perf #0 (dar-dar6x4-perf-5dq.6): dedicated stat socket. A SOCK_STREAM listener in
+		// the ABSTRACT namespace (the server is in a private mount namespace, so a pathname
+		// socket is unreachable from the host; the network namespace is shared, so an
+		// abstract name works). On accept the server writes a one-shot JSON metrics snapshot
+		// and closes. Lives on the same epoll loop, so producing the snapshot is single-
+		// threaded and reads the atomic counters consistently. -1 if setup failed (the
+		// server keeps running regardless -- metrics are best-effort observability).
+		int _statListenerSocket = -1;
+		std::string _statSocketPath; // abstract name (without the leading NUL)
 		int _epollFD;
 		MessageQueue _inbox;
 		MessageQueue _outbox;
@@ -55,6 +64,9 @@ namespace DarlingServer {
 		std::mutex _monitorsLock;
 
 		void _worker(std::shared_ptr<Thread> thread);
+
+		// perf #0: accept one stat client and write the JSON snapshot.
+		void _handleStatConnection();
 
 		friend struct ::DTapeHooks;
 
