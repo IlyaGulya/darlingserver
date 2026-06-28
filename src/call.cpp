@@ -28,6 +28,7 @@
 #include <darlingserver/logging.hpp>
 #include <darlingserver/duct-tape.h>
 #include <darlingserver/config.hpp>
+#include <darlingserver/metrics.hpp>
 #include <sys/fcntl.h>
 #include <sys/syscall.h>
 #include <darlingserver/kqchan.hpp>
@@ -376,6 +377,17 @@ void DarlingServer::Call::sendErrorReplyFromHeader(const dserver_rpc_callhdr_t* 
 void DarlingServer::Call::Checkin::processCall() {
 	// the Call instance creation already took care of registering the process and thread.
 
+	// perf #0 (dar-dar6x4-perf-5dq.6): count checkins, and fork-checkins specifically.
+	// The fork checkin is the per-fork synchronous round-trip whose latency dominates
+	// fork-heavy builds (the dar-l3a slowness); fork_latency_pXX is the headline number
+	// each perf fix must drive down.
+	auto& metrics = Metrics::shared();
+	metrics.checkins.fetch_add(1, std::memory_order_relaxed);
+	if (_body.is_fork) {
+		metrics.forks.fetch_add(1, std::memory_order_relaxed);
+	}
+	uint64_t startUs = Metrics::nowMonoUs();
+
 	int code = 0;
 
 	if (auto thread = _thread.lock()) {
@@ -388,6 +400,13 @@ void DarlingServer::Call::Checkin::processCall() {
 		}
 	} else {
 		code = -ESRCH;
+	}
+
+	// perf #0: record fork-checkin latency (the handler may block coordinating with the
+	// parent, so this captures the real per-fork cost).
+	if (_body.is_fork) {
+		uint64_t now = Metrics::nowMonoUs();
+		metrics.forkLatency.record((now >= startUs) ? (now - startUs) : 0);
 	}
 
 	_sendReply(code);
