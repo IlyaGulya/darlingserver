@@ -265,7 +265,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			// (dar-gwn.6.2)
 			callLog.error() << "setPendingCall rejected call (number " << header->number
 				<< "): " << ex.what() << "; replying -EAGAIN instead of dropping" << callLog.endLog;
-			sendErrorReplyFromHeader(header, requestMessage.address(), -EAGAIN);
+			result->sendBasicReply(-EAGAIN);
 			return nullptr;
 		}
 		return result;
