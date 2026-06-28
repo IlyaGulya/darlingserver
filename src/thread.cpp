@@ -23,6 +23,7 @@
 #include <darlingserver/call.hpp>
 #include <darlingserver/server.hpp>
 #include <darlingserver/logging.hpp>
+#include <darlingserver/metrics.hpp>
 #include <filesystem>
 #include <fstream>
 
@@ -355,6 +356,13 @@ void DarlingServer::Thread::microthreadWorker() {
 	// in-flight RPC blocked forever in recvmsg. Contain it: turn the failure into an
 	// error reply when the call supports one, otherwise just log and drop it, and
 	// continue the normal post-call flow so the server stays alive.
+	// perf #0 (dar-dar6x4-perf-5dq.6): time how long this RPC takes to service and count
+	// it. We measure from worker entry (== dequeue, since the worker runs immediately on
+	// the same thread that took the item) to completion below.
+	auto& _metrics = DarlingServer::Metrics::shared();
+	uint64_t _callStartUs = DarlingServer::Metrics::nowMonoUs();
+	auto _callNumber = currentThreadVar->_activeCall->number();
+
 	try {
 		currentThreadVar->_activeCall->processCall();
 	} catch (const std::system_error& err) {
@@ -383,6 +391,17 @@ void DarlingServer::Thread::microthreadWorker() {
 		try {
 			currentThreadVar->_activeCall->sendBasicReply(-EINVAL);
 		} catch (...) {}
+	}
+
+	// perf #0: record service latency (worker entry -> completion).
+	{
+		uint64_t now = DarlingServer::Metrics::nowMonoUs();
+		uint64_t serviceUs = (now >= _callStartUs) ? (now - _callStartUs) : 0;
+		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
+		_metrics.rpcLatency.record(serviceUs);
+		if (_callNumber == DarlingServer::Call::Number::Checkin) {
+			_metrics.checkinLatency.record(serviceUs);
+		}
 	}
 
 	if (currentThreadVar->_handlingInterruptedCall) {
