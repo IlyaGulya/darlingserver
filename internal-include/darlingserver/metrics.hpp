@@ -157,6 +157,23 @@ namespace DarlingServer {
 		std::atomic<uint64_t> ringWakesIssued {0};
 		std::atomic<uint64_t> ringWakesSkipped {0};
 		std::atomic<uint64_t> ringDoorbellsReceived {0}; // eventfd wakes the server actually drained
+
+#ifdef DSERVER_RING_PHASE_PROF
+		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in
+		// ringServiceThread/publishReply accumulate per-phase TSC cycles + a sample count, so we
+		// can read mean cycles/phase from the stat socket. Pure diagnostic (default OFF, this whole
+		// block compiles out); the brackets read the TSC, which is far below a phase's own cost so
+		// they don't perturb the breakdown the way clock_gettime would.
+		//   drain    = consumer_begin + copy the slot transport header out
+		//   dispatch = callFromMessage (rebuild Message, registry lookup, decode)
+		//   body     = doWork() -- the inline Mach operation itself
+		//   publish  = publishReply (claim s2c slot, write reply, release-store)
+		std::atomic<uint64_t> phaseDrainCycles {0};
+		std::atomic<uint64_t> phaseDispatchCycles {0};
+		std::atomic<uint64_t> phaseBodyCycles {0};
+		std::atomic<uint64_t> phasePublishCycles {0};
+		std::atomic<uint64_t> phaseSamples {0};
+#endif
 #endif
 
 		// ---- gauges sampled at snapshot time (set by the owner) ----
@@ -202,6 +219,19 @@ namespace DarlingServer {
 
 		// Current monotonic time in microseconds.
 		static uint64_t nowMonoUs();
+
+#ifdef DSERVER_RING_PHASE_PROF
+		// perf #18 P6: raw TSC read for sub-microsecond phase brackets. x86-only diagnostic.
+		static inline uint64_t rdtscCycles() {
+#if defined(__x86_64__) || defined(__i386__)
+			unsigned hi, lo;
+			__asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+			return ((uint64_t)hi << 32) | lo;
+#else
+			return nowMonoUs() * 1000; // fallback (coarse)
+#endif
+		}
+#endif
 
 		// Build a JSON snapshot string. `extra` lets the caller inject gauges it owns
 		// (workqueue_depth, workers_busy/total, clients_blocked_in_rpc) as already-

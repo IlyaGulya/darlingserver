@@ -1395,6 +1395,9 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 		if (!req) {
 			break; // empty or corrupt tail
 		}
+#ifdef DSERVER_RING_PHASE_PROF
+		uint64_t _phaseT0 = Metrics::rdtscCycles(); // perf#18 P6: drain phase start
+#endif
 
 		// Copy the transport header out before trusting it (guest can mutate concurrently).
 		uint32_t callnum = req->callnum;
@@ -1444,12 +1447,33 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 
 		// Arm the one-shot ring-reply sink, then dispatch through the normal Call path.
 		thread->beginRingReply(seq);
+#ifdef DSERVER_RING_PHASE_PROF
+		uint64_t _phaseT1 = Metrics::rdtscCycles(); // drain end / dispatch start
+#endif
 		try {
 			auto call = Call::callFromMessage(std::move(reqMsg));
+#ifdef DSERVER_RING_PHASE_PROF
+			uint64_t _phaseT2 = Metrics::rdtscCycles(); // dispatch end / body start
+#endif
 			if (call) {
 				// run inline on the main loop (self-traps never block) -- perf#2b path
 				call->thread()->doWork();
 				++serviced;
+#ifdef DSERVER_RING_PHASE_PROF
+				uint64_t _phaseT3 = Metrics::rdtscCycles(); // body end
+				auto& m = Metrics::shared();
+				// body = doWork window MINUS the publish cycles recorded inside publishReply for
+				// this very call (publishReply ran during doWork, via pushCallReply). We read the
+				// just-added publish delta back out of the thread's one-shot scratch.
+				uint64_t pub = thread->takeRingPublishCycles();
+				uint64_t bodyTotal = _phaseT3 - _phaseT2;
+				uint64_t body = (bodyTotal > pub) ? (bodyTotal - pub) : 0;
+				m.phaseDrainCycles.fetch_add(_phaseT1 - _phaseT0, std::memory_order_relaxed);
+				m.phaseDispatchCycles.fetch_add(_phaseT2 - _phaseT1, std::memory_order_relaxed);
+				m.phaseBodyCycles.fetch_add(body, std::memory_order_relaxed);
+				m.phasePublishCycles.fetch_add(pub, std::memory_order_relaxed);
+				m.phaseSamples.fetch_add(1, std::memory_order_relaxed);
+#endif
 			}
 		} catch (const std::exception& ex) {
 			callLog.error() << "ring C2S dispatch threw: " << ex.what() << callLog.endLog;
