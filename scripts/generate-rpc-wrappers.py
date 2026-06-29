@@ -682,6 +682,13 @@ calls = [
 		('mapping_size', 'uint64_t'),
 	], [
 		('reject_reason', 'uint32_t'),
+		# perf #18 P3 wake design (Variant 2): on accept the SERVER creates the wake eventfd
+		# (it owns it for the RingBuffer's lifetime and registers it in its own epoll), and
+		# hands the guest a dup of it back in the reply. The guest writes this fd to wake the
+		# server when it publishes a c2s request (the only primitive the epoll-bound server can
+		# wait on); the reverse direction (server waking guest) is FUTEX_WAKE on s2c_futex, so
+		# no fd is needed there. -1 on reject (the guest then stays on UDS).
+		('wake_fd', '@fd'),
 	]),
 ]
 

@@ -200,6 +200,95 @@ typedef struct dserver_ring_slot {
 	// char payload[] follows
 } dserver_ring_slot_t;
 
+// --- SPSC datapath ---------------------------------------------------------------------
+//
+// Single-producer / single-consumer ring access. Both directions share these helpers: for
+// the c2s ring the guest is the producer and the server is the consumer; for the s2c ring
+// it is reversed. They operate on offsets validated by dserver_ring_shm_validate(), so the
+// only attacker-controlled values at runtime are head/tail (each owned by ONE side). We
+// re-clamp them on every access anyway -- a corrupt index from the untrusted peer must never
+// be able to make us read/write outside the ring's own slot array.
+//
+// Discipline (torn-write-safe, no locks). head and tail are FREE-RUNNING uint32 counters
+// (never pre-masked); the slot index is (counter & (slot_count-1)). slot_count is a validated
+// power of two, so the counters wrapping at 2^32 is harmless (2^32 is a multiple of any
+// power-of-two slot_count, so the masked index stays continuous across the wrap).
+//   * tail = total slots ever PUBLISHED; head = total slots ever CONSUMED.
+//   * empty when tail == head; full when (tail - head) == slot_count.
+//   * The producer writes the whole slot body, THEN does ONE release-store incrementing tail.
+//     A consumer that observes the new tail therefore observes a fully written slot.
+//   * The consumer reads the slot, THEN does ONE release-store incrementing head. The producer
+//     treats a slot as free once head has advanced past it.
+// The (tail - head) distance is itself untrusted (the peer owns one end), so we treat any
+// distance > slot_count as "corrupt -> empty/full" rather than trusting it to index.
+//
+// Header-only inline so the guest (libc-free C), the server (C++), and the host loopback test
+// all compile the IDENTICAL datapath.
+
+// Pointer to the slot for free-running counter value `counter` within a ring whose header is
+// at `ring`. slot_size/slot_count come from the validated control block.
+static inline dserver_ring_slot_t* dserver_ring_slot_at(dserver_ring_t* ring, uint32_t counter, uint32_t slot_size, uint32_t slot_count) {
+	uint32_t idx = counter & (slot_count - 1u);
+	char* slots = (char*)ring + sizeof(dserver_ring_t);
+	return (dserver_ring_slot_t*)(slots + (uint64_t)idx * slot_size);
+}
+
+// Producer: claim the next free slot and return a pointer to it WITHOUT publishing, or NULL
+// if the ring is full (or the consumer's head looks corrupt). The caller writes the slot
+// fields + body, then calls dserver_ring_producer_publish().
+static inline dserver_ring_slot_t* dserver_ring_producer_begin(dserver_ring_t* ring, uint32_t slot_size, uint32_t slot_count) {
+	uint32_t tail = __atomic_load_n(&ring->tail, __ATOMIC_RELAXED); // producer owns tail
+	uint32_t head = __atomic_load_n(&ring->head, __ATOMIC_ACQUIRE); // consumer owns head (untrusted)
+	uint32_t used = tail - head; // wraps correctly in unsigned arithmetic
+	if (used >= slot_count) {
+		return (dserver_ring_slot_t*)0; // full, or a corrupt head -> refuse to produce
+	}
+	return dserver_ring_slot_at(ring, tail, slot_size, slot_count);
+}
+
+// Producer: publish the slot claimed by dserver_ring_producer_begin(). The single release
+// store of tail is the linearization point; everything written to the slot happens-before it.
+static inline void dserver_ring_producer_publish(dserver_ring_t* ring) {
+	uint32_t tail = __atomic_load_n(&ring->tail, __ATOMIC_RELAXED);
+	__atomic_store_n(&ring->tail, tail + 1u, __ATOMIC_RELEASE);
+}
+
+// Consumer: return a pointer to the next published slot WITHOUT consuming, or NULL if empty
+// (or the producer's tail looks corrupt). The caller reads the body, then calls
+// dserver_ring_consumer_advance().
+static inline dserver_ring_slot_t* dserver_ring_consumer_begin(dserver_ring_t* ring, uint32_t slot_size, uint32_t slot_count) {
+	uint32_t head = __atomic_load_n(&ring->head, __ATOMIC_RELAXED); // consumer owns head
+	uint32_t tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE); // producer owns tail (untrusted)
+	uint32_t avail = tail - head; // wraps correctly in unsigned arithmetic
+	if (avail == 0u || avail > slot_count) {
+		return (dserver_ring_slot_t*)0; // empty, or a corrupt tail -> consume nothing
+	}
+	return dserver_ring_slot_at(ring, head, slot_size, slot_count);
+}
+
+// Consumer: free the slot returned by dserver_ring_consumer_begin().
+static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
+	uint32_t head = __atomic_load_n(&ring->head, __ATOMIC_RELAXED);
+	__atomic_store_n(&ring->head, head + 1u, __ATOMIC_RELEASE);
+}
+
+// --- Ring message convention (P3, first migrated op) ----------------------------------
+//
+// A request slot carries: callnum = dserver_callnum_<name>, seq = a guest-chosen request id,
+// length = inline request-body bytes, payload = the dserver_call_<name>_t body (none for a
+// no-arg call like task_self_trap). A reply slot echoes the request's callnum + seq, sets
+// flags bit0 if the call failed, carries the result code in dserver_ring_reply_hdr_t at the
+// start of the payload, followed by the dserver_reply_<name>_t body. Big bodies (arena_len>0)
+// are P4; P3 only migrates small inline-only ops.
+#define DSERVER_RING_FLAG_REPLY_ERROR 0x1u
+
+// Prefix of every REPLY payload: the RPC result code (what the UDS reply header.code carries),
+// followed by the call's reply body. Kept separate from dserver_ring_slot so the slot stays a
+// pure transport header and the payload stays a faithful copy of the UDS reply body.
+typedef struct dserver_ring_reply_hdr {
+	int32_t code; // RPC result code (0 == success); mirrors dserver_rpc_replyhdr_t.code
+} dserver_ring_reply_hdr_t;
+
 // The control block at the head of the shared mapping. The guest fills this in once before
 // handing the memfd to the server; the server treats every field as adversarial input.
 typedef struct dserver_ring_shm {
@@ -237,6 +326,108 @@ typedef enum dserver_ring_reject {
 	dserver_ring_reject_arena_overlap,   // arena overlaps a ring or the header
 	dserver_ring_reject_tid,             // guest_tid != the SCM-credentialed nsid
 } dserver_ring_reject_t;
+
+// --- Server-side C2S service loop (pure, bounds-safe) ---------------------------------
+//
+// Drain published request slots from the c2s ring, hand each to a servicer callback, and
+// publish the reply onto the s2c ring. ALL of this is attacker-exposed: the guest owns the
+// c2s tail and the slot bodies. We re-validate every slot before trusting it -- callnum is
+// left to the servicer (it reuses call.cpp's switch), but length/seq/arena are clamped here.
+//
+// The servicer computes a reply: it receives the request body (already bounds-checked to lie
+// within one slot) and writes a reply body + an RPC code. It returns 0 on "handled" or
+// non-zero on "refuse this callnum on the ring" (the loop then drops the request and the
+// guest will time out + fall back to UDS for that op). The servicer NEVER sees a pointer into
+// guest memory beyond the single validated slot payload.
+//
+// Returns the number of requests serviced (0 if the ring was empty or every slot was corrupt).
+// `*out_woke` is set nonzero if at least one reply was published (caller should wake the guest).
+typedef int (*dserver_ring_servicer_t)(
+	void* ctx,
+	uint32_t callnum,
+	const void* req_body, uint32_t req_len,
+	void* reply_body, uint32_t reply_cap, uint32_t* out_reply_len,
+	int32_t* out_code
+);
+
+static inline uint32_t dserver_ring_service_c2s(
+	dserver_ring_t* c2s, dserver_ring_t* s2c,
+	uint32_t slot_size, uint32_t slot_count,
+	dserver_ring_servicer_t servicer, void* ctx,
+	int* out_woke
+) {
+	uint32_t serviced = 0;
+	uint32_t inline_cap = slot_size - (uint32_t)sizeof(dserver_ring_slot_t);
+	if (out_woke) *out_woke = 0;
+
+	for (;;) {
+		dserver_ring_slot_t* req = dserver_ring_consumer_begin(c2s, slot_size, slot_count);
+		if (!req) {
+			break; // empty or corrupt tail -> stop (corrupt is handled defensively by begin())
+		}
+
+		// Copy the slot's transport header out before trusting it -- the guest can mutate the
+		// page concurrently. Then bounds-check the inline request body strictly.
+		uint32_t callnum = req->callnum;
+		uint32_t reqlen  = req->length;
+		uint32_t seq     = req->seq;
+		const void* req_body = (const char*)req + sizeof(dserver_ring_slot_t);
+		if (reqlen > inline_cap) {
+			// malformed: claimed body exceeds the slot. Drop it (consume so we don't spin) and
+			// keep going; the guest op will UDS-fall-back on timeout.
+			dserver_ring_consumer_advance(c2s);
+			continue;
+		}
+
+		// Produce the reply into an s2c slot. If the reply ring is full we stop (leave the
+		// request unconsumed so we retry it on the next wake -- backpressure, not loss).
+		dserver_ring_slot_t* rep = dserver_ring_producer_begin(s2c, slot_size, slot_count);
+		if (!rep) {
+			break;
+		}
+		char* rep_payload = (char*)rep + sizeof(dserver_ring_slot_t);
+		uint32_t rep_cap = inline_cap;
+		if (rep_cap < (uint32_t)sizeof(dserver_ring_reply_hdr_t)) {
+			// slot too small to even carry a reply header -- impossible after validate(), but
+			// be defensive: drop the request.
+			dserver_ring_consumer_advance(c2s);
+			continue;
+		}
+		dserver_ring_reply_hdr_t* rhdr = (dserver_ring_reply_hdr_t*)rep_payload;
+		void* rep_body = rep_payload + sizeof(dserver_ring_reply_hdr_t);
+		uint32_t rep_body_cap = rep_cap - (uint32_t)sizeof(dserver_ring_reply_hdr_t);
+		uint32_t rep_body_len = 0;
+		int32_t code = 0;
+
+		int handled = servicer(ctx, callnum, req_body, reqlen, rep_body, rep_body_cap, &rep_body_len, &code);
+
+		// We are done reading the request slot now; free it.
+		dserver_ring_consumer_advance(c2s);
+
+		if (handled != 0) {
+			// servicer refused this callnum on the ring; don't publish a reply (guest UDS-falls
+			// back). Roll back the reply slot we hadn't published yet -- producer_begin didn't
+			// move tail, so simply not publishing is the rollback.
+			continue;
+		}
+
+		if (rep_body_len > rep_body_cap) {
+			rep_body_len = rep_body_cap; // servicer bug guard; never overruns the slot
+		}
+		rhdr->code = code;
+		rep->callnum = callnum;
+		rep->seq = seq;
+		rep->length = (uint32_t)sizeof(dserver_ring_reply_hdr_t) + rep_body_len;
+		rep->arena_off = 0;
+		rep->arena_len = 0;
+		rep->flags = (code != 0) ? DSERVER_RING_FLAG_REPLY_ERROR : 0u;
+		dserver_ring_producer_publish(s2c);
+		if (out_woke) *out_woke = 1;
+		++serviced;
+	}
+
+	return serviced;
+}
 
 // Pure trust-boundary validator. Takes a COPY of the guest's control block (copied in by the
 // caller -- never validate in place, the guest can mutate it concurrently) plus the mapping's
