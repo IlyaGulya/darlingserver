@@ -740,6 +740,7 @@ bool DarlingServer::Thread::doWorkInline() {
 			// fiber to resume onto -> we cannot honor it. Log; leave _running cleared so the
 			// thread isn't wedged. (The guest will time out on this op and UDS-fall-back.)
 			microthreadLog.error() << *this << ": doWorkInline call suspended -- not fast-path eligible!" << microthreadLog.endLog;
+			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
 			_suspended = false;
 		}
 		_activeCall = nullptr;
@@ -823,6 +824,10 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 #endif
 	if (published) {
 		ring->wakeGuest();
+	} else {
+		// s2c ring full: the reply will be sent via UDS below (no double-mint). Account it so a
+		// nonzero ring_s2c_full under load flags a guest that isn't draining its s2c ring.
+		Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	{
@@ -840,6 +845,7 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 		if (_suspended) {
 			// Impossible for mach_reply_port (it never blocks). Log loudly; clear so we don't wedge.
 			microthreadLog.error() << *this << ": doMachReplyPortInline suspended -- mach_reply_port must never block!" << microthreadLog.endLog;
+			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
 			_suspended = false;
 		}
 		dtape_thread_exiting(_dtapeThread);
@@ -1736,6 +1742,7 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 #endif
 				if (!published) {
 					// s2c full: fall back to a UDS reply so the guest still gets its answer.
+					Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
 					Server::sharedInstance().sendMessage(std::move(reply));
 				} else {
 					ring->wakeGuest();
