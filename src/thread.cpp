@@ -1424,7 +1424,16 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 		if (_deferReplyForS2C) {
 			_deferReplyForS2C = false;
 			if (_deferredReply) {
-				Server::sharedInstance().sendMessage(std::move(*_deferredReply));
+#ifdef DSERVER_RING_TRANSPORT
+				// perf #18 P5-bulk (dar-1il.1): a ring-originated call that triggered this S2C
+				// upcall deferred its reply; it MUST go back onto the s2c ring, not UDS, or the
+				// ring-waiting guest never wakes. _publishReplyToRingLocked consumes _ringReplyPending
+				// and returns false (not a ring call) -> fall through to the UDS send below.
+				if (!_publishReplyToRingLocked(*_deferredReply))
+#endif
+				{
+					Server::sharedInstance().sendMessage(std::move(*_deferredReply));
+				}
 				_deferredReply = std::nullopt;
 			}
 		}
@@ -1699,6 +1708,49 @@ void DarlingServer::Thread::logToStream(Log::Stream& stream) const {
 	stream << "[T:" << _tid << "(" << _nstid << ")]";
 };
 
+#ifdef DSERVER_RING_TRANSPORT
+// perf #18 P3 / P5-bulk: publish a complete reply Message onto the s2c ring if this thread's current
+// call is ring-originated. Returns true if it took ownership of the reply (published, OR consumed it
+// to UDS-fall-back on a full ring); false if this is not a ring call (caller must send it via UDS).
+// Consumes _ringReplyPending. _rwlock MUST be held by the caller. The reply Message data is
+// dserver_rpc_reply_<call>_t = {replyhdr{number,code}, body}; we carry the code + body bytes onto the
+// ring (the guest reconstructs the same body).
+bool DarlingServer::Thread::_publishReplyToRingLocked(Message& reply) {
+	if (!_ringReplyPending || !_ring) {
+		return false;
+	}
+	_ringReplyPending = false;
+	const auto& bytes = reply.data();
+	if (bytes.size() < sizeof(dserver_rpc_replyhdr_t)) {
+		return false; // malformed (too short) -> caller UDS-falls-back
+	}
+	const dserver_rpc_replyhdr_t* rhdr = reinterpret_cast<const dserver_rpc_replyhdr_t*>(bytes.data());
+	const uint8_t* body = bytes.data() + sizeof(dserver_rpc_replyhdr_t);
+	uint32_t bodyLen = static_cast<uint32_t>(bytes.size() - sizeof(dserver_rpc_replyhdr_t));
+	auto ring = _ring; // keep alive across the publish
+	uint32_t seq = _ringReplySeq;
+	uint32_t callnum = static_cast<uint32_t>(rhdr->number);
+	int32_t code = rhdr->code;
+	// publish under the lock is fine (no suspend, no Server-state mutation); the FUTEX_WAKE is a
+	// bare syscall and likewise can't re-enter our locks.
+#ifdef DSERVER_RING_PHASE_PROF
+	uint64_t _pubT0 = Metrics::rdtscCycles();
+#endif
+	bool published = ring->publishReply(seq, callnum, code, body, bodyLen);
+#ifdef DSERVER_RING_PHASE_PROF
+	_ringPublishCycles = Metrics::rdtscCycles() - _pubT0; // read back by ringServiceThread
+#endif
+	if (!published) {
+		// s2c full: fall back to a UDS reply so the guest still gets its answer.
+		Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
+		Server::sharedInstance().sendMessage(std::move(reply));
+	} else {
+		ring->wakeGuest();
+	}
+	return true;
+}
+#endif
+
 void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Message&& reply) {
 	std::unique_lock lock(_rwlock);
 
@@ -1713,43 +1765,15 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 
 		_interrupts.top().savedReply = std::move(reply);
 	} else if (_deferReplyForS2C) {
+		// A ring-originated call that performs an S2C upcall defers its reply here; the flush in
+		// _s2cPerform() (NOT this path) republishes it -- and MUST honor _ringReplyPending or a
+		// ring-waiting guest wedges. We deliberately do NOT consume _ringReplyPending here so the
+		// flush still knows the reply belongs to the ring. (perf #18 P5-bulk / dar-1il.1)
 		_deferredReply = std::move(reply);
 	} else if (!_dead) {
 #ifdef DSERVER_RING_TRANSPORT
-		// perf #18 P3: if this reply belongs to a ring-originated call, publish it onto the s2c
-		// ring + wake the guest instead of sending a UDS datagram. One-shot: consume the flag.
-		// The reply Message data is dserver_rpc_reply_<call>_t = {replyhdr{number,code}, body};
-		// we carry the code + body bytes onto the ring (the guest reconstructs the same body).
-		if (_ringReplyPending && _ring) {
-			_ringReplyPending = false;
-			const auto& bytes = reply.data();
-			if (bytes.size() >= sizeof(dserver_rpc_replyhdr_t)) {
-				const dserver_rpc_replyhdr_t* rhdr = reinterpret_cast<const dserver_rpc_replyhdr_t*>(bytes.data());
-				const uint8_t* body = bytes.data() + sizeof(dserver_rpc_replyhdr_t);
-				uint32_t bodyLen = static_cast<uint32_t>(bytes.size() - sizeof(dserver_rpc_replyhdr_t));
-				auto ring = _ring; // keep alive across the unlocked publish
-				uint32_t seq = _ringReplySeq;
-				uint32_t callnum = static_cast<uint32_t>(rhdr->number);
-				int32_t code = rhdr->code;
-				// publish under the lock is fine (no suspend, no Server-state mutation); the
-				// FUTEX_WAKE is a bare syscall and likewise can't re-enter our locks.
-#ifdef DSERVER_RING_PHASE_PROF
-				uint64_t _pubT0 = Metrics::rdtscCycles();
-#endif
-				bool published = ring->publishReply(seq, callnum, code, body, bodyLen);
-#ifdef DSERVER_RING_PHASE_PROF
-				_ringPublishCycles = Metrics::rdtscCycles() - _pubT0; // read back by ringServiceThread
-#endif
-				if (!published) {
-					// s2c full: fall back to a UDS reply so the guest still gets its answer.
-					Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
-					Server::sharedInstance().sendMessage(std::move(reply));
-				} else {
-					ring->wakeGuest();
-				}
-				return;
-			}
-			// malformed (too short) -> fall through to UDS below
+		if (_publishReplyToRingLocked(reply)) {
+			return;
 		}
 #endif
 		Server::sharedInstance().sendMessage(std::move(reply));

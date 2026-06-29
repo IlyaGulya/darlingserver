@@ -20,7 +20,13 @@
 // slot" assertions MUST then fail.
 
 #define _POSIX_C_SOURCE 200112L
+// Make the shared C2S opcode allowlist macro (DSERVER_RING_C2S_OPCODES) visible -- it lives inside
+// the DSERVER_RING_TRANSPORT block in rpc-supplement.h, the SINGLE source of truth both the server
+// (call.cpp) and the guest (dserver-ring.c) key off. We gate the (unused-here) attach-check out.
+#define DSERVER_RING_TRANSPORT 1
+#define DSERVER_RING_NO_ATTACH_CHECK 1
 #include <darlingserver/rpc.h>
+#include <darlingserver/rpc-supplement.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,21 +57,35 @@ static int fast_eligible(unsigned int callnum) {
 #endif
 }
 
-// perf #18 P5 (dar-1il): the C2S allowlist predicate, mirroring the `eligible` check in call.cpp's
-// ringServiceThread(). mach_port_mod_refs rides the GENERIC fiber doWork() path on the ring (it has
-// a 4-arg request body; it is NOT inline/surgical-eligible -- see fast_eligible). Its body must fit
-// one inline slot (reqlen <= inlineCap). CRITICALLY this allowlist is NOT gated by any per-op env
-// hatch: a request the guest published is parked waiting for a ring reply, so silently dropping it
-// (gating off server-side) would strand the guest on its bounded reply-wait every call. mod_refs
-// rides the safe generic path, so the whole-transport switch is its only kill-switch. RED arm
-// -DC2S_NO_MODREFS drops mod_refs from the allowlist; the "is C2S-allowlisted" assertion MUST fail.
-static int c2s_allowlisted(unsigned int callnum, unsigned int reqlen, unsigned int inlinecap) {
-	int eligible = (callnum == (unsigned)dserver_callnum_task_self_trap) ||
-	               (callnum == (unsigned)dserver_callnum_mach_reply_port)
-#ifndef C2S_NO_MODREFS
-	               || (callnum == (unsigned)dserver_callnum_mach_port_mod_refs)
+// perf #18 P5 (dar-1il) / P5-bulk (dar-1il.1): the C2S allowlist predicate, mirroring the `eligible`
+// check in call.cpp's ringServiceThread(). The port/right bookkeeping ops (mach_port_mod_refs,
+// _deallocate, _allocate, _insert_right) ride the GENERIC fiber doWork() path on the ring (they
+// carry a request body; they are NOT inline/surgical-eligible -- see fast_eligible). The body must
+// fit one inline slot (reqlen <= inlineCap). CRITICALLY this allowlist is NOT gated by any per-op
+// env hatch: a request the guest published is parked waiting for a ring reply, so silently dropping
+// it (gating off server-side) would strand the guest on its bounded reply-wait every call.
+//
+// THE allowlist is now GENERATED from the SHARED DSERVER_RING_C2S_OPCODES macro -- the IDENTICAL
+// macro the server (call.cpp) and the guest (dserver-ring.c) consume -- so this mirror cannot drift
+// from the real predicate. RED arm -DC2S_NO_MODREFS removes mach_port_mod_refs from the local copy
+// of the macro below; the "is C2S-allowlisted" assertion for it MUST then fail, proving the gate
+// exercises the allowlist. (ring_drift_gate_test.c separately proves guest==server set equality.)
+#ifdef C2S_NO_MODREFS
+// RED arm: a deliberately drifted allowlist that omits mach_port_mod_refs (matches the real set
+// minus mod_refs). The "mach_port_mod_refs is C2S-allowlisted" GREEN assertion MUST then fail.
+#define C2S_GATE_OPCODES(X) \
+	X(task_self_trap) \
+	X(mach_reply_port) \
+	X(mach_port_allocate) \
+	X(mach_port_insert_right)
+#else
+#define C2S_GATE_OPCODES(X) DSERVER_RING_C2S_OPCODES(X)
 #endif
-	               ;
+static int c2s_allowlisted(unsigned int callnum, unsigned int reqlen, unsigned int inlinecap) {
+	int eligible = 0;
+#define C2S_GATE_MATCH(op) || (callnum == (unsigned)dserver_callnum_##op)
+	eligible = (0 C2S_GATE_OPCODES(C2S_GATE_MATCH));
+#undef C2S_GATE_MATCH
 	if (!eligible || reqlen > inlinecap) return 0;
 	return 1;
 }
@@ -104,6 +124,10 @@ int main(void) {
 	CHECK(fast_eligible(dserver_callnum_mach_reply_port),     "mach_reply_port is inline-eligible by default");
 	CHECK(fast_eligible(dserver_callnum_task_self_trap),      "task_self_trap is inline-eligible by default");
 	CHECK(!fast_eligible(dserver_callnum_mach_port_mod_refs), "mach_port_mod_refs is NOT inline-eligible (rides the fiber path)");
+	// perf #18 P5-bulk (dar-1il.1): the new port/right ops ALSO ride the generic fiber path, never
+	// the no-fiber inline path (mach_port_mod_refs proved these are not off-fiber-safe).
+	CHECK(!fast_eligible(dserver_callnum_mach_port_allocate),     "mach_port_allocate is NOT inline-eligible (rides the fiber path)");
+	CHECK(!fast_eligible(dserver_callnum_mach_port_insert_right), "mach_port_insert_right is NOT inline-eligible (rides the fiber path)");
 	CHECK(!fast_eligible(dserver_callnum_kprintf),            "kprintf is NOT inline-eligible");
 	CHECK(!fast_eligible(dserver_callnum_checkin),            "checkin is NOT inline-eligible");
 
@@ -131,6 +155,19 @@ int main(void) {
 	      "mach_port_mod_refs with an over-cap body is dropped (UDS fallback)");
 	CHECK(c2s_allowlisted(dserver_callnum_mach_reply_port, 0, 96),
 	      "mach_reply_port (empty body) is C2S-allowlisted");
+	// perf #18 P5-bulk (dar-1il.1): allocate + insert_right are C2S-allowlisted (Tier-1 ring).
+	// Bodies: allocate=16B {target,right,name-ptr}; insert_right=16B {target,name,poly,polyPoly} --
+	// within a 96-byte inline cap.
+	CHECK(c2s_allowlisted(dserver_callnum_mach_port_allocate, 16, 96),
+	      "mach_port_allocate (16-byte body) is C2S-allowlisted");
+	CHECK(c2s_allowlisted(dserver_callnum_mach_port_insert_right, 16, 96),
+	      "mach_port_insert_right (16-byte body) is C2S-allowlisted");
+	CHECK(!c2s_allowlisted(dserver_callnum_mach_port_allocate, 200, 96),
+	      "mach_port_allocate with an over-cap body is dropped (UDS fallback)");
+	// mach_port_deallocate is DELIBERATELY NOT allowlisted: it can trigger a vm munmap S2C upcall to
+	// the caller, which a ring-waiting (non-recvmsg) thread cannot service -> deadlock. Stays on UDS.
+	CHECK(!c2s_allowlisted(dserver_callnum_mach_port_deallocate, 8, 96),
+	      "mach_port_deallocate is NOT C2S-allowlisted (S2C-upcall deadlock hazard -> UDS only)");
 	CHECK(!c2s_allowlisted(dserver_callnum_kprintf, 4, 96),
 	      "kprintf is NOT C2S-allowlisted");
 

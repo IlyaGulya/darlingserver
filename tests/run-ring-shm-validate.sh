@@ -157,6 +157,32 @@ else
 		echo "ring_fastpath gate: RED->GREEN OK"
 		echo
 	fi
+
+	# --- P5-bulk (dar-1il.1): no-silent-drop drift gate. Guest "may publish" set == server "will
+	#     service" set (both derived from the shared DSERVER_RING_C2S_OPCODES macro). RED arm
+	#     -DDRIFT_GUEST_EXTRA gives the guest an opcode the server won't service -> the gate fails. ---
+	DRSRC="$HERE/ring_drift_gate_test.c"
+	if [ -f "$DRSRC" ]; then
+		echo "== drift GREEN arm (guest C2S set == server C2S set) =="
+		if ! "$CC" -std=c11 -I"$GEN_RPC" -I"$INC" -o "$TMP/dr_green" "$DRSRC" 2>/dev/null; then
+			echo "drift GREEN arm failed to COMPILE"; exit 2
+		fi
+		if ! "$TMP/dr_green"; then
+			echo "drift GREEN arm FAILED -- guest and server C2S allowlists are not equal"; exit 1
+		fi
+		echo
+		echo "== drift RED arm (-DDRIFT_GUEST_EXTRA: guest routes an op the server drops, MUST fail) =="
+		if ! "$CC" -std=c11 -DDRIFT_GUEST_EXTRA -I"$GEN_RPC" -I"$INC" -o "$TMP/dr_red" "$DRSRC" 2>/dev/null; then
+			echo "drift RED arm failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/dr_red" >/dev/null 2>&1; then
+			echo "drift RED arm PASSED but must FAIL -- gate not exercising the no-silent-drop invariant"; exit 1
+		fi
+		echo "  drift RED arm correctly failed."
+		echo
+		echo "ring_drift gate: RED->GREEN OK"
+		echo
+	fi
 fi
 
 # --- P7 wake-model LOST-WAKE race gate (dar-my8). Hermetic: header-only, real shm, two threads.
