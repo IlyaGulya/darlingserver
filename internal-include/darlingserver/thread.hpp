@@ -135,6 +135,13 @@ namespace DarlingServer {
 		// reply must echo. Guarded by _rwlock like the rest of the reply state.
 		bool _ringReplyPending = false;
 		uint32_t _ringReplySeq = 0;
+		// perf #18 P5-bulk (dar-1il.1): publish a complete reply Message onto the s2c ring if this
+		// thread's current call is ring-originated (_ringReplyPending), else return false so the
+		// caller sends it over UDS. Consumes _ringReplyPending. MUST be called with _rwlock held.
+		// Used by BOTH pushCallReply() (the normal path) and the deferred-S2C reply flush in
+		// _s2cPerform() -- a ring call that triggers an S2C upcall has its reply deferred, and the
+		// flush MUST go back to the ring (not UDS) or the ring-waiting guest wedges forever.
+		bool _publishReplyToRingLocked(Message& reply);
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6: scratch for the TSC cycles publishReply consumed during this call's
 		// doWork(), so ringServiceThread can subtract them from the body window. One-shot.

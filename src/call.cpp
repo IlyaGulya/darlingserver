@@ -1543,12 +1543,18 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 		// NOTE: this allowlist must NOT be gated by a per-op env hatch. A request that the guest
 		// published here is parked waiting for a ring reply; silently dropping it (consume + no
 		// reply) strands the guest on its bounded reply-wait every call (slow UDS re-fall-back per
-		// op = effectively wedged). mod_refs rides the safe GENERIC fiber path, so it needs no
+		// op = effectively wedged). These ops ride the safe GENERIC fiber path, so they need no
 		// fast-path kill-switch -- the whole-transport switch (DSERVER_RING_TRANSPORT / ABI
-		// auto-fallback) is its safety valve, exactly like task_self_trap.
-		bool eligible = (callnum == dserver_callnum_task_self_trap) ||
-		                (callnum == dserver_callnum_mach_reply_port) ||
-		                (callnum == dserver_callnum_mach_port_mod_refs);
+		// auto-fallback) is their safety valve, exactly like task_self_trap.
+		//
+		// perf #18 P5-bulk (dar-1il.1): the allowlist is GENERATED from DSERVER_RING_C2S_OPCODES
+		// (rpc-supplement.h) -- the SAME macro the guest's ring dispatch consumes -- so the guest
+		// "may publish" set and the server "will service" set can never drift (the no-silent-drop
+		// invariant; ring_drift_gate_test.c pins it). To add an op: edit the macro in ONE place.
+		bool eligible = false;
+#define DSERVER_RING_C2S_ELIGIBLE(op) || (callnum == (uint32_t)dserver_callnum_##op)
+		eligible = (false DSERVER_RING_C2S_OPCODES(DSERVER_RING_C2S_ELIGIBLE));
+#undef DSERVER_RING_C2S_ELIGIBLE
 		if (!eligible || reqlen > inlineCap) {
 			dserver_ring_consumer_advance(c2s);
 			continue;
