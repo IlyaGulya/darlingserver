@@ -1393,6 +1393,19 @@ static bool ringFastMachReplyPortEnabled() {
 // Is this callnum eligible for the no-fiber inline fast path? Must be a PROVEN-non-blocking op.
 // task_self_trap + mach_reply_port both just mint/return a port via current_task()'s space and
 // never suspend. Each gated by its hatch (task_self_trap rides the global hatch only).
+//
+// perf #18 P5 (dar-1il): mach_port_mod_refs is DELIBERATELY NOT here. Although it never blocks
+// (its processCall is Thread::syscallReturn(dtape_mach_port_mod_refs(...)) = port_name_to_task +
+// ipc_right_lookup_write + ipc_right_delta, no waitq -- see duct-tape/.../ipc/mach_port.c:974),
+// running it WITHOUT the microthread fiber (doWorkInline) was MEASURED to corrupt the thread's
+// fiber/stack bookkeeping: a later real doWork() on the same thread frees a now-garbage _stack
+// (StackPool::free -> munmap EINVAL -> std::system_error -> std::terminate -> server abort). The
+// surgical mach_reply_port path is safe inline because it only mints a port in current_task's
+// space; mach_port_mod_refs additionally does a port->task translation + task refcounting that is
+// NOT safe to execute off the fiber. So mod_refs rides the ring via the GENERIC fiber doWork()
+// (it is in the C2S allowlist below) -- that still drops it from the ~30us UDS class into the
+// ~5us ring class (P5's goal), and was proven correct under a large mint/free/ref-churn A/B. The
+// no-fiber inline sub-case is reserved for the trivial pure-mint port traps only.
 static bool ringFastPathEligible(uint32_t callnum) {
 	if (!ringFastOpsEnabled()) {
 		return false;
@@ -1517,14 +1530,25 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 			continue;
 		}
 
-		// P3 allowlist: only no-arg, single-uint32-port-reply traps may ride the ring for now.
-		// task_self_trap was the first migration (correctness-first; it's cached per-process so
-		// it doesn't move latency); mach_reply_port is the UNCACHED high-frequency op the profile
-		// flagged -- it's the one that actually moves the A/B needle. Both have an empty request
-		// body and a {replyhdr.code, uint32 port} reply, so they share the exact same datapath.
-		// Anything else -> drop (consume so we don't spin); the guest will UDS-fall-back for it.
+		// C2S allowlist: which call numbers may ride the ring. task_self_trap was the first
+		// migration (correctness-first; cached per-process so it doesn't move latency);
+		// mach_reply_port is the UNCACHED high-frequency port trap (empty body, {replyhdr.code,
+		// uint32 port} reply). perf #18 P5 (dar-1il): mach_port_mod_refs joins -- it carries a
+		// 4-arg request BODY (target,name,right,delta) and a HEADER-ONLY reply (the result is the
+		// kern_return_t code, no port), so it exercises the generic body-copy datapath below
+		// (NOT the empty-body surgical path). The Message is rebuilt as {callhdr, body} exactly as
+		// over UDS and dispatched via callFromMessage -> the same MachPortModRefs::processCall ->
+		// the same dtape primitive, so behavior is byte-identical to UDS. Anything not allowlisted
+		// -> drop (consume so we don't spin); the guest will UDS-fall-back for it.
+		// NOTE: this allowlist must NOT be gated by a per-op env hatch. A request that the guest
+		// published here is parked waiting for a ring reply; silently dropping it (consume + no
+		// reply) strands the guest on its bounded reply-wait every call (slow UDS re-fall-back per
+		// op = effectively wedged). mod_refs rides the safe GENERIC fiber path, so it needs no
+		// fast-path kill-switch -- the whole-transport switch (DSERVER_RING_TRANSPORT / ABI
+		// auto-fallback) is its safety valve, exactly like task_self_trap.
 		bool eligible = (callnum == dserver_callnum_task_self_trap) ||
-		                (callnum == dserver_callnum_mach_reply_port);
+		                (callnum == dserver_callnum_mach_reply_port) ||
+		                (callnum == dserver_callnum_mach_port_mod_refs);
 		if (!eligible || reqlen > inlineCap) {
 			dserver_ring_consumer_advance(c2s);
 			continue;

@@ -30,7 +30,11 @@ static int env_off(const char* name) {
 	return (e && e[0] == '0' && e[1] == '\0');
 }
 
-// The predicate under test, mirroring call.cpp's ringFastPathEligible().
+// The predicate under test, mirroring call.cpp's ringFastPathEligible() (the no-fiber INLINE
+// fast path). perf #18 P5 (dar-1il): mach_port_mod_refs is DELIBERATELY NOT inline-eligible --
+// running it off the microthread fiber corrupted the thread's stack bookkeeping (server abort in
+// StackPool::free). It rides the ring via the GENERIC fiber doWork() instead (see c2s_allowlisted).
+// So the inline predicate must REJECT mod_refs; the assertion below pins that.
 static int fast_eligible(unsigned int callnum) {
 #ifndef FASTPATH_NO_HATCH
 	if (env_off("DARLING_SERVER_FAST_OPS")) return 0;            // global kill-switch
@@ -41,10 +45,29 @@ static int fast_eligible(unsigned int callnum) {
 	return 0;
 #else
 	// RED arm: ignores the hatches entirely (the bug we must catch).
-	if (callnum == (unsigned)dserver_callnum_mach_reply_port) return 1;
-	if (callnum == (unsigned)dserver_callnum_task_self_trap)  return 1;
+	if (callnum == (unsigned)dserver_callnum_mach_reply_port)    return 1;
+	if (callnum == (unsigned)dserver_callnum_task_self_trap)     return 1;
 	return 0;
 #endif
+}
+
+// perf #18 P5 (dar-1il): the C2S allowlist predicate, mirroring the `eligible` check in call.cpp's
+// ringServiceThread(). mach_port_mod_refs rides the GENERIC fiber doWork() path on the ring (it has
+// a 4-arg request body; it is NOT inline/surgical-eligible -- see fast_eligible). Its body must fit
+// one inline slot (reqlen <= inlineCap). CRITICALLY this allowlist is NOT gated by any per-op env
+// hatch: a request the guest published is parked waiting for a ring reply, so silently dropping it
+// (gating off server-side) would strand the guest on its bounded reply-wait every call. mod_refs
+// rides the safe generic path, so the whole-transport switch is its only kill-switch. RED arm
+// -DC2S_NO_MODREFS drops mod_refs from the allowlist; the "is C2S-allowlisted" assertion MUST fail.
+static int c2s_allowlisted(unsigned int callnum, unsigned int reqlen, unsigned int inlinecap) {
+	int eligible = (callnum == (unsigned)dserver_callnum_task_self_trap) ||
+	               (callnum == (unsigned)dserver_callnum_mach_reply_port)
+#ifndef C2S_NO_MODREFS
+	               || (callnum == (unsigned)dserver_callnum_mach_port_mod_refs)
+#endif
+	               ;
+	if (!eligible || reqlen > inlinecap) return 0;
+	return 1;
 }
 
 // perf #18 P6.1 step 2 (dar-ohp): the SURGICAL direct-dispatch predicate, mirroring call.cpp's
@@ -74,25 +97,42 @@ static void setenv01(const char* n, int off) {
 }
 
 int main(void) {
-	// --- allowlist: only the two no-block port traps are eligible ---------------------------
+	// --- INLINE allowlist: only the trivial pure-mint port traps are inline-eligible ---------
+	// mach_port_mod_refs is INTENTIONALLY excluded (it crashed the server off the fiber).
 	setenv01("DARLING_SERVER_FAST_OPS", 0);
 	setenv01("DARLING_SERVER_FAST_MACH_REPLY_PORT", 0);
-	CHECK(fast_eligible(dserver_callnum_mach_reply_port), "mach_reply_port is fast-eligible by default");
-	CHECK(fast_eligible(dserver_callnum_task_self_trap),  "task_self_trap is fast-eligible by default");
-	CHECK(!fast_eligible(dserver_callnum_kprintf),        "kprintf is NOT fast-eligible");
-	CHECK(!fast_eligible(dserver_callnum_checkin),        "checkin is NOT fast-eligible");
+	CHECK(fast_eligible(dserver_callnum_mach_reply_port),     "mach_reply_port is inline-eligible by default");
+	CHECK(fast_eligible(dserver_callnum_task_self_trap),      "task_self_trap is inline-eligible by default");
+	CHECK(!fast_eligible(dserver_callnum_mach_port_mod_refs), "mach_port_mod_refs is NOT inline-eligible (rides the fiber path)");
+	CHECK(!fast_eligible(dserver_callnum_kprintf),            "kprintf is NOT inline-eligible");
+	CHECK(!fast_eligible(dserver_callnum_checkin),            "checkin is NOT inline-eligible");
 
-	// --- escape hatch: global kill-switch disables ALL fast paths ---------------------------
+	// --- escape hatch: global kill-switch disables ALL inline fast paths --------------------
 	setenv01("DARLING_SERVER_FAST_OPS", 1);
-	CHECK(!fast_eligible(dserver_callnum_mach_reply_port), "FAST_OPS=0 disables mach_reply_port fast path");
-	CHECK(!fast_eligible(dserver_callnum_task_self_trap),  "FAST_OPS=0 disables task_self_trap fast path");
+	CHECK(!fast_eligible(dserver_callnum_mach_reply_port),    "FAST_OPS=0 disables mach_reply_port inline path");
+	CHECK(!fast_eligible(dserver_callnum_task_self_trap),     "FAST_OPS=0 disables task_self_trap inline path");
 	setenv01("DARLING_SERVER_FAST_OPS", 0);
 
 	// --- escape hatch: per-op kill-switch disables just mach_reply_port ----------------------
 	setenv01("DARLING_SERVER_FAST_MACH_REPLY_PORT", 1);
-	CHECK(!fast_eligible(dserver_callnum_mach_reply_port), "FAST_MACH_REPLY_PORT=0 disables mach_reply_port fast path");
-	CHECK(fast_eligible(dserver_callnum_task_self_trap),   "FAST_MACH_REPLY_PORT=0 leaves task_self_trap fast path on");
+	CHECK(!fast_eligible(dserver_callnum_mach_reply_port), "FAST_MACH_REPLY_PORT=0 disables mach_reply_port inline path");
+	CHECK(fast_eligible(dserver_callnum_task_self_trap),   "FAST_MACH_REPLY_PORT=0 leaves task_self_trap inline path on");
 	setenv01("DARLING_SERVER_FAST_MACH_REPLY_PORT", 0);
+
+	// --- P5 C2S allowlist: mach_port_mod_refs rides the GENERIC fiber path on the ring --------
+	// inlineCap for the guest's 128B slot is 128 - sizeof(dserver_ring_slot_t); the 16-byte body
+	// (4 args) fits easily. Use a representative cap of 96 (>= 16). Allowlisted with a body, and
+	// dropped if the body would overflow the slot. The allowlist is NOT env-gated (gating off a
+	// guest-published op would strand the guest on its reply-wait). RED arm -DC2S_NO_MODREFS drops
+	// it -> the first assertion fails.
+	CHECK(c2s_allowlisted(dserver_callnum_mach_port_mod_refs, 16, 96),
+	      "mach_port_mod_refs (16-byte body) is C2S-allowlisted");
+	CHECK(!c2s_allowlisted(dserver_callnum_mach_port_mod_refs, 200, 96),
+	      "mach_port_mod_refs with an over-cap body is dropped (UDS fallback)");
+	CHECK(c2s_allowlisted(dserver_callnum_mach_reply_port, 0, 96),
+	      "mach_reply_port (empty body) is C2S-allowlisted");
+	CHECK(!c2s_allowlisted(dserver_callnum_kprintf, 4, 96),
+	      "kprintf is NOT C2S-allowlisted");
 
 	// --- P6.1 step 2: surgical mach_reply_port direct dispatch + shape guard -----------------
 	setenv01("DARLING_SERVER_FAST_OPS", 0);
