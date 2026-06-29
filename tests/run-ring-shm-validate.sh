@@ -203,6 +203,60 @@ else
 		echo "ring_drift gate: RED->GREEN OK"
 		echo
 	fi
+
+	# --- Phase A (dar-dar6x4-perf-5dq.30.1): THREE-LANE op classification + the static guardrail that
+	#     a destroy-capable / caller-S2C op CANNOT enter the simple ring. Two kinds of arm:
+	#       (i)  C host gate (ring_lane_class_gate_test.c): GREEN runs; RED -DLANECLASS_READD_DEALLOCATE
+	#            and -DLANECLASS_DESTROY_IN_RING fold the canon predicate over a drifted/mis-tagged set
+	#            and MUST exit nonzero.
+	#       (ii) C++ COMPILE-TIME guardrail: the header's static_assert(dserver_ring_c2s_set_is_canon_safe)
+	#            MUST compile clean GREEN and MUST FAIL TO COMPILE under
+	#            -DDSERVER_RING_LANECLASS_RED_DESTROY_IN_RING (which OR's DestroyCapable onto a real
+	#            simple-ring member). This proves the compile-time guardrail is live, not vacuous. ---
+	LCSRC="$HERE/ring_lane_class_gate_test.c"
+	if [ -f "$LCSRC" ]; then
+		echo "== lane-class GREEN arm (three-lane classification + canon guardrail hold) =="
+		if ! "$CC" -std=c11 -I"$GEN_RPC" -I"$INC" -o "$TMP/lc_green" "$LCSRC" 2>/dev/null; then
+			echo "lane-class GREEN arm failed to COMPILE"; exit 2
+		fi
+		if ! "$TMP/lc_green"; then
+			echo "lane-class GREEN arm FAILED"; exit 1
+		fi
+		echo
+		echo "== lane-class RED arm A (-DLANECLASS_READD_DEALLOCATE: destroy-capable op in the set, MUST fail) =="
+		if ! "$CC" -std=c11 -DLANECLASS_READD_DEALLOCATE -I"$GEN_RPC" -I"$INC" -o "$TMP/lc_redA" "$LCSRC" 2>/dev/null; then
+			echo "lane-class RED arm A failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/lc_redA" >/dev/null 2>&1; then
+			echo "lane-class RED arm A PASSED but must FAIL -- the canon fold does not reject a destroy-capable member"; exit 1
+		fi
+		echo "  lane-class RED arm A correctly failed."
+		echo
+		echo "== lane-class RED arm B (-DLANECLASS_DESTROY_IN_RING: mis-tag a real simple-ring op, MUST fail) =="
+		if ! "$CC" -std=c11 -DLANECLASS_DESTROY_IN_RING -I"$GEN_RPC" -I"$INC" -o "$TMP/lc_redB" "$LCSRC" 2>/dev/null; then
+			echo "lane-class RED arm B failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/lc_redB" >/dev/null 2>&1; then
+			echo "lane-class RED arm B PASSED but must FAIL -- the canon fold does not read the destroy bit"; exit 1
+		fi
+		echo "  lane-class RED arm B correctly failed."
+		echo
+		# COMPILE-TIME guardrail: the static_assert in the header.
+		echo "== lane-class static_assert GREEN (header must COMPILE in C++) =="
+		printf '#define DSERVER_RING_TRANSPORT 1\n#define DSERVER_RING_NO_ATTACH_CHECK 1\n#include <darlingserver/rpc.h>\n#include <darlingserver/rpc-supplement.h>\nint main(){return 0;}\n' > "$TMP/lc_sa.cpp"
+		if ! "$CXX" -std=c++17 -I"$GEN_RPC" -I"$INC" -fsyntax-only "$TMP/lc_sa.cpp" 2>/dev/null; then
+			echo "lane-class static_assert GREEN FAILED to compile -- the shipped classification violates the canon"; exit 1
+		fi
+		echo "  static_assert GREEN compiles."
+		echo "== lane-class static_assert RED (-DDSERVER_RING_LANECLASS_RED_DESTROY_IN_RING MUST FAIL to compile) =="
+		if "$CXX" -std=c++17 -DDSERVER_RING_LANECLASS_RED_DESTROY_IN_RING -I"$GEN_RPC" -I"$INC" -fsyntax-only "$TMP/lc_sa.cpp" 2>/dev/null; then
+			echo "lane-class static_assert RED COMPILED but must FAIL -- the compile-time guardrail is vacuous"; exit 1
+		fi
+		echo "  static_assert RED correctly failed to compile."
+		echo
+		echo "ring_lane_class gate: RED->GREEN OK"
+		echo
+	fi
 fi
 
 # --- P7 wake-model LOST-WAKE race gate (dar-my8). Hermetic: header-only, real shm, two threads.
