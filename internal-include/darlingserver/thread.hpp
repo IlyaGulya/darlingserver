@@ -135,6 +135,11 @@ namespace DarlingServer {
 		// reply must echo. Guarded by _rwlock like the rest of the reply state.
 		bool _ringReplyPending = false;
 		uint32_t _ringReplySeq = 0;
+#ifdef DSERVER_RING_PHASE_PROF
+		// perf #18 P6: scratch for the TSC cycles publishReply consumed during this call's
+		// doWork(), so ringServiceThread can subtract them from the body window. One-shot.
+		uint64_t _ringPublishCycles = 0;
+#endif
 #endif
 
 		static void microthreadWorker();
@@ -307,6 +312,10 @@ namespace DarlingServer {
 		// existing dispatch (and thus the dar-l8k UAF / dar-6x4 rwlock fixes) -- only the reply
 		// SINK changes, not the execution path.
 		void beginRingReply(uint32_t seq);
+#ifdef DSERVER_RING_PHASE_PROF
+		// perf #18 P6: read + clear the publish-phase TSC cycles recorded during the last reply.
+		uint64_t takeRingPublishCycles();
+#endif
 #endif
 
 		/**

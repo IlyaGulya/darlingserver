@@ -1499,7 +1499,14 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 				int32_t code = rhdr->code;
 				// publish under the lock is fine (no suspend, no Server-state mutation); the
 				// FUTEX_WAKE is a bare syscall and likewise can't re-enter our locks.
-				if (!ring->publishReply(seq, callnum, code, body, bodyLen)) {
+#ifdef DSERVER_RING_PHASE_PROF
+				uint64_t _pubT0 = Metrics::rdtscCycles();
+#endif
+				bool published = ring->publishReply(seq, callnum, code, body, bodyLen);
+#ifdef DSERVER_RING_PHASE_PROF
+				_ringPublishCycles = Metrics::rdtscCycles() - _pubT0; // read back by ringServiceThread
+#endif
+				if (!published) {
 					// s2c full: fall back to a UDS reply so the guest still gets its answer.
 					Server::sharedInstance().sendMessage(std::move(reply));
 				} else {
@@ -1687,6 +1694,14 @@ void DarlingServer::Thread::beginRingReply(uint32_t seq) {
 	_ringReplyPending = true;
 	_ringReplySeq = seq;
 };
+#ifdef DSERVER_RING_PHASE_PROF
+uint64_t DarlingServer::Thread::takeRingPublishCycles() {
+	// no lock: only the main loop touches this, in the same ringServiceThread call chain.
+	uint64_t v = _ringPublishCycles;
+	_ringPublishCycles = 0;
+	return v;
+};
+#endif
 #endif
 
 void DarlingServer::Thread::_dispose() {
