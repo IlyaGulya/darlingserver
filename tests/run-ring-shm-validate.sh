@@ -15,6 +15,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 CXX="${CXX:-g++}"
+CC="${CC:-gcc}"
 
 echo "== RED arm (accept-all stub: adversarial cases MUST fail) =="
 if ! "$CXX" -std=c++17 -I"$INC" -DRING_VALIDATE_STUB -o "$TMP/red" "$SRC"; then
@@ -114,6 +115,30 @@ else
 	echo
 	echo "ring_allowlist gate: RED->GREEN OK"
 	echo
+
+	# --- P6.1 fast-path eligibility + escape hatches (dar-ohp). Reuses $GEN_RPC. ---
+	FPSRC="$HERE/ring_fastpath_gate_test.c"
+	if [ -f "$FPSRC" ]; then
+		echo "== fast-path GREEN arm (hatch-aware: allowlist + env kill-switches) =="
+		if ! "$CC" -std=c11 -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_green" "$FPSRC" 2>/dev/null; then
+			echo "fast-path GREEN arm failed to COMPILE"; exit 2
+		fi
+		if ! "$TMP/fp_green"; then
+			echo "fast-path GREEN arm FAILED"; exit 1
+		fi
+		echo
+		echo "== fast-path RED arm (-DFASTPATH_NO_HATCH: ignores hatches, MUST fail) =="
+		if ! "$CC" -std=c11 -DFASTPATH_NO_HATCH -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_red" "$FPSRC" 2>/dev/null; then
+			echo "fast-path RED arm failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/fp_red" >/dev/null 2>&1; then
+			echo "fast-path RED arm PASSED but must FAIL -- gate not exercising the hatches"; exit 1
+		fi
+		echo "  fast-path RED arm correctly failed."
+		echo
+		echo "ring_fastpath gate: RED->GREEN OK"
+		echo
+	fi
 fi
 
 echo "all perf#18 ring gates: OK"

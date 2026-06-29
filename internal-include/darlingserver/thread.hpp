@@ -216,6 +216,22 @@ namespace DarlingServer {
 
 		void doWork();
 
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 P6.1 (dar-ohp): run a PROVEN-NON-BLOCKING Call to completion WITHOUT the
+		// microthread fiber. doWork() always allocates a stack and makecontext/setcontext-swaps
+		// onto a fiber so the call can suspend; for a tiny self-trap that never suspends (e.g.
+		// mach_reply_port) that fiber machinery is ~half the hot-path cost. doWorkInline()
+		// establishes the SAME duct-tape context (currentThreadVar + dtape_thread_entering, so
+		// current_task()/current_thread() resolve identically) and calls the SAME processCall()
+		// on the current (main-loop) stack, then runs the same completion cleanup.
+		//
+		// CONTRACT: the caller MUST guarantee the call never suspends (never calls suspend()).
+		// If it does, there is no fiber to switch back to -> UB. Use ONLY for the ring fast-path
+		// allowlist of no-block ops. Returns true if it ran inline to completion; false if it
+		// declined (deferred/running/terminating/dead) so the caller can fall back to doWork().
+		bool doWorkInline();
+#endif
+
 		// perf #2b (dar-dar6x4-perf-5dq.8): the main event loop runs cheap, non-blocking
 		// RPCs inline via doWork() instead of paying a worker-thread wakeup. After an inline
 		// doWork() returns, this reports whether the microthread is still suspended (i.e. the
