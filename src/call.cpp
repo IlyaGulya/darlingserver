@@ -1335,4 +1335,60 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 	_sendReply(code, portCount, pipes[0]);
 };
 
+// perf #18 (dar-dar6x4-perf-5dq.30): shared-memory ring transport negotiation handler.
+//
+// The guest sends a memfd (via @fd, dup'd into _body.ring_fd) holding a dserver_ring_shm
+// control block + rings + arena, plus the size it claims the mapping is. We treat all of it
+// as untrusted: dserver_ring_attach_check() fstats the fd for its REAL size, maps it
+// read-only, copies the control block out, and runs the pure validator -- dereferencing no
+// guest pointer and trusting no guest-supplied length. reject_reason is 0 (dserver_ring_ok)
+// on accept or a dserver_ring_reject_t code; on any reject (or with the feature compiled
+// off) the guest stays on UDS forever, no error -- the ring is a fast path, never the only
+// path. This increment performs the full attach DECISION and reply; retaining the RW mapping
+// and registering the ring's wake eventfd in the epoll loop is the next sub-step (it needs
+// the guest side to actually drive traffic, so there is nothing to wake yet).
+void DarlingServer::Call::RingAttach::processCall() {
+#ifdef DSERVER_RING_TRANSPORT
+	uint32_t rejectReason = dserver_ring_reject_total_size; // default-deny
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (_body.ring_fd < 0) {
+			// no fd arrived -- can't be a valid attach
+			rejectReason = dserver_ring_reject_total_size;
+		} else {
+			uint64_t realSize = 0;
+			dserver_ring_shm_t cb;
+			rejectReason = dserver_ring_attach_check(
+				_body.ring_fd,
+				_body.mapping_size,
+				static_cast<int32_t>(thread->nsid()),
+				&realSize,
+				&cb
+			);
+			if (rejectReason == dserver_ring_ok) {
+				// Accepted: the control block is well-formed and the guest_tid matches this
+				// thread's nsid. (Next sub-step: keep the RW mapping + register cb.c2s_futex's
+				// eventfd as a Monitor so the epoll loop drains this ring.) For now we accept
+				// the handshake and let the FD close at end of call.
+				callLog.debug() << "ring_attach accepted for TID " << thread->nsid()
+					<< " (size " << realSize << ", " << cb.slot_count << " slots of " << cb.slot_size << "B)"
+					<< callLog.endLog;
+			} else {
+				callLog.info() << "ring_attach rejected for TID " << thread->nsid()
+					<< " reason " << rejectReason << " -- thread stays on UDS" << callLog.endLog;
+			}
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, rejectReason);
+#else
+	// feature compiled out: a ring-capable guest gets a clean "unsupported" and falls back
+	// to UDS. reject_reason is non-zero so the guest never believes the ring was accepted.
+	_sendReply(0, static_cast<uint32_t>(1) /* dserver_ring_reject_magic-ish: any non-ok */);
+#endif
+};
+
 DSERVER_CLASS_SOURCE_DEFS;

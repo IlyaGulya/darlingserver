@@ -286,6 +286,61 @@ static inline dserver_ring_reject_t dserver_ring_shm_validate(
 	return dserver_ring_ok;
 }
 
+// Server-side ring_attach decision: given the memfd the guest passed, its claimed size, and
+// the SCM-credentialed nsid, decide whether to accept the ring. This is the bridge between
+// the pure validator above and real kernel state -- it fstats the fd for its TRUE size
+// (never trusting the guest's mapping_size), maps it read-only just to read the control
+// block, copies the control block OUT (so validation runs on a stable server-owned copy, not
+// the page the guest can mutate), validates, and unmaps. On success it hands back the real
+// size and the validated control-block copy via out-params so the caller can keep the
+// mapping; on any failure it returns the reject reason and maps nothing lasting.
+//
+// Header-only + dependency-free (only <sys/mman.h>, <sys/stat.h>, <unistd.h>, <string.h>) so
+// the adversarial test drives it with a real memfd, exactly as the server will. Returns
+// dserver_ring_ok or a reject reason; *out_real_size / *out_cb are written only on ok.
+#if defined(__linux__) && !defined(DSERVER_RING_NO_ATTACH_CHECK)
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string.h>
+
+static inline dserver_ring_reject_t dserver_ring_attach_check(
+	int ring_fd,             // the memfd the guest sent via @fd
+	uint64_t claimed_size,   // mapping_size the guest claimed in the RPC (cross-checked, not trusted)
+	int32_t scm_nsid,        // the thread nsid from the kernel
+	uint64_t* out_real_size, // [out] the fstat size, written on ok
+	dserver_ring_shm_t* out_cb // [out] validated copy of the control block, written on ok
+) {
+	struct stat st;
+	if (fstat(ring_fd, &st) != 0) return dserver_ring_reject_total_size;
+	uint64_t real_size = (uint64_t)st.st_size;
+
+	// the guest's claimed size must match the real fd size (a lie is a protocol violation),
+	// and must be at least the control block + within the hard cap before we even map it.
+	if (claimed_size != real_size) return dserver_ring_reject_total_size;
+	if (real_size < sizeof(dserver_ring_shm_t) || real_size > DSERVER_RING_MAX_TOTAL_SIZE) return dserver_ring_reject_total_size;
+
+	// map read-only just to read the header; the real attach (caller) will map RW after ok.
+	void* map = mmap(NULL, sizeof(dserver_ring_shm_t), PROT_READ, MAP_SHARED, ring_fd, 0);
+	if (map == MAP_FAILED) return dserver_ring_reject_total_size;
+
+	// copy the control block out of the shared page IMMEDIATELY -- never validate in place,
+	// the guest can race a write between any two reads.
+	dserver_ring_shm_t cb;
+	memcpy(&cb, map, sizeof(cb));
+	munmap(map, sizeof(dserver_ring_shm_t));
+
+	dserver_ring_reject_t r = dserver_ring_shm_validate(&cb, real_size, scm_nsid);
+	if (r != dserver_ring_ok) return r;
+
+	if (out_real_size) *out_real_size = real_size;
+	if (out_cb) *out_cb = cb;
+	return dserver_ring_ok;
+}
+
+#endif // __linux__ && !DSERVER_RING_NO_ATTACH_CHECK
+
 #endif // DSERVER_RING_TRANSPORT
 
 //
