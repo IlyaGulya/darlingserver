@@ -385,6 +385,118 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 	X(mach_port_allocate) \
 	X(mach_port_insert_right)
 
+// === perf #18 Phase A (dar-dar6x4-perf-5dq.30.1): THREE-LANE hybrid IPC taxonomy + guardrail ======
+//
+// plan.md ("Hybrid Ring Architecture Brief") froze the target as a MULTI-LANE IPC, not "a faster UDS
+// for every RPC". Each op rides the CHEAPEST lane that preserves its semantics:
+//   Lane 0  UDS            -- control/fallback: bootstrap, creds, fd-passing, unknown/complex ops,
+//                             and destroy-capable / caller-S2C ops UNTIL a duplex lane proves them.
+//   Lane 1  simple ring    -- CLOSED request->single-reply transactions, NO caller S2C while parked.
+//                             Two sub-tiers (see below): generic-fiber (Tier 1) and no-fiber (Tier 2).
+//   Lane 2  duplex ring    -- FUTURE reentrant lane for caller-S2C-capable ops (dar-1il.3). Not built.
+//
+// The lane an op MAY use is a set of orthogonal, independently-proven properties. Encode them as
+// explicit bits so the code stops overloading "fast op" / "allowlist" / "ring op" (plan.md §6):
+//
+//   SimpleRingC2SEligible  -- may ride the Lane-1 simple ring (== membership in DSERVER_RING_C2S_OPCODES)
+//   NoFiberFastEligible    -- may ALSO skip the generic fiber/Call machinery (Tier 2; ringFastPathEligible)
+//   DuplexRingEligible     -- may ride the FUTURE Lane-2 duplex ring (no op qualifies yet)
+//   UdsOnly                -- must stay on UDS for now (no ring lane is safe for it yet)
+//   DestroyCapable         -- may, for SOME args, drop a last ref / tear down / cause a caller S2C
+//   CallerS2CCapable       -- may synchronously upcall the CALLER (mmap/munmap/...) before its reply
+//
+// POLICY (these are the load-bearing relationships; the static guardrail below enforces #2/#3):
+//   1. SimpleRingC2SEligible, NoFiberFastEligible, and DuplexRingEligible are DISTINCT concepts.
+//      SimpleRingC2SEligible does NOT imply NoFiberFastEligible (Tier 2 is a strictly smaller proven
+//      set). A future DuplexRingEligible op is NOT automatically SimpleRingC2SEligible.
+//   2. DestroyCapable  => NOT SimpleRingC2SEligible. (canon rule 2: a teardown can drive a caller S2C.)
+//   3. CallerS2CCapable => NOT SimpleRingC2SEligible. (canon rule 1: a parked caller can't service it.)
+//   4. NoFiberFastEligible => SimpleRingC2SEligible. (Tier 2 is a sub-lane of Tier 1.)
+//
+// CLASSIFICATION TABLE: every Mach op that is RING-RELEVANT (already on a ring lane, or a known
+// future/duplex candidate the canon has ruled on) is listed here with its lane-class bits, so the
+// guardrail can mechanically cross-check the simple-ring set against the destroy/S2C prohibition.
+// An op that never comes near a ring lane (the vast majority) need NOT be listed -- absence just
+// means "unclassified == treated as UdsOnly by default". X is invoked as X(op, classbits).
+#define DSERVER_RING_CLASS_SIMPLE_C2S   0x01u // SimpleRingC2SEligible: in DSERVER_RING_C2S_OPCODES
+#define DSERVER_RING_CLASS_NOFIBER_FAST 0x02u // NoFiberFastEligible: Tier-2 no-fiber direct dispatch
+#define DSERVER_RING_CLASS_DUPLEX       0x04u // DuplexRingEligible: future Lane-2 (none yet)
+#define DSERVER_RING_CLASS_UDS_ONLY     0x08u // UdsOnly: no ring lane safe yet
+#define DSERVER_RING_CLASS_DESTROY      0x10u // DestroyCapable: can tear down / drop last ref
+#define DSERVER_RING_CLASS_CALLER_S2C   0x20u // CallerS2CCapable: can upcall the caller pre-reply
+
+#define DSERVER_RING_OP_CLASS(X) \
+	/* Lane 1 + Tier 2 (no-fiber): pure mint, never blocks, never an S2C. */ \
+	X(task_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
+	X(mach_reply_port,        DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
+	/* Lane 1 Tier 1 (generic fiber): create/ref bookkeeping, no teardown, no caller S2C. */ \
+	X(mach_port_allocate,     DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(mach_port_insert_right, DSERVER_RING_CLASS_SIMPLE_C2S) \
+	/* UDS-only today: destroy-capable -> caller-S2C deadlock on the simple ring. The right home is */ \
+	/* the future duplex lane (dar-1il.3) -- "wrong lane, not bad op". They are DuplexRingEligible */ \
+	/* CANDIDATES but NOT yet proven, so they carry UDS_ONLY until Phase D/E lands. */ \
+	X(mach_port_deallocate,   DSERVER_RING_CLASS_UDS_ONLY | DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C) \
+	X(mach_port_mod_refs,     DSERVER_RING_CLASS_UDS_ONLY | DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C)
+
+// dserver_ring_op_class(): the lane-class bits for a callnum, or 0 (== unclassified, treat as UdsOnly)
+// if the op is not in the table. Only defined where rpc.h (the callnum source) is in scope, like the
+// opcode hash; the server build always has it. Header-only; pure chain of integer comparisons, no
+// allocation. constexpr under C++ (so it folds inside the static_assert below); plain inline in C.
+#ifdef _DARLINGSERVER_API_H_
+#if defined(__cplusplus)
+#define DSERVER_RING_OPCLASS_LINKAGE constexpr
+#else
+#define DSERVER_RING_OPCLASS_LINKAGE static inline
+#endif
+DSERVER_RING_OPCLASS_LINKAGE uint32_t dserver_ring_op_class(uint32_t callnum) {
+	// RED-ARM HOOK (gate-only, never defined in a real build): when the lane-class gate compiles this
+	// header with -DDSERVER_RING_LANECLASS_RED_DESTROY_IN_RING, OR the DestroyCapable bit onto a
+	// genuine simple-ring member (mach_port_allocate). That makes dserver_ring_c2s_set_is_canon_safe()
+	// false and the static_assert below FAIL TO COMPILE -- proving the compile-time guardrail is live,
+	// not vacuous. run-ring-shm-validate.sh asserts this arm fails to build.
+#ifdef DSERVER_RING_LANECLASS_RED_DESTROY_IN_RING
+	if (callnum == (uint32_t)dserver_callnum_mach_port_allocate)
+		return DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_DESTROY;
+#endif
+#define DSERVER_RING_OP_CLASS_CASE(op, bits) if (callnum == (uint32_t)dserver_callnum_##op) return (bits);
+	DSERVER_RING_OP_CLASS(DSERVER_RING_OP_CLASS_CASE)
+#undef DSERVER_RING_OP_CLASS_CASE
+	return 0u;
+}
+
+// === STATIC GUARDRAIL (plan.md §17.3): a destroy-capable / caller-S2C op CANNOT enter the simple =====
+// ring set. Cross-check, at COMPILE TIME on the server (and at runtime in the C guest mirror gate),
+// that every op the table marks SimpleRingC2SEligible is (a) actually in DSERVER_RING_C2S_OPCODES and
+// (b) NOT marked DestroyCapable or CallerS2CCapable, and conversely that every op in
+// DSERVER_RING_C2S_OPCODES is classified SimpleRingC2SEligible. This makes canon rules 1-2 a build
+// error, not a review checklist: re-adding deallocate/mod_refs to the macro (or mis-tagging a real
+// simple-ring op as destroy-capable) fails to compile. The bead's RED arms exercise exactly that.
+//
+// Property folded to a single bool over the WHOLE simple-ring set: each member must be classified
+// SIMPLE_C2S and must carry NEITHER destroy NOR caller-S2C bit. (We can only check the C2S set here,
+// not the reverse "every SIMPLE_C2S-tagged op is in the macro" -- the macro is the set of record; a
+// tag claiming SIMPLE_C2S on an op the macro omits is a documentation slip, caught by the gate test.)
+#define DSERVER_RING_C2S_MEMBER_IS_SAFE(op) \
+	&& ((dserver_ring_op_class((uint32_t)dserver_callnum_##op) & DSERVER_RING_CLASS_SIMPLE_C2S) != 0u) \
+	&& ((dserver_ring_op_class((uint32_t)dserver_callnum_##op) & (DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C)) == 0u)
+// Constant-foldable predicate (true iff the whole simple-ring set obeys the canon). Used by the
+// static_assert (C++) and the guest mirror gate (C). RED arms flip a member's class to break it.
+// constexpr under C++ so it is usable in static_assert; plain inline in C.
+DSERVER_RING_OPCLASS_LINKAGE int dserver_ring_c2s_set_is_canon_safe(void) {
+	return (1 DSERVER_RING_C2S_OPCODES(DSERVER_RING_C2S_MEMBER_IS_SAFE)) ? 1 : 0;
+}
+#if defined(__cplusplus) && !defined(DSERVER_RING_NO_LANECLASS_ASSERT)
+// Compile-time enforcement in the server build. dserver_ring_op_class is a pure constexpr-foldable
+// chain of integer comparisons over compile-time-constant callnums, so the whole fold is a constant
+// expression; a violating classification makes this assertion fail to compile.
+static_assert(dserver_ring_c2s_set_is_canon_safe(),
+	"perf#18 canon: a DSERVER_RING_C2S_OPCODES member is classified DestroyCapable/CallerS2CCapable "
+	"(or not SimpleRingC2SEligible) in DSERVER_RING_OP_CLASS -- a destroy-capable/caller-S2C op must "
+	"NOT ride the simple ring (it deadlocks a parked caller on an S2C upcall). See the membership canon "
+	"above; such ops belong on the future duplex lane (dar-1il.3), not Lane 1.");
+#endif
+#endif // _DARLINGSERVER_API_H_
+
 // --- C2S opcode-set ABI tie (perf #18 dar-1il.2 item 2) ---------------------------------------
 //
 // The shared X-macro above makes the guest and server allowlists drift-proof ONLY when both are
