@@ -145,6 +145,15 @@ else
 		fi
 		echo "  fast-path shape RED arm correctly failed."
 		echo
+		echo "== P5 mod_refs C2S allowlist RED arm (-DC2S_NO_MODREFS: drops mod_refs from the C2S allowlist, MUST fail) =="
+		if ! "$CC" -std=c11 -DC2S_NO_MODREFS -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_c2s_red" "$FPSRC" 2>/dev/null; then
+			echo "P5 mod_refs C2S RED arm failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/fp_c2s_red" >/dev/null 2>&1; then
+			echo "P5 mod_refs C2S RED arm PASSED but must FAIL -- gate not exercising the C2S allowlist"; exit 1
+		fi
+		echo "  P5 mod_refs C2S RED arm correctly failed."
+		echo
 		echo "ring_fastpath gate: RED->GREEN OK"
 		echo
 	fi
