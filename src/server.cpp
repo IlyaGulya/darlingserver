@@ -1080,6 +1080,24 @@ void DarlingServer::Server::_resolveRingSpinBudget() {
 		}
 	}
 	_ringSpinNs = us * 1000ull;
+
+	// perf #18 P7 (dar-my8): one-time startup announcement of the ring config. The gist's staged
+	// rollout wants operators to SEE, in the log, that the experimental ring transport is active,
+	// in which mode, and exactly how to turn it (or just the fast ops) off. Resolved once, so this
+	// fires once when the first ring attaches.
+	static DarlingServer::Log ringLog("ring");
+	const char* fastOps = (getenv("DARLING_SERVER_FAST_OPS") && getenv("DARLING_SERVER_FAST_OPS")[0] == '0') ? "OFF" : "on";
+	const char* fastMRP = (getenv("DARLING_SERVER_FAST_MACH_REPLY_PORT") && getenv("DARLING_SERVER_FAST_MACH_REPLY_PORT")[0] == '0') ? "OFF" : "on";
+	// Emitted at error() level deliberately: the default log cutoff is Error, and a staged rollout
+	// REQUIRES this notice be visible without raising the log level. It is a one-time NOTICE, not a
+	// fault. (Worded as [NOTICE] so it doesn't read as a server error.)
+	ringLog.error() << "[NOTICE] perf#18 shared-memory ring transport ACTIVE (experimental). spin_budget="
+		<< (_ringSpinNs / 1000ull) << "us"
+		<< " fast_ops=" << fastOps << " fast_mach_reply_port=" << fastMRP
+		<< ". Disable: rebuild without DSERVER_RING_TRANSPORT (full transport off), or set"
+		<< " DARLING_SERVER_FAST_OPS=0 (all inline fast paths off) /"
+		<< " DARLING_SERVER_FAST_MACH_REPLY_PORT=0 (just mach_reply_port). Mode via DARLING_SERVER_MODE="
+		<< "low-power|balanced|latency or DARLING_SERVER_SPIN_US=<n>." << ringLog.endLog;
 };
 #endif // DSERVER_RING_TRANSPORT
 
