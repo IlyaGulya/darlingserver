@@ -1471,6 +1471,7 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 				}
 			} catch (const std::exception& ex) {
 				callLog.error() << "ring fast-path fallback dispatch threw: " << ex.what() << callLog.endLog;
+				Metrics::shared().ringFastFail.fetch_add(1, std::memory_order_relaxed);
 			}
 			continue;
 		}

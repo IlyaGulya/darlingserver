@@ -150,4 +150,40 @@ else
 	fi
 fi
 
+# --- P7 wake-model LOST-WAKE race gate (dar-my8). Hermetic: header-only, real shm, two threads.
+#     GREEN: exhaustive ordering enumeration finds ZERO lost-wake interleavings on both the
+#     request and response sides + the concurrent stress is fully live. RED arms break each
+#     safety mechanism (server critical recheck / guest set-waiter-bit-before-recheck) so the
+#     enumeration finds lost > 0 and the binary exits nonzero. ---
+WRSRC="$HERE/ring_wake_race_test.cpp"
+WR_ITERS="${RING_WAKE_RACE_ITERS:-8000}"
+echo "== wake-race GREEN arm (no lost-wake interleaving; stress live) =="
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread -I"$INC" -o "$TMP/wr_green" "$WRSRC"; then
+	echo "wake-race GREEN arm failed to COMPILE"; exit 2
+fi
+if ! "$TMP/wr_green" "$WR_ITERS"; then
+	echo "wake-race GREEN arm FAILED -- a lost-wake invariant does not hold"; exit 1
+fi
+echo
+echo "== wake-race RED arm A (-DRACE_NO_SERVER_RECHECK: server skips critical recheck, MUST fail) =="
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread -DRACE_NO_SERVER_RECHECK -I"$INC" -o "$TMP/wr_redA" "$WRSRC"; then
+	echo "wake-race RED arm A failed to COMPILE -- gate broken"; exit 2
+fi
+if "$TMP/wr_redA" "$WR_ITERS" >/dev/null 2>&1; then
+	echo "wake-race RED arm A PASSED but must FAIL -- gate not exercising the server critical recheck"; exit 1
+fi
+echo "  wake-race RED arm A correctly failed."
+echo
+echo "== wake-race RED arm B (-DRACE_WAITERBIT_AFTER_RECHECK: guest sets waiter bit too late, MUST fail) =="
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread -DRACE_WAITERBIT_AFTER_RECHECK -I"$INC" -o "$TMP/wr_redB" "$WRSRC"; then
+	echo "wake-race RED arm B failed to COMPILE -- gate broken"; exit 2
+fi
+if "$TMP/wr_redB" "$WR_ITERS" >/dev/null 2>&1; then
+	echo "wake-race RED arm B PASSED but must FAIL -- gate not exercising the guest waiter-bit ordering"; exit 1
+fi
+echo "  wake-race RED arm B correctly failed."
+echo
+echo "ring_wake_race gate: RED->GREEN OK"
+echo
+
 echo "all perf#18 ring gates: OK"
