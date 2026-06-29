@@ -81,4 +81,39 @@ echo "  datapath RED arm correctly failed."
 echo
 echo "ring_datapath gate: RED->GREEN OK"
 echo
+
+# --- ring eligibility ALLOWLIST (P3): the real dserver_callnum_* set that may ride the ring.
+#     Needs the GENERATED rpc.h. Find it under a build dir; skip (don't fail) if not built. ---
+LSRC="$HERE/ring_allowlist_test.cpp"
+GEN_RPC=""
+for cand in "${DSERVER_GEN_INC:-}" \
+            "$HERE/../../../../build/src/external/darlingserver/include" \
+            "$HOME/work/darling-build/src/external/darlingserver/include"; do
+	[ -n "$cand" ] && [ -f "$cand/darlingserver/rpc.h" ] && { GEN_RPC="$cand"; break; }
+done
+if [ -z "$GEN_RPC" ]; then
+	echo "== allowlist gate SKIPPED (generated rpc.h not found; set DSERVER_GEN_INC) =="
+	echo
+else
+	echo "== allowlist GREEN arm (current predicate: task_self_trap + mach_reply_port) =="
+	if ! "$CXX" -std=c++17 -I"$GEN_RPC" -I"$INC" -o "$TMP/al_green" "$LSRC"; then
+		echo "allowlist GREEN arm failed to COMPILE"; exit 2
+	fi
+	if ! "$TMP/al_green"; then
+		echo "allowlist GREEN arm FAILED"; exit 1
+	fi
+	echo
+	echo "== allowlist RED arm (pre-migration predicate: task_self_trap only, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DALLOWLIST_OLD -I"$GEN_RPC" -I"$INC" -o "$TMP/al_red" "$LSRC"; then
+		echo "allowlist RED arm failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/al_red"; then
+		echo "allowlist RED arm PASSED but must FAIL -- gate not exercising the migration"; exit 1
+	fi
+	echo "  allowlist RED arm correctly failed."
+	echo
+	echo "ring_allowlist gate: RED->GREEN OK"
+	echo
+fi
+
 echo "all perf#18 ring gates: OK"

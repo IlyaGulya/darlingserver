@@ -1359,9 +1359,14 @@ static void darRingServiceC2S(const std::shared_ptr<DarlingServer::Thread>& thre
 		uint32_t reqlen = req->length;
 		uint32_t seq = req->seq;
 
-		// P3 allowlist: only no-arg self-traps may ride the ring for now. Anything else ->
-		// drop (consume so we don't spin); the guest will UDS-fall-back for that op.
-		bool eligible = (callnum == dserver_callnum_task_self_trap);
+		// P3 allowlist: only no-arg, single-uint32-port-reply traps may ride the ring for now.
+		// task_self_trap was the first migration (correctness-first; it's cached per-process so
+		// it doesn't move latency); mach_reply_port is the UNCACHED high-frequency op the profile
+		// flagged -- it's the one that actually moves the A/B needle. Both have an empty request
+		// body and a {replyhdr.code, uint32 port} reply, so they share the exact same datapath.
+		// Anything else -> drop (consume so we don't spin); the guest will UDS-fall-back for it.
+		bool eligible = (callnum == dserver_callnum_task_self_trap) ||
+		                (callnum == dserver_callnum_mach_reply_port);
 		if (!eligible || reqlen > inlineCap) {
 			dserver_ring_consumer_advance(c2s);
 			continue;
