@@ -58,6 +58,12 @@ endif()
 
 option(DSERVER_SINGLE_THREADED "Only use a single thread per workqueue in darlingserver" ON)
 
+# perf #18 (dar-dar6x4-perf-5dq.30): shared-memory ring transport for the hot-path RPC.
+# OFF by default -- the ring ABI/handler code is compiled out so a normal build is unaffected
+# (the ring_attach RPC is still defined, but its handler replies "unsupported"). Turn ON to
+# build the server with ring support for A/B against UDS.
+option(DSERVER_RING_TRANSPORT "Build darlingserver with shared-memory ring transport support (perf#18)" OFF)
+
 if (DSERVER_SINGLE_THREADED)
 	add_compile_definitions(
 		DSERVER_SINGLE_THREADED=1
@@ -119,6 +125,7 @@ add_executable(darlingserver
 	src/async-writer.cpp
 	src/stack-pool.cpp
 	src/metrics.cpp
+	src/ring.cpp
 )
 
 add_dependencies(darlingserver
@@ -166,6 +173,12 @@ install(TARGETS darlingserver DESTINATION bin)
 #	"${DARLING_ROOT_RELATIVE_TO_SDK}/../../../src/darlingserver/include/darlingserver/rpc.h"
 #	"${CMAKE_BINARY_DIR}/${DARLING_SDK_RELATIVE_PATH}/usr/include/darlingserver/rpc.h"
 #)
+
+if (DSERVER_RING_TRANSPORT)
+	target_compile_definitions(darlingserver PRIVATE
+		DSERVER_RING_TRANSPORT=1
+	)
+endif()
 
 if (NOT "${DARLINGSERVER_INIT_PROCESS}" STREQUAL "")
 	target_compile_definitions(darlingserver PRIVATE
