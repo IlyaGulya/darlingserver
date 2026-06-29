@@ -656,6 +656,33 @@ calls = [
 		('message_count', 'uint64_t'),
 		('fd', '@fd'),
 	], UNMANAGED_CALL),
+
+	#
+	# perf #18 (dar-dar6x4-perf-5dq.30): shared-memory ring transport negotiation.
+	#
+	# ring_attach is the per-thread handshake that opts a checked-in thread into the
+	# shared-memory ring fast path. The guest creates a memfd holding a dserver_ring_shm
+	# control block + the two rings + arena, fills the control block, and sends the memfd
+	# here via @fd (the same SCM_RIGHTS mechanism checkin uses for the lifetime pipe). The
+	# server fstats the fd for its REAL size (never trusting mapping_size), mmaps it, copies
+	# the control block out (never validating in place -- the guest can mutate the page
+	# concurrently), and runs dserver_ring_shm_validate(). reject_reason is 0
+	# (dserver_ring_ok) on success or a dserver_ring_reject_t code; on any reject the guest
+	# stays on UDS forever (no error -- the ring is a fast path, never the only path).
+	#
+	# This is additive: it's a brand-new call number at the end of the table, so an old
+	# server simply rejects an unknown call number and the guest falls back to UDS; we do
+	# NOT touch checkin (keeping the dar-l8k / dar-6x4 exec path untouched). The whole
+	# handler is gated behind DSERVER_RING_TRANSPORT server-side; with the feature off the
+	# call is still defined but its processCall() replies "unsupported" so a ring-capable
+	# guest built against a non-ring server also falls back cleanly.
+	#
+	('ring_attach', [
+		('ring_fd', '@fd'),
+		('mapping_size', 'uint64_t'),
+	], [
+		('reject_reason', 'uint32_t'),
+	]),
 ]
 
 ALLOWED_PRIVATE_TYPES = [

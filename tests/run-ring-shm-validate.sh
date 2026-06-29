@@ -35,3 +35,27 @@ if ! "$TMP/green"; then
 fi
 echo
 echo "ring_shm_validate gate: RED->GREEN OK"
+echo
+
+# --- ring_attach decision (real memfd: fstat-size-check + map + validate) ---
+ASRC="$HERE/ring_attach_check_test.cpp"
+echo "== attach-check RED arm (accept-all stub: adversarial cases MUST fail) =="
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -I"$INC" -DRING_ATTACH_STUB -o "$TMP/ared" "$ASRC"; then
+	echo "attach RED arm failed to COMPILE -- gate broken"; exit 2
+fi
+if "$TMP/ared"; then
+	echo "attach RED arm PASSED but must FAIL -- gate not exercising the attach-check"; exit 1
+fi
+echo "  attach RED arm correctly failed."
+echo
+echo "== attach-check GREEN arm (real attach-check on real memfds) =="
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -I"$INC" -o "$TMP/agreen" "$ASRC"; then
+	echo "attach GREEN arm failed to COMPILE"; exit 2
+fi
+if ! "$TMP/agreen"; then
+	echo "attach GREEN arm FAILED"; exit 1
+fi
+echo
+echo "ring_attach_check gate: RED->GREEN OK"
+echo
+echo "all perf#18 ring gates: OK"
