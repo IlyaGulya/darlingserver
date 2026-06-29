@@ -45,6 +45,7 @@
 
 #define DSERVER_RING_TRANSPORT 1
 #define DSERVER_RING_NO_ATTACH_CHECK 1
+#include <darlingserver/rpc.h> // callnums for the C2S opcode-set hash (dar-1il.2 item 2)
 #include <darlingserver/rpc-supplement.h>
 
 #include <sys/mman.h>
@@ -95,6 +96,7 @@ static RingMap buildRing(uint32_t slot_size, uint32_t slot_count) {
 	dserver_ring_shm_t* cb = (dserver_ring_shm_t*)base;
 	cb->magic = DSERVER_RING_MAGIC;
 	cb->abi_version = DSERVER_RING_ABI_VERSION;
+	cb->c2s_opcode_hash = dserver_ring_c2s_opcode_hash(); // dar-1il.2 item 2 (this test doesn't validate, but keep it honest)
 	cb->slot_size = (uint16_t)slot_size;
 	cb->slot_count = slot_count;
 	cb->c2s_ring_off = (uint32_t)c2s_off;

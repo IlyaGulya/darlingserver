@@ -67,17 +67,17 @@ static int fast_eligible(unsigned int callnum) {
 //
 // THE allowlist is now GENERATED from the SHARED DSERVER_RING_C2S_OPCODES macro -- the IDENTICAL
 // macro the server (call.cpp) and the guest (dserver-ring.c) consume -- so this mirror cannot drift
-// from the real predicate. RED arm -DC2S_NO_MODREFS removes mach_port_mod_refs from the local copy
-// of the macro below; the "is C2S-allowlisted" assertion for it MUST then fail, proving the gate
-// exercises the allowlist. (ring_drift_gate_test.c separately proves guest==server set equality.)
-#ifdef C2S_NO_MODREFS
-// RED arm: a deliberately drifted allowlist that omits mach_port_mod_refs (matches the real set
-// minus mod_refs). The "mach_port_mod_refs is C2S-allowlisted" GREEN assertion MUST then fail.
+// from the real predicate. RED arm -DC2S_READD_MODREFS RE-ADDS mach_port_mod_refs to the local copy
+// of the macro below (modeling the dar-1il.2 regression of returning the destroy-capable op to the
+// ring); the "mach_port_mod_refs is NOT C2S-allowlisted" GREEN assertion MUST then fail, proving the
+// gate pins mod_refs OUT of the ring set. (ring_drift_gate_test.c separately proves guest==server
+// set equality.)
+#ifdef C2S_READD_MODREFS
+// RED arm: a deliberately drifted allowlist that RE-ADDS mach_port_mod_refs (the S2C-deadlock hazard
+// dar-1il.2 removed). The "mach_port_mod_refs is NOT C2S-allowlisted" GREEN assertion MUST then fail.
 #define C2S_GATE_OPCODES(X) \
-	X(task_self_trap) \
-	X(mach_reply_port) \
-	X(mach_port_allocate) \
-	X(mach_port_insert_right)
+	DSERVER_RING_C2S_OPCODES(X) \
+	X(mach_port_mod_refs)
 #else
 #define C2S_GATE_OPCODES(X) DSERVER_RING_C2S_OPCODES(X)
 #endif
@@ -118,12 +118,13 @@ static void setenv01(const char* n, int off) {
 
 int main(void) {
 	// --- INLINE allowlist: only the trivial pure-mint port traps are inline-eligible ---------
-	// mach_port_mod_refs is INTENTIONALLY excluded (it crashed the server off the fiber).
+	// mach_port_mod_refs is INTENTIONALLY excluded (it crashed the server off the fiber; and as of
+	// dar-1il.2 it is off the ring entirely -- UDS only -- so it is neither inline- nor C2S-eligible).
 	setenv01("DARLING_SERVER_FAST_OPS", 0);
 	setenv01("DARLING_SERVER_FAST_MACH_REPLY_PORT", 0);
 	CHECK(fast_eligible(dserver_callnum_mach_reply_port),     "mach_reply_port is inline-eligible by default");
 	CHECK(fast_eligible(dserver_callnum_task_self_trap),      "task_self_trap is inline-eligible by default");
-	CHECK(!fast_eligible(dserver_callnum_mach_port_mod_refs), "mach_port_mod_refs is NOT inline-eligible (rides the fiber path)");
+	CHECK(!fast_eligible(dserver_callnum_mach_port_mod_refs), "mach_port_mod_refs is NOT inline-eligible (UDS only)");
 	// perf #18 P5-bulk (dar-1il.1): the new port/right ops ALSO ride the generic fiber path, never
 	// the no-fiber inline path (mach_port_mod_refs proved these are not off-fiber-safe).
 	CHECK(!fast_eligible(dserver_callnum_mach_port_allocate),     "mach_port_allocate is NOT inline-eligible (rides the fiber path)");
@@ -143,16 +144,11 @@ int main(void) {
 	CHECK(fast_eligible(dserver_callnum_task_self_trap),   "FAST_MACH_REPLY_PORT=0 leaves task_self_trap inline path on");
 	setenv01("DARLING_SERVER_FAST_MACH_REPLY_PORT", 0);
 
-	// --- P5 C2S allowlist: mach_port_mod_refs rides the GENERIC fiber path on the ring --------
-	// inlineCap for the guest's 128B slot is 128 - sizeof(dserver_ring_slot_t); the 16-byte body
-	// (4 args) fits easily. Use a representative cap of 96 (>= 16). Allowlisted with a body, and
-	// dropped if the body would overflow the slot. The allowlist is NOT env-gated (gating off a
-	// guest-published op would strand the guest on its reply-wait). RED arm -DC2S_NO_MODREFS drops
-	// it -> the first assertion fails.
-	CHECK(c2s_allowlisted(dserver_callnum_mach_port_mod_refs, 16, 96),
-	      "mach_port_mod_refs (16-byte body) is C2S-allowlisted");
-	CHECK(!c2s_allowlisted(dserver_callnum_mach_port_mod_refs, 200, 96),
-	      "mach_port_mod_refs with an over-cap body is dropped (UDS fallback)");
+	// --- P5 C2S allowlist: the Tier-1 ring ops ride the GENERIC fiber path on the ring -----------
+	// inlineCap for the guest's 128B slot is 128 - sizeof(dserver_ring_slot_t); the 16-byte bodies
+	// fit easily. Use a representative cap of 96 (>= 16). Allowlisted with a body, dropped if the body
+	// would overflow the slot. The allowlist is NOT env-gated (gating off a guest-published op would
+	// strand the guest on its reply-wait).
 	CHECK(c2s_allowlisted(dserver_callnum_mach_reply_port, 0, 96),
 	      "mach_reply_port (empty body) is C2S-allowlisted");
 	// perf #18 P5-bulk (dar-1il.1): allocate + insert_right are C2S-allowlisted (Tier-1 ring).
@@ -168,6 +164,11 @@ int main(void) {
 	// the caller, which a ring-waiting (non-recvmsg) thread cannot service -> deadlock. Stays on UDS.
 	CHECK(!c2s_allowlisted(dserver_callnum_mach_port_deallocate, 8, 96),
 	      "mach_port_deallocate is NOT C2S-allowlisted (S2C-upcall deadlock hazard -> UDS only)");
+	// mach_port_mod_refs is DELIBERATELY NOT allowlisted (dar-1il.2): it is destroy-capable
+	// (mod_refs(delta<0) last-ref destroys the port -> same vm munmap S2C upcall hazard as
+	// deallocate). Stays on UDS. RED arm -DC2S_READD_MODREFS re-adds it -> this assertion fails.
+	CHECK(!c2s_allowlisted(dserver_callnum_mach_port_mod_refs, 16, 96),
+	      "mach_port_mod_refs is NOT C2S-allowlisted (destroy-capable -> S2C-upcall deadlock hazard -> UDS only)");
 	CHECK(!c2s_allowlisted(dserver_callnum_kprintf, 4, 96),
 	      "kprintf is NOT C2S-allowlisted");
 
