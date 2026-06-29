@@ -58,6 +58,24 @@ namespace DarlingServer {
 		void* arena() const;              // nullptr if arena_size == 0
 		uint32_t slotSize() const;
 		uint32_t slotCount() const;
+
+		/**
+		 * Publish one reply onto the s2c ring: claim a slot, write the reply header (code) +
+		 * body, echo the request's seq + callnum, single-release-store publish. Returns false
+		 * if the s2c ring is full (caller leaves the guest to retry / UDS-fall-back) or the body
+		 * exceeds the inline slot capacity. Does NOT wake the guest -- call wakeGuest() after a
+		 * batch so one wake covers several replies.
+		 */
+		bool publishReply(uint32_t seq, uint32_t callnum, int32_t code, const void* body, uint32_t bodyLen);
+
+		/**
+		 * Wake a guest that is FUTEX_WAITing on the s2c futex word (bump the word, then
+		 * FUTEX_WAKE). Cheap no-op cost if the guest is spinning (it just sees the new tail).
+		 */
+		void wakeGuest();
+
+		/** Drain the wake eventfd (called from the Monitor callback so it stops re-firing). */
+		void drainWake();
 	};
 };
 

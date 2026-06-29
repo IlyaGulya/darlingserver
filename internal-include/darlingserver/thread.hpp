@@ -130,6 +130,11 @@ namespace DarlingServer {
 		// in notifyDead() so the mapping + eventfd are released with the thread.
 		std::shared_ptr<class RingBuffer> _ring = nullptr;
 		std::shared_ptr<class Monitor> _ringMonitor = nullptr;
+		// P3: one-shot "next reply goes to the ring" state, set by beginRingReply() and consumed
+		// by pushCallReply(). _ringReplyPending gates it; _ringReplySeq is the request seq the
+		// reply must echo. Guarded by _rwlock like the rest of the reply state.
+		bool _ringReplyPending = false;
+		uint32_t _ringReplySeq = 0;
 #endif
 
 		static void microthreadWorker();
@@ -293,6 +298,15 @@ namespace DarlingServer {
 		// notifyDead(). Replaces any prior ring (a thread attaches at most once in practice).
 		void attachRing(std::shared_ptr<class RingBuffer> ring, std::shared_ptr<class Monitor> monitor);
 		std::shared_ptr<class RingBuffer> ring() const;
+
+		// perf #18 P3: redirect the NEXT reply this thread produces onto its s2c ring instead
+		// of UDS. The server C2S service loop sets this (with the request's seq) right before
+		// running a ring-originated Call through the normal Call path; pushCallReply() consults
+		// it so the reply lands on the ring + wakes the guest via FUTEX_WAKE. One-shot: the
+		// flag is consumed (cleared) by the reply. This is how a ring call reuses the entire
+		// existing dispatch (and thus the dar-l8k UAF / dar-6x4 rwlock fixes) -- only the reply
+		// SINK changes, not the execution path.
+		void beginRingReply(uint32_t seq);
 #endif
 
 		/**
