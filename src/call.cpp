@@ -1421,8 +1421,14 @@ static void darRingServiceC2S(const std::shared_ptr<DarlingServer::Thread>& thre
 		reqMsg.data().resize(totalSize);
 		auto* hdr = reinterpret_cast<dserver_rpc_callhdr_t*>(reqMsg.data().data());
 		hdr->number = static_cast<dserver_callnum_t>(callnum);
-		hdr->pid = process->id();
-		hdr->tid = thread->id();
+		// The call header carries the GUEST-NAMESPACE ids (nsid): callFromMessage() looks the
+		// thread/process up in the registry keyed on nsid. Using the server-internal id() here
+		// makes the lookup miss -> "non-existent thread" -> ESRCH -> the guest FUTEX_WAITs on a
+		// reply that never comes (boot wedge). Mirror the real UDS path: header = nsid, and set
+		// the Message's SCM-pid to the LINUX id() so callFromMessage's pid-consistency check
+		// (process->id() == requestMessage.pid()) holds.
+		hdr->pid = process->nsid();
+		hdr->tid = thread->nsid();
 		hdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
 		if (reqlen > 0) {
 			memcpy(reqMsg.data().data() + sizeof(dserver_rpc_callhdr_t),
@@ -1430,6 +1436,7 @@ static void darRingServiceC2S(const std::shared_ptr<DarlingServer::Thread>& thre
 			       reqlen);
 		}
 		reqMsg.setAddress(thread->address());
+		reqMsg.setPID(process->id());
 
 		// done reading the request slot; free it before running the call
 		dserver_ring_consumer_advance(c2s);
