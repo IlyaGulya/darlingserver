@@ -165,6 +165,16 @@ namespace DarlingServer {
 		// guard or whose inline dispatch declined -> took the generic step-1 callFromMessage path.
 		std::atomic<uint64_t> ringFastHit {0};
 		std::atomic<uint64_t> ringFastFallback {0};
+		// perf #18 P7 (dar-my8): the rest of the gist-required per-op fast-path accounting.
+		// ringFastFail  = an inline fast op that could not complete cleanly (declined late / publish
+		//                 lost) -- distinct from a fallback (which is a deliberate route to generic).
+		// ringS2cFull   = publishReply() found the s2c ring full (reply could not be published there;
+		//                 the caller UDS-falls-back). A nonzero value under load = guest not draining.
+		// ringFastSuspend = an op the fast path ran as non-blocking actually SUSPENDED -- a contract
+		//                 violation (allowlist misclassification). MUST stay 0; nonzero = a bug.
+		std::atomic<uint64_t> ringFastFail {0};
+		std::atomic<uint64_t> ringS2cFull {0};
+		std::atomic<uint64_t> ringFastSuspend {0};
 
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in
