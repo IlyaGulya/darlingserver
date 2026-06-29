@@ -1353,6 +1353,13 @@ static bool ringFastMachReplyPortEnabled() {
 // task_self_trap + mach_reply_port both just mint/return a port via current_task()'s space and
 // never suspend. Each gated by its hatch (task_self_trap rides the global hatch only).
 //
+// TAXONOMY (perf #18 Phase A, dar-dar6x4-perf-5dq.30.1): this predicate is the "NoFiberFastEligible"
+// concept (Tier 2) in the three-lane vocabulary defined next to DSERVER_RING_OP_CLASS in
+// rpc-supplement.h -- DISTINCT from, and a strict subset of, "SimpleRingC2SEligible" (Tier 1, the
+// DSERVER_RING_C2S_OPCODES allowlist). NoFiberFastEligible => SimpleRingC2SEligible, never the reverse.
+// The classification table tags exactly these two ops NOFIBER_FAST; keep this function in sync with it
+// (the table is documentation/guardrail, this is the live gate -- they must agree).
+//
 // perf #18 P5 (dar-1il): mach_port_mod_refs is DELIBERATELY NOT here. Two reasons, both standing:
 // (1) it is not no-fiber-inline-safe -- running it WITHOUT the microthread fiber (doWorkInline) was
 // MEASURED to corrupt the thread's fiber/stack bookkeeping (a later doWork() frees a garbage _stack:
