@@ -160,7 +160,19 @@ typedef struct dserver_kqchan_reply_proc_read {
 #ifdef DSERVER_RING_TRANSPORT
 
 #define DSERVER_RING_MAGIC       0x44524e47u /* 'DRNG' */
-#define DSERVER_RING_ABI_VERSION 1u
+// ABI v2 (perf #18 P4, dar-dar6x4-perf-5dq.33): added the wake-model state words
+// (server_state + s2c_waiters) to the control block. Bumped so a v1 guest/server pair rejects
+// cleanly at attach instead of mismatching the struct size.
+#define DSERVER_RING_ABI_VERSION 2u
+
+// perf #18 P4 wake model: the server publishes its current sleep state into server_state so a
+// producing guest can SKIP the eventfd doorbell when the server is actively polling (it will
+// see the request on its own). Values are a plain uint32 (portable wire format); transitions
+// are single release-stores. Guests treat any unknown value conservatively as "not polling"
+// (== send the doorbell), so an old/garbage value only costs a redundant wake, never a missed one.
+#define DSERVER_RING_SRV_SLEEPING_EPOLL 0u // server is (or is about to be) blocked in epoll_wait -> MUST doorbell
+#define DSERVER_RING_SRV_ACTIVE_POLLING 1u // server is draining rings in its spin phase -> doorbell NOT needed
+#define DSERVER_RING_SRV_SLEEP_ARMED    2u // server is between "decided to sleep" and epoll_wait -> doorbell (race window)
 
 // Bounds the server is willing to accept for a guest-proposed ring, so a malicious or buggy
 // guest can't make the server map an absurd region or compute a huge index. Kept modest;
@@ -309,7 +321,46 @@ typedef struct dserver_ring_shm {
 	// sleep/wake.)
 	DSERVER_RING_ALIGN64 uint32_t c2s_futex; // guest bumps to wake the server (via a registered eventfd)
 	DSERVER_RING_ALIGN64 uint32_t s2c_futex; // server bumps to wake the guest
+	// perf #18 P4 wake-model words. server_state is written ONLY by the server and read by the
+	// guest (conditional doorbell). s2c_waiters is written ONLY by the guest (1 just before it
+	// FUTEX_WAITs on s2c_futex, 0 after it wakes) and read by the server (conditional FUTEX_WAKE):
+	// the server skips the wake syscall entirely while no guest is parked. Each is the producer's
+	// to write and the peer's to read -- never a shared RMW -- so plain release/acquire suffices;
+	// a stale read only ever causes a redundant wake or doorbell, never a lost one. Own cache
+	// lines so the two directions don't false-share with each other or with the futex words.
+	DSERVER_RING_ALIGN64 uint32_t server_state; // server-written: DSERVER_RING_SRV_* (guest reads for conditional doorbell)
+	DSERVER_RING_ALIGN64 uint32_t s2c_waiters;  // guest-written: nonzero == a guest is parked in FUTEX_WAIT on s2c_futex
 } dserver_ring_shm_t;
+
+// --- P4 wake-model decision predicates (shared by guest, server, and the host gate) ----------
+//
+// These are the entire wake model expressed as two pure functions, so the guest (libc-free C),
+// the server (C++), and the host A/B gate all make the IDENTICAL decision from the same control
+// block. The whole P4 win is: on the hot path BOTH of these return 0, so neither side enters the
+// kernel. The cold path (server parked in epoll / guest parked in futex) makes them return 1 and
+// the doorbell / FUTEX_WAKE happen exactly as in v0. Defined after dserver_ring_shm_t so they can
+// dereference it.
+//
+// dserver_ring_guest_should_doorbell(): the guest just published a request. It must poke the
+// server's wake eventfd ONLY if the server is not currently draining rings. While ACTIVE_POLLING
+// the server will observe the new c2s tail on its own, so the doorbell is pure overhead and is
+// skipped. SLEEP_ARMED and SLEEPING_EPOLL (and any unknown value) -> doorbell, because the server
+// either is asleep or is in the arm/sleep race window and may miss the publish.
+static inline int dserver_ring_guest_should_doorbell(const dserver_ring_shm_t* cb) {
+	uint32_t st = __atomic_load_n(&cb->server_state, __ATOMIC_ACQUIRE);
+	return st != DSERVER_RING_SRV_ACTIVE_POLLING;
+}
+
+// dserver_ring_server_should_wake(): the server just published a reply. It must FUTEX_WAKE the
+// guest ONLY if a guest is actually parked (s2c_waiters != 0). A guest that is still spinning on
+// the reply has s2c_waiters == 0 and will see the new s2c tail without a syscall, so the wake is
+// skipped. The guest sets the bit BEFORE its final pre-sleep recheck and the server publishes the
+// reply BEFORE reading the bit, so the bit can only be falsely-0 if the guest hasn't slept yet
+// (in which case it's spinning and needs no wake) -- never a lost wakeup.
+static inline int dserver_ring_server_should_wake(const dserver_ring_shm_t* cb) {
+	uint32_t w = __atomic_load_n(&cb->s2c_waiters, __ATOMIC_ACQUIRE);
+	return w != 0u;
+}
 
 // Why a ring control block was rejected. Returned by dserver_ring_shm_validate(); the server
 // logs it once and falls the thread back to UDS. (0 == accepted.)
