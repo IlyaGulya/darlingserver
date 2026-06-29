@@ -158,6 +158,14 @@ namespace DarlingServer {
 		std::atomic<uint64_t> ringWakesSkipped {0};
 		std::atomic<uint64_t> ringDoorbellsReceived {0}; // eventfd wakes the server actually drained
 
+		// perf #18 P6.1 step 2 (dar-ohp): surgical direct-dispatch fast path for mach_reply_port.
+		// ringFastHit = a mach_reply_port request serviced WITHOUT building a Call/Message or
+		// re-looking-up the thread in the registry (doMachReplyPortInline -> dtape trap -> ring
+		// publish). ringFastFallback = a request that matched the callnum but failed the shape
+		// guard or whose inline dispatch declined -> took the generic step-1 callFromMessage path.
+		std::atomic<uint64_t> ringFastHit {0};
+		std::atomic<uint64_t> ringFastFallback {0};
+
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in
 		// ringServiceThread/publishReply accumulate per-phase TSC cycles + a sample count, so we
