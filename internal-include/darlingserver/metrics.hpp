@@ -144,6 +144,21 @@ namespace DarlingServer {
 		std::atomic<uint64_t> inlineHandled {0};
 		std::atomic<uint64_t> queuedToPool {0};
 
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 P4 (dar-dar6x4-perf-5dq.33): wake-model accounting. ringServicedSpin =
+		// requests drained by the main-loop spin phase (the HOT path: guest skipped the
+		// doorbell, server found the request by polling). ringServicedDoorbell = requests
+		// drained by the eventfd Monitor callback (the COLD path: guest doorbelled because the
+		// server was sleeping/armed). ringWakesIssued/ringWakesSkipped = FUTEX_WAKE on the
+		// reply path actually done vs elided because no guest was parked. A healthy hot stream
+		// is mostly ringServicedSpin + ringWakesSkipped; both prove zero per-call syscalls.
+		std::atomic<uint64_t> ringServicedSpin {0};
+		std::atomic<uint64_t> ringServicedDoorbell {0};
+		std::atomic<uint64_t> ringWakesIssued {0};
+		std::atomic<uint64_t> ringWakesSkipped {0};
+		std::atomic<uint64_t> ringDoorbellsReceived {0}; // eventfd wakes the server actually drained
+#endif
+
 		// ---- gauges sampled at snapshot time (set by the owner) ----
 		// These are filled in by Server when producing a snapshot, not on the hot path.
 

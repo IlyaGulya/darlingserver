@@ -24,6 +24,7 @@
 
 #define _GNU_SOURCE 1
 #include <darlingserver/ring.hpp>
+#include <darlingserver/metrics.hpp>
 
 #include <sys/mman.h>
 #include <sys/eventfd.h>
@@ -155,18 +156,39 @@ bool DarlingServer::RingBuffer::publishReply(uint32_t seq, uint32_t callnum, int
 	return true;
 };
 
-void DarlingServer::RingBuffer::wakeGuest() {
-	// The s2c futex word lives in the control block at the head of the mapping. Bump it (so a
-	// guest that races the check sees a change) and FUTEX_WAKE one waiter. Guests that are
-	// spinning rather than sleeping simply observe the new s2c tail and never enter the kernel.
-	uint32_t* word = &((dserver_ring_shm_t*)_map)->s2c_futex;
+bool DarlingServer::RingBuffer::wakeGuest() {
+	// The s2c futex word lives in the control block at the head of the mapping. Always bump it
+	// (so a guest that races its pre-sleep recheck sees a change and re-checks the ring), but
+	// only pay for the FUTEX_WAKE syscall when a guest is actually parked. The guest sets
+	// s2c_waiters BEFORE its final recheck and we publish the reply BEFORE reading the bit, so a
+	// 0 here means the guest is still spinning (it'll see the new tail) -- never a lost wakeup.
+	dserver_ring_shm_t* cb = (dserver_ring_shm_t*)_map;
+	uint32_t* word = &cb->s2c_futex;
 	__atomic_fetch_add(word, 1u, __ATOMIC_RELEASE);
-	syscall(SYS_futex, word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+	if (dserver_ring_server_should_wake(cb)) {
+		syscall(SYS_futex, word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+		Metrics::shared().ringWakesIssued.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	Metrics::shared().ringWakesSkipped.fetch_add(1, std::memory_order_relaxed);
+	return false;
 };
 
 void DarlingServer::RingBuffer::drainWake() {
 	eventfd_t value;
 	eventfd_read(_eventfd.fd(), &value);
+};
+
+void DarlingServer::RingBuffer::setServerState(uint32_t state) {
+	dserver_ring_shm_t* cb = (dserver_ring_shm_t*)_map;
+	__atomic_store_n(&cb->server_state, state, __ATOMIC_RELEASE);
+};
+
+bool DarlingServer::RingBuffer::hasPendingRequests() const {
+	// consumer_begin is bounds-safe against a corrupt guest tail (returns NULL on empty OR on a
+	// distance > slot_count); a non-NULL result means there is a real published slot to service.
+	dserver_ring_t* c2s = c2sRing();
+	return dserver_ring_consumer_begin(c2s, _cb.slot_size, _cb.slot_count) != nullptr;
 };
 
 #endif // DSERVER_RING_TRANSPORT

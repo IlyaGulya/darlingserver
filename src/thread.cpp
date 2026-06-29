@@ -1608,7 +1608,11 @@ void DarlingServer::Thread::notifyDead() {
 	}
 
 #ifdef DSERVER_RING_TRANSPORT
-	// _rwlock is dropped now; tear down the ring's epoll Monitor and release the mapping.
+	// _rwlock is dropped now; remove ourselves from the main-loop spin registry (perf #18 P4),
+	// tear down the ring's epoll Monitor, and release the mapping.
+	if (ringToRelease) {
+		Server::sharedInstance().unregisterRingThread(shared_from_this());
+	}
 	if (ringMonitorToRelease) {
 		Server::sharedInstance().removeMonitor(ringMonitorToRelease);
 	}

@@ -1370,11 +1370,12 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 // already refuses a corrupt c2s tail; here we additionally (a) bound the inline body to the
 // slot, (b) only accept a small allowlist of ring-eligible call numbers (P3 = task_self_trap),
 // dropping anything else so the guest UDS-falls-back, and (c) never deref a guest pointer.
-static void darRingServiceC2S(const std::shared_ptr<DarlingServer::Thread>& thread) {
+uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::Thread>& thread) {
 	using namespace DarlingServer;
+	uint32_t serviced = 0;
 	auto ring = thread->ring();
 	if (!ring) {
-		return;
+		return 0;
 	}
 	const auto& cb = ring->controlBlock();
 	dserver_ring_t* c2s = ring->c2sRing();
@@ -1384,7 +1385,7 @@ static void darRingServiceC2S(const std::shared_ptr<DarlingServer::Thread>& thre
 
 	auto process = thread->process();
 	if (!process) {
-		return;
+		return 0;
 	}
 
 	// bounded drain: never loop more than slotCount times even if a buggy/hostile peer keeps
@@ -1448,6 +1449,7 @@ static void darRingServiceC2S(const std::shared_ptr<DarlingServer::Thread>& thre
 			if (call) {
 				// run inline on the main loop (self-traps never block) -- perf#2b path
 				call->thread()->doWork();
+				++serviced;
 			}
 		} catch (const std::exception& ex) {
 			callLog.error() << "ring C2S dispatch threw: " << ex.what() << callLog.endLog;
@@ -1455,6 +1457,7 @@ static void darRingServiceC2S(const std::shared_ptr<DarlingServer::Thread>& thre
 			// time out on this op and UDS-fall-back. Keep serving the rest.
 		}
 	}
+	return serviced;
 }
 #endif
 
@@ -1513,17 +1516,30 @@ void DarlingServer::Call::RingAttach::processCall() {
 								eventfd_read(thisMonitor->fd()->fd(), &value);
 							}
 							if (static_cast<uint64_t>(events & Monitor::Event::HangUp) != 0) {
+								if (t) {
+									Server::sharedInstance().unregisterRingThread(t);
+								}
 								Server::sharedInstance().removeMonitor(thisMonitor);
 								return;
 							}
-							// Service every request the guest published since the last wake.
+							// Service every request the guest published since the last wake. This is
+							// the COLD path: the guest doorbelled because the server was sleeping.
 							if (t) {
-								darRingServiceC2S(t);
+								Metrics::shared().ringDoorbellsReceived.fetch_add(1, std::memory_order_relaxed);
+								uint32_t n = ringServiceThread(t);
+								if (n > 0) {
+									Metrics::shared().ringServicedDoorbell.fetch_add(n, std::memory_order_relaxed);
+								}
 							}
 						}
 					);
 					Server::sharedInstance().addMonitor(monitor);
 					thread->attachRing(ring, monitor);
+					// perf #18 P4: register the ring-owning thread with the server so the main
+					// loop's pre-epoll spin phase can drain it directly (the eventfd Monitor is
+					// only the COLD-path wake; on the hot path the guest skips the doorbell and
+					// the spin phase finds the request by polling the c2s ring).
+					Server::sharedInstance().registerRingThread(thread);
 				}
 			} else {
 				callLog.info() << "ring_attach rejected for TID " << thread->nsid()
