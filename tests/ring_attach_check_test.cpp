@@ -15,6 +15,7 @@
  */
 
 #define DSERVER_RING_TRANSPORT 1
+#include <darlingserver/rpc.h> // callnums for the C2S opcode-set hash (dar-1il.2 item 2)
 #include <darlingserver/rpc-supplement.h>
 
 #include <sys/mman.h>
@@ -52,6 +53,7 @@ static uint32_t fillValid(dserver_ring_shm_t* cb, uint32_t slot_size, uint32_t s
 	cb->slot_size = (uint16_t)slot_size;
 	cb->slot_count = slot_count;
 	cb->guest_tid = NSID;
+	cb->c2s_opcode_hash = dserver_ring_c2s_opcode_hash(); // dar-1il.2 item 2: matches the server's by default
 	uint32_t hdr = (uint32_t)sizeof(dserver_ring_shm_t);
 	uint32_t ring_span = (uint32_t)(sizeof(dserver_ring_t) + (uint64_t)slot_count * slot_size);
 	cb->c2s_ring_off = hdr;
@@ -141,6 +143,18 @@ int main() {
 		dserver_ring_shm_t cb; uint32_t sz = fillValid(&cb, 256, 64, 0);
 		int fd = makeMemfd(&cb, sz);
 		CHECK(ATTACH(fd, sz, NSID + 1, &outSize, &outCb) == dserver_ring_reject_tid, "tid spoof rejected at attach");
+		close(fd);
+	}
+
+	// --- reject: C2S opcode-set hash mismatch (dar-1il.2 item 2) ---
+	// A guest built from a different DSERVER_RING_C2S_OPCODES publishes a non-matching hash even
+	// though everything else is well-formed -> the ring is rejected at attach (the thread then uses
+	// UDS for everything; no silent per-op drop). Real-memfd path mirrors the validator-level test.
+	{
+		dserver_ring_shm_t cb; uint32_t sz = fillValid(&cb, 256, 64, 0);
+		cb.c2s_opcode_hash ^= 0x1ull; // model a skewed opcode set
+		int fd = makeMemfd(&cb, sz);
+		CHECK(ATTACH(fd, sz, NSID, &outSize, &outCb) == dserver_ring_reject_opcode_set, "C2S opcode-set hash mismatch rejected at attach");
 		close(fd);
 	}
 

@@ -18,6 +18,7 @@
  */
 
 #define DSERVER_RING_TRANSPORT 1
+#include <darlingserver/rpc.h> // callnums for the C2S opcode-set hash (dar-1il.2 item 2)
 #include <darlingserver/rpc-supplement.h>
 
 #include <cstdio>
@@ -56,6 +57,7 @@ static dserver_ring_shm_t makeValid(uint32_t slot_size, uint32_t slot_count, uin
 	cb.slot_size = (uint16_t)slot_size;
 	cb.slot_count = slot_count;
 	cb.guest_tid = NSID;
+	cb.c2s_opcode_hash = dserver_ring_c2s_opcode_hash(); // dar-1il.2 item 2: matches the server's by default
 
 	uint32_t hdr = (uint32_t)sizeof(dserver_ring_shm_t);
 	uint32_t ring_span = (uint32_t)(sizeof(dserver_ring_t) + (uint64_t)slot_count * slot_size);
@@ -95,6 +97,21 @@ int main() {
 		dserver_ring_shm_t cb = makeValid(256, 64, 0);
 		cb.abi_version = DSERVER_RING_ABI_VERSION + 1;
 		CHECK(VALIDATE(&cb, cb.total_size, NSID) == dserver_ring_reject_abi, "bad abi rejected");
+	}
+	// --- reject: C2S opcode-set hash mismatch (dar-1il.2 item 2) ---
+	// A guest built from a DIFFERENT DSERVER_RING_C2S_OPCODES publishes a hash that doesn't match the
+	// server's -> the ring is rejected (-> the thread uses UDS for everything, never a silent per-op
+	// drop). Flip one bit of the matching hash to model the skew.
+	{
+		dserver_ring_shm_t cb = makeValid(256, 64, 0);
+		cb.c2s_opcode_hash ^= 0x1ull;
+		CHECK(VALIDATE(&cb, cb.total_size, NSID) == dserver_ring_reject_opcode_set, "C2S opcode-set hash mismatch rejected");
+	}
+	// --- accept: the matching hash is accepted (guards the check isn't vacuously always-reject) ---
+	{
+		dserver_ring_shm_t cb = makeValid(256, 64, 0);
+		cb.c2s_opcode_hash = dserver_ring_c2s_opcode_hash();
+		CHECK(VALIDATE(&cb, cb.total_size, NSID) == dserver_ring_ok, "matching C2S opcode-set hash accepted");
 	}
 	// --- reject: slot_size out of range / below the slot header ---
 	{

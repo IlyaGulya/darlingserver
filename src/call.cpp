@@ -1394,18 +1394,18 @@ static bool ringFastMachReplyPortEnabled() {
 // task_self_trap + mach_reply_port both just mint/return a port via current_task()'s space and
 // never suspend. Each gated by its hatch (task_self_trap rides the global hatch only).
 //
-// perf #18 P5 (dar-1il): mach_port_mod_refs is DELIBERATELY NOT here. Although it never blocks
-// (its processCall is Thread::syscallReturn(dtape_mach_port_mod_refs(...)) = port_name_to_task +
-// ipc_right_lookup_write + ipc_right_delta, no waitq -- see duct-tape/.../ipc/mach_port.c:974),
-// running it WITHOUT the microthread fiber (doWorkInline) was MEASURED to corrupt the thread's
-// fiber/stack bookkeeping: a later real doWork() on the same thread frees a now-garbage _stack
-// (StackPool::free -> munmap EINVAL -> std::system_error -> std::terminate -> server abort). The
-// surgical mach_reply_port path is safe inline because it only mints a port in current_task's
-// space; mach_port_mod_refs additionally does a port->task translation + task refcounting that is
-// NOT safe to execute off the fiber. So mod_refs rides the ring via the GENERIC fiber doWork()
-// (it is in the C2S allowlist below) -- that still drops it from the ~30us UDS class into the
-// ~5us ring class (P5's goal), and was proven correct under a large mint/free/ref-churn A/B. The
-// no-fiber inline sub-case is reserved for the trivial pure-mint port traps only.
+// perf #18 P5 (dar-1il): mach_port_mod_refs is DELIBERATELY NOT here. Two reasons, both standing:
+// (1) it is not no-fiber-inline-safe -- running it WITHOUT the microthread fiber (doWorkInline) was
+// MEASURED to corrupt the thread's fiber/stack bookkeeping (a later doWork() frees a garbage _stack:
+// StackPool::free -> munmap EINVAL -> std::terminate). It does a port->task translation + task
+// refcounting that is unsafe off the fiber, unlike the surgical mach_reply_port path (pure mint).
+// (2) perf #18 dar-1il.2: it is no longer in the C2S ring allowlist AT ALL (not even the generic
+// fiber path) -- mach_port_mod_refs(delta<0) dropping the last ref is destroy-capable, and
+// destroying a mapped-region-backed port drives a vm munmap S2C upcall to a caller parked on the
+// ring -> deadlock (the same class that sank mach_port_deallocate). It is UDS-only until a
+// proven-safe subset is gated. The no-fiber inline sub-case is reserved for the trivial pure-mint
+// port traps only; the C2S allowlist (DSERVER_RING_C2S_OPCODES, expanded in ringServiceThread) is
+// the larger Tier-1 set, and mod_refs is in NEITHER.
 static bool ringFastPathEligible(uint32_t callnum) {
 	if (!ringFastOpsEnabled()) {
 		return false;

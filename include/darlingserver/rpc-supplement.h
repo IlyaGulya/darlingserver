@@ -163,7 +163,11 @@ typedef struct dserver_kqchan_reply_proc_read {
 // ABI v2 (perf #18 P4, dar-dar6x4-perf-5dq.33): added the wake-model state words
 // (server_state + s2c_waiters) to the control block. Bumped so a v1 guest/server pair rejects
 // cleanly at attach instead of mismatching the struct size.
-#define DSERVER_RING_ABI_VERSION 2u
+// ABI v3 (perf #18 dar-1il.2 item 2): added c2s_opcode_hash to the control block (the guest's
+// compiled C2S opcode-set hash, cross-checked at attach). The struct grew, so bump the version too:
+// a v2 server reading a v3 guest's block (or vice versa) rejects on abi_version BEFORE it would ever
+// misread the new field, and a same-version pair whose opcode SETS still differ rejects on the hash.
+#define DSERVER_RING_ABI_VERSION 3u
 
 // perf #18 P4 wake model: the server publishes its current sleep state into server_state so a
 // producing guest can SKIP the eventfd doorbell when the server is actively polling (it will
@@ -325,7 +329,20 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // the ring futex-wait, neither able to make progress. This is exactly why mach_port_deallocate is
 // NOT here (see dar-1il.1): under launchd's real workload it destroys ports backing mapped regions
 // -> munmap S2C -> wedge. It stays on UDS, where the caller's recvmsg can service the S2C. The
-// safe ops below only CREATE/REF (allocate, insert_right) or adjust refs without a caller upcall.
+// safe ops below only CREATE/REF (allocate, insert_right) -- a pure right-table write with no
+// caller upcall.
+//
+// mach_port_mod_refs is ALSO deliberately NOT here (dar-1il.2): it is destroy-CAPABLE. A
+// mod_refs(right, delta<0) that drops the last user-ref of a receive right destroys the port, and
+// destroying a port that backs a mapped region drives the SAME vm munmap S2C upcall to the caller
+// that sank deallocate -- but the failure is a SIDE EFFECT of certain args, not the return code, so
+// the byte-identical kern_return_t A/B in dar-1il.1 (which destroyed only bare ports) did NOT prove
+// safety. The safety of a given mod_refs call cannot be decided until the ipc_space lock is held and
+// the right's current refcount is known, i.e. AFTER mutation begins, which violates the "decide
+// safety BEFORE mutating" rule -- you cannot start, discover "oops, need S2C", and roll back. So
+// mod_refs stays UDS until a proven-safe subset (positive-delta / provably-not-last-ref / no-destroy
+// with a pre-mutation server guard, dar-1il.2 item 1 option B) is built and gated. See mach_traps.c
+// _kernelrpc_mach_port_mod_refs_trap_impl.
 //
 // NOTE this is the TRANSPORT allowlist (Tier 1 = ride the ring via the generic fiber doWork); it is
 // DISTINCT from the no-fiber inline fast path (ringFastPathEligible / Tier 2), a strictly smaller,
@@ -333,9 +350,55 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 #define DSERVER_RING_C2S_OPCODES(X) \
 	X(task_self_trap) \
 	X(mach_reply_port) \
-	X(mach_port_mod_refs) \
 	X(mach_port_allocate) \
 	X(mach_port_insert_right)
+
+// --- C2S opcode-set ABI tie (perf #18 dar-1il.2 item 2) ---------------------------------------
+//
+// The shared X-macro above makes the guest and server allowlists drift-proof ONLY when both are
+// compiled from THIS header. An OLD server + NEW guest (or vice versa), built from DIFFERENT
+// rpc-supplement.h revisions, can still disagree on the set -- and that disagreement is the exact
+// silent-drop wedge the macro exists to prevent (guest publishes an op the server's older allowlist
+// drops -> guest stranded on its bounded reply-wait). Source-level sharing cannot catch a version
+// skew across two separately-built binaries; the ATTACH HANDSHAKE can.
+//
+// So fold the C2S opcode set into a 64-bit hash that BOTH sides compute from their OWN compiled
+// DSERVER_RING_C2S_OPCODES, carry it in the control block (c2s_opcode_hash), and have the server
+// REJECT the ring at attach (-> dserver_ring_reject_opcode_set -> the thread falls back to UDS for
+// EVERYTHING, never a silent per-op drop) if the guest's hash != the server's. A skewed pair thus
+// degrades cleanly to all-UDS instead of wedging on the first divergent op. This generalizes the
+// no-silent-drop invariant across binary/version skew, not just same-build source equality.
+//
+// FNV-1a over the little-endian callnum bytes, in macro-expansion order. Plain compile-time-foldable
+// arithmetic; identical on guest (libc-free C) and server (C++). Order-sensitive, which is fine: the
+// macro defines one canonical order and both sides expand the SAME macro. (A reorder of the macro is
+// itself a set change we want to surface.) Folded away with the rest of the ring behind the guard.
+//
+// This fold references dserver_callnum_* values, which live in the GENERATED rpc.h -- the one header
+// this supplement is otherwise independent of. So it is only defined when the consumer has ALREADY
+// included rpc.h (detected via its guard _DARLINGSERVER_API_H_). Every real consumer that needs the
+// hash (the guest ring attach, the server validator, the gates) includes rpc.h; a consumer that only
+// wants the wake predicates / service loop (e.g. ring_wake_predicates_test) includes neither the
+// hash nor anything that calls it, and still compiles. The server build ALWAYS has rpc.h in scope,
+// so the validator's opcode-set check below is always active in production.
+#define DSERVER_RING_OPCODE_HASH_FNV_OFFSET 1469598103934665603ull
+#define DSERVER_RING_OPCODE_HASH_FNV_PRIME  1099511628211ull
+#ifdef _DARLINGSERVER_API_H_
+static inline uint64_t dserver_ring_c2s_opcode_hash(void) {
+	uint64_t h = DSERVER_RING_OPCODE_HASH_FNV_OFFSET;
+#define DSERVER_RING_OPCODE_HASH_FOLD(op) \
+	do { \
+		uint32_t _cn = (uint32_t)dserver_callnum_##op; \
+		for (int _b = 0; _b < 4; ++_b) { \
+			h ^= (uint64_t)((_cn >> (8 * _b)) & 0xffu); \
+			h *= DSERVER_RING_OPCODE_HASH_FNV_PRIME; \
+		} \
+	} while (0);
+	DSERVER_RING_C2S_OPCODES(DSERVER_RING_OPCODE_HASH_FOLD)
+#undef DSERVER_RING_OPCODE_HASH_FOLD
+	return h;
+}
+#endif // _DARLINGSERVER_API_H_
 
 // Prefix of every REPLY payload: the RPC result code (what the UDS reply header.code carries),
 // followed by the call's reply body. Kept separate from dserver_ring_slot so the slot stays a
@@ -357,6 +420,13 @@ typedef struct dserver_ring_shm {
 	uint32_t s2c_ring_off; // offset of the reply ring (server->guest)
 	uint32_t total_size;   // full mapping size; server cross-checks vs the fd's real size
 	int32_t  guest_tid;    // nsid the guest claims; server cross-checks vs SCM credentials
+	// perf #18 dar-1il.2 item 2: the guest's compiled C2S opcode-set hash
+	// (dserver_ring_c2s_opcode_hash()). The server rejects the ring at attach if it != the server's
+	// own hash, so a guest/server pair built from a different DSERVER_RING_C2S_OPCODES degrades to
+	// all-UDS instead of wedging on the first op the older side doesn't allowlist. 8-byte aligned (it
+	// follows guest_tid at offset 36; the struct's natural alignment pads to 40 before this 8-byte
+	// field -> offset 40). Placed before the cache-line-aligned wake words so it doesn't perturb them.
+	uint64_t c2s_opcode_hash;
 	// Futex wake words. Plain uint32_t storage so the struct is a portable C/C++ wire format;
 	// atomicity is at the ACCESS site (the producer/consumer use atomic load/store + FUTEX_*),
 	// not in the storage type. Each on its own cache line so the two directions don't
@@ -419,6 +489,7 @@ typedef enum dserver_ring_reject {
 	dserver_ring_reject_arena_bounds,    // arena [off, off+size) escapes the mapping
 	dserver_ring_reject_arena_overlap,   // arena overlaps a ring or the header
 	dserver_ring_reject_tid,             // guest_tid != the SCM-credentialed nsid
+	dserver_ring_reject_opcode_set,      // c2s_opcode_hash != the server's (guest/server C2S allowlists differ across build/version skew -> would silent-drop; reject -> all-UDS)
 } dserver_ring_reject_t;
 
 // --- Server-side C2S service loop (pure, bounds-safe) ---------------------------------
@@ -567,6 +638,17 @@ static inline dserver_ring_reject_t dserver_ring_shm_validate(
 	}
 
 	if (cb->guest_tid != scm_nsid) return dserver_ring_reject_tid;
+
+	// perf #18 dar-1il.2 item 2: the guest's C2S opcode-set hash MUST match the server's. A mismatch
+	// means the two were built from different DSERVER_RING_C2S_OPCODES (binary/version skew the shared
+	// macro can't catch), so some op one side routes the other would silently drop -> reject the whole
+	// ring here -> the thread uses UDS for everything (no silent per-op drop, no wedge). Checked last
+	// because it's the most "semantic" of the trust-boundary checks; arithmetic-only, dereferences
+	// nothing beyond the server-owned copy. Active whenever rpc.h (the callnum source) is in scope --
+	// which it always is in the server build; see dserver_ring_c2s_opcode_hash above.
+#ifdef _DARLINGSERVER_API_H_
+	if (cb->c2s_opcode_hash != dserver_ring_c2s_opcode_hash()) return dserver_ring_reject_opcode_set;
+#endif
 
 	return dserver_ring_ok;
 }

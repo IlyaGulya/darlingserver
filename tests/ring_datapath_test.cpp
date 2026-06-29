@@ -18,6 +18,7 @@
 
 #define DSERVER_RING_TRANSPORT 1
 
+#include <darlingserver/rpc.h> // callnums for the C2S opcode-set hash (dar-1il.2 item 2)
 #include <darlingserver/rpc-supplement.h>
 
 // This gate is hermetic: it does NOT pull in the generated rpc.h (build-dir only). It only
@@ -62,6 +63,7 @@ static RingMap buildRing(uint32_t slot_size, uint32_t slot_count) {
 	dserver_ring_shm_t* cb = (dserver_ring_shm_t*)base;
 	cb->magic = DSERVER_RING_MAGIC;
 	cb->abi_version = DSERVER_RING_ABI_VERSION;
+	cb->c2s_opcode_hash = dserver_ring_c2s_opcode_hash(); // dar-1il.2 item 2 (this test doesn't validate, but keep it honest)
 	cb->slot_size = (uint16_t)slot_size;
 	cb->slot_count = slot_count;
 	cb->arena_off = 0;

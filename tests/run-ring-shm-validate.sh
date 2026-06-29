@@ -17,8 +17,26 @@ trap 'rm -rf "$TMP"' EXIT
 CXX="${CXX:-g++}"
 CC="${CC:-gcc}"
 
+# The GENERATED rpc.h supplies the dserver_callnum_* values. As of dar-1il.2 item 2 the validator
+# (and so the validate/attach/datapath/wake-race tests that exercise it) folds the C2S opcode set
+# into a hash that needs those callnums, so these tests now need rpc.h on the include path. Discover
+# it once up front; if a tree isn't built, SKIP (don't fail) the rpc.h-dependent arms.
+GEN_RPC=""
+for cand in "${DSERVER_GEN_INC:-}" \
+            "$HERE/../../../../build/src/external/darlingserver/include" \
+            "$HOME/work/darling-build/src/external/darlingserver/include"; do
+	[ -n "$cand" ] && [ -f "$cand/darlingserver/rpc.h" ] && { GEN_RPC="$cand"; break; }
+done
+GEN_INC_FLAG=""
+[ -n "$GEN_RPC" ] && GEN_INC_FLAG="-I$GEN_RPC"
+
+if [ -z "$GEN_RPC" ]; then
+	echo "== validator/attach/datapath gates SKIPPED (generated rpc.h not found; set DSERVER_GEN_INC) =="
+	echo
+else
+
 echo "== RED arm (accept-all stub: adversarial cases MUST fail) =="
-if ! "$CXX" -std=c++17 -I"$INC" -DRING_VALIDATE_STUB -o "$TMP/red" "$SRC"; then
+if ! "$CXX" -std=c++17 $GEN_INC_FLAG -I"$INC" -DRING_VALIDATE_STUB -o "$TMP/red" "$SRC"; then
 	echo "RED arm failed to COMPILE -- gate broken"; exit 2
 fi
 if "$TMP/red"; then
@@ -28,7 +46,7 @@ echo "  RED arm correctly failed."
 echo
 
 echo "== GREEN arm (real validator: all checks pass) =="
-if ! "$CXX" -std=c++17 -I"$INC" -o "$TMP/green" "$SRC"; then
+if ! "$CXX" -std=c++17 $GEN_INC_FLAG -I"$INC" -o "$TMP/green" "$SRC"; then
 	echo "GREEN arm failed to COMPILE"; exit 2
 fi
 if ! "$TMP/green"; then
@@ -41,7 +59,7 @@ echo
 # --- ring_attach decision (real memfd: fstat-size-check + map + validate) ---
 ASRC="$HERE/ring_attach_check_test.cpp"
 echo "== attach-check RED arm (accept-all stub: adversarial cases MUST fail) =="
-if ! "$CXX" -std=c++17 -D_GNU_SOURCE -I"$INC" -DRING_ATTACH_STUB -o "$TMP/ared" "$ASRC"; then
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE $GEN_INC_FLAG -I"$INC" -DRING_ATTACH_STUB -o "$TMP/ared" "$ASRC"; then
 	echo "attach RED arm failed to COMPILE -- gate broken"; exit 2
 fi
 if "$TMP/ared"; then
@@ -50,7 +68,7 @@ fi
 echo "  attach RED arm correctly failed."
 echo
 echo "== attach-check GREEN arm (real attach-check on real memfds) =="
-if ! "$CXX" -std=c++17 -D_GNU_SOURCE -I"$INC" -o "$TMP/agreen" "$ASRC"; then
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE $GEN_INC_FLAG -I"$INC" -o "$TMP/agreen" "$ASRC"; then
 	echo "attach GREEN arm failed to COMPILE"; exit 2
 fi
 if ! "$TMP/agreen"; then
@@ -64,7 +82,7 @@ echo
 #     memfd-backed ring, with adversarial corruption + backpressure. ASan on both arms. ---
 DSRC="$HERE/ring_datapath_test.cpp"
 echo "== datapath GREEN arm (real SPSC + service loop, ASan) =="
-if ! "$CXX" -std=c++17 -D_GNU_SOURCE -fsanitize=address -I"$INC" -o "$TMP/dp_green" "$DSRC"; then
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -fsanitize=address $GEN_INC_FLAG -I"$INC" -o "$TMP/dp_green" "$DSRC"; then
 	echo "datapath GREEN arm failed to COMPILE"; exit 2
 fi
 if ! "$TMP/dp_green"; then
@@ -72,7 +90,7 @@ if ! "$TMP/dp_green"; then
 fi
 echo
 echo "== datapath RED arm (accept-all stub, ASan: adversarial cases MUST fail) =="
-if ! "$CXX" -std=c++17 -D_GNU_SOURCE -fsanitize=address -DRING_DATAPATH_STUB -I"$INC" -o "$TMP/dp_red" "$DSRC"; then
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -fsanitize=address -DRING_DATAPATH_STUB $GEN_INC_FLAG -I"$INC" -o "$TMP/dp_red" "$DSRC"; then
 	echo "datapath RED arm failed to COMPILE -- gate broken"; exit 2
 fi
 if "$TMP/dp_red"; then
@@ -82,6 +100,8 @@ echo "  datapath RED arm correctly failed."
 echo
 echo "ring_datapath gate: RED->GREEN OK"
 echo
+
+fi # GEN_RPC present (validator/attach/datapath gates)
 
 # --- ring eligibility ALLOWLIST (P3): the real dserver_callnum_* set that may ride the ring.
 #     Needs the GENERATED rpc.h. Find it under a build dir; skip (don't fail) if not built. ---
@@ -145,14 +165,14 @@ else
 		fi
 		echo "  fast-path shape RED arm correctly failed."
 		echo
-		echo "== P5 mod_refs C2S allowlist RED arm (-DC2S_NO_MODREFS: drops mod_refs from the C2S allowlist, MUST fail) =="
-		if ! "$CC" -std=c11 -DC2S_NO_MODREFS -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_c2s_red" "$FPSRC" 2>/dev/null; then
-			echo "P5 mod_refs C2S RED arm failed to COMPILE -- gate broken"; exit 2
+		echo "== mod_refs C2S exclusion RED arm (-DC2S_READD_MODREFS: re-adds the destroy-capable op, MUST fail) =="
+		if ! "$CC" -std=c11 -DC2S_READD_MODREFS -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_c2s_red" "$FPSRC" 2>/dev/null; then
+			echo "mod_refs C2S RED arm failed to COMPILE -- gate broken"; exit 2
 		fi
 		if "$TMP/fp_c2s_red" >/dev/null 2>&1; then
-			echo "P5 mod_refs C2S RED arm PASSED but must FAIL -- gate not exercising the C2S allowlist"; exit 1
+			echo "mod_refs C2S RED arm PASSED but must FAIL -- gate not pinning mod_refs OUT of the C2S allowlist"; exit 1
 		fi
-		echo "  P5 mod_refs C2S RED arm correctly failed."
+		echo "  mod_refs C2S RED arm correctly failed."
 		echo
 		echo "ring_fastpath gate: RED->GREEN OK"
 		echo
@@ -193,7 +213,7 @@ fi
 WRSRC="$HERE/ring_wake_race_test.cpp"
 WR_ITERS="${RING_WAKE_RACE_ITERS:-8000}"
 echo "== wake-race GREEN arm (no lost-wake interleaving; stress live) =="
-if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread -I"$INC" -o "$TMP/wr_green" "$WRSRC"; then
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread $GEN_INC_FLAG -I"$INC" -o "$TMP/wr_green" "$WRSRC"; then
 	echo "wake-race GREEN arm failed to COMPILE"; exit 2
 fi
 if ! "$TMP/wr_green" "$WR_ITERS"; then
@@ -201,7 +221,7 @@ if ! "$TMP/wr_green" "$WR_ITERS"; then
 fi
 echo
 echo "== wake-race RED arm A (-DRACE_NO_SERVER_RECHECK: server skips critical recheck, MUST fail) =="
-if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread -DRACE_NO_SERVER_RECHECK -I"$INC" -o "$TMP/wr_redA" "$WRSRC"; then
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread -DRACE_NO_SERVER_RECHECK $GEN_INC_FLAG -I"$INC" -o "$TMP/wr_redA" "$WRSRC"; then
 	echo "wake-race RED arm A failed to COMPILE -- gate broken"; exit 2
 fi
 if "$TMP/wr_redA" "$WR_ITERS" >/dev/null 2>&1; then
@@ -210,7 +230,7 @@ fi
 echo "  wake-race RED arm A correctly failed."
 echo
 echo "== wake-race RED arm B (-DRACE_WAITERBIT_AFTER_RECHECK: guest sets waiter bit too late, MUST fail) =="
-if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread -DRACE_WAITERBIT_AFTER_RECHECK -I"$INC" -o "$TMP/wr_redB" "$WRSRC"; then
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -O2 -pthread -DRACE_WAITERBIT_AFTER_RECHECK $GEN_INC_FLAG -I"$INC" -o "$TMP/wr_redB" "$WRSRC"; then
 	echo "wake-race RED arm B failed to COMPILE -- gate broken"; exit 2
 fi
 if "$TMP/wr_redB" "$WR_ITERS" >/dev/null 2>&1; then

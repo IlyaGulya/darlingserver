@@ -84,13 +84,15 @@ int main(void) {
 		CHECK(in_set(guest_set, guest_set_len, server_set[i]), buf);
 	}
 
-	// (c) Sanity: the shared set is non-empty and contains the ops migrated so far. Note
-	//     mach_port_deallocate is DELIBERATELY ABSENT (S2C-upcall deadlock hazard -> UDS only).
-	CHECK(server_set_len >= 5, "shared C2S allowlist has the expected ops");
-	CHECK(in_set(server_set, server_set_len, (unsigned)dserver_callnum_mach_port_mod_refs),  "mod_refs in shared set");
+	// (c) Sanity: the shared set is non-empty and contains the ops migrated so far. Note BOTH
+	//     mach_port_deallocate AND mach_port_mod_refs are DELIBERATELY ABSENT (S2C-upcall deadlock
+	//     hazard from destroying a mapped-region-backed port -> UDS only; mod_refs removed in
+	//     dar-1il.2 because mod_refs(delta<0) last-ref is destroy-capable).
+	CHECK(server_set_len >= 4, "shared C2S allowlist has the expected ops");
 	CHECK(in_set(server_set, server_set_len, (unsigned)dserver_callnum_mach_port_allocate),     "allocate in shared set");
 	CHECK(in_set(server_set, server_set_len, (unsigned)dserver_callnum_mach_port_insert_right), "insert_right in shared set");
 	CHECK(!in_set(server_set, server_set_len, (unsigned)dserver_callnum_mach_port_deallocate),  "deallocate NOT in shared set (S2C deadlock hazard)");
+	CHECK(!in_set(server_set, server_set_len, (unsigned)dserver_callnum_mach_port_mod_refs),    "mod_refs NOT in shared set (destroy-capable -> S2C deadlock hazard, dar-1il.2)");
 
 	if (failures) {
 		fprintf(stderr, "\nring_drift_gate_test: %d FAILURE(S) -- guest/server C2S allowlists DRIFT (silent-drop wedge hazard)\n", failures);
