@@ -35,6 +35,12 @@
 #include <darlingserver/kqchan.hpp>
 #include <system_error>
 #include <cerrno>
+#ifdef DSERVER_RING_TRANSPORT
+	#include <darlingserver/ring.hpp>
+	#include <darlingserver/monitor.hpp>
+	#include <darlingserver/utility.hpp>
+	#include <sys/eventfd.h>
+#endif
 
 static DarlingServer::Log callLog("calls");
 
@@ -1344,9 +1350,11 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 // guest pointer and trusting no guest-supplied length. reject_reason is 0 (dserver_ring_ok)
 // on accept or a dserver_ring_reject_t code; on any reject (or with the feature compiled
 // off) the guest stays on UDS forever, no error -- the ring is a fast path, never the only
-// path. This increment performs the full attach DECISION and reply; retaining the RW mapping
-// and registering the ring's wake eventfd in the epoll loop is the next sub-step (it needs
-// the guest side to actually drive traffic, so there is nothing to wake yet).
+// path. On accept we build a RingBuffer (maps RW + creates the wake eventfd), register that
+// eventfd as a Readable Monitor on the epoll loop, and hand both to the Thread (it releases
+// them on death). The Monitor callback currently just drains the wake eventfd -- no call is
+// migrated onto the ring yet (that's P3), so there is nothing to dispatch; this proves the
+// attach/teardown lifecycle end-to-end.
 void DarlingServer::Call::RingAttach::processCall() {
 #ifdef DSERVER_RING_TRANSPORT
 	uint32_t rejectReason = dserver_ring_reject_total_size; // default-deny
@@ -1357,22 +1365,19 @@ void DarlingServer::Call::RingAttach::processCall() {
 			// no fd arrived -- can't be a valid attach
 			rejectReason = dserver_ring_reject_total_size;
 		} else {
-			uint64_t realSize = 0;
-			dserver_ring_shm_t cb;
-			rejectReason = dserver_ring_attach_check(
+			dserver_ring_reject_t reject = dserver_ring_reject_total_size;
+			auto ring = RingBuffer::attach(
 				_body.ring_fd,
 				_body.mapping_size,
 				static_cast<int32_t>(thread->nsid()),
-				&realSize,
-				&cb
+				&reject
 			);
-			if (rejectReason == dserver_ring_ok) {
-				// Accepted: the control block is well-formed and the guest_tid matches this
-				// thread's nsid. (Next sub-step: keep the RW mapping + register cb.c2s_futex's
-				// eventfd as a Monitor so the epoll loop drains this ring.) For now we accept
-				// the handshake and let the FD close at end of call.
+			rejectReason = static_cast<uint32_t>(reject);
+
+			if (ring) {
+				const auto& cb = ring->controlBlock();
 				callLog.debug() << "ring_attach accepted for TID " << thread->nsid()
-					<< " (size " << realSize << ", " << cb.slot_count << " slots of " << cb.slot_size << "B)"
+					<< " (" << cb.slot_count << " slots of " << cb.slot_size << "B)"
 					<< callLog.endLog;
 			} else {
 				callLog.info() << "ring_attach rejected for TID " << thread->nsid()
@@ -1392,3 +1397,33 @@ void DarlingServer::Call::RingAttach::processCall() {
 };
 
 DSERVER_CLASS_SOURCE_DEFS;
+
+				// Watch the ring's wake eventfd. The guest writes it to signal "I published a
+				// request"; for now the callback just drains it (no C2S call is on the ring
+				// yet -- P3). HangUp tears the ring down. We pass a non-owning FD to the
+				// Monitor (the RingBuffer owns the eventfd lifetime) by dup'ing it into the
+				// Monitor's FD so the two lifetimes stay independent.
+				int wakeDup = ::dup(ring->eventfd());
+				if (wakeDup < 0) {
+					rejectReason = static_cast<uint32_t>(dserver_ring_reject_total_size);
+				} else {
+					std::weak_ptr<Thread> weakThread = thread;
+					auto monitor = std::make_shared<Monitor>(
+						std::make_shared<FD>(wakeDup),
+						Monitor::Event::Readable | Monitor::Event::HangUp,
+						false, false,
+						[weakThread](std::shared_ptr<Monitor> thisMonitor, Monitor::Event events) {
+							// drain the eventfd so it doesn't re-fire spuriously
+							eventfd_t value;
+							eventfd_read(thisMonitor->fd()->fd(), &value);
+							if (static_cast<uint64_t>(events & Monitor::Event::HangUp) != 0) {
+								Server::sharedInstance().removeMonitor(thisMonitor);
+								return;
+							}
+							// P3 will dispatch the C2S ring slots here. For now: nothing on the
+							// ring, so just having drained the wake is correct.
+						}
+					);
+					Server::sharedInstance().addMonitor(monitor);
+					thread->attachRing(ring, monitor);
+				}
