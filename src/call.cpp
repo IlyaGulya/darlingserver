@@ -1370,6 +1370,42 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 // already refuses a corrupt c2s tail; here we additionally (a) bound the inline body to the
 // slot, (b) only accept a small allowlist of ring-eligible call numbers (P3 = task_self_trap),
 // dropping anything else so the guest UDS-falls-back, and (c) never deref a guest pointer.
+// perf #18 P6.1 (dar-ohp): escape hatches. Resolved once from the environment. The fast inline
+// path (doWorkInline, no fiber) is ON by default when the ring is enabled, but either knob set to
+// "0" forces the op back through the generic doWork() fiber path -- so the ring transport can be
+// run WITHOUT specialized inline semantics if a bug surfaces.
+//   DARLING_SERVER_FAST_OPS=0            -> disable ALL inline fast paths
+//   DARLING_SERVER_FAST_MACH_REPLY_PORT=0 -> disable just mach_reply_port's inline path
+static bool ringFastOpsEnabled() {
+	static const bool v = []() {
+		const char* e = getenv("DARLING_SERVER_FAST_OPS");
+		return !(e && e[0] == '0' && e[1] == '\0');
+	}();
+	return v;
+}
+static bool ringFastMachReplyPortEnabled() {
+	static const bool v = []() {
+		const char* e = getenv("DARLING_SERVER_FAST_MACH_REPLY_PORT");
+		return !(e && e[0] == '0' && e[1] == '\0');
+	}();
+	return v;
+}
+// Is this callnum eligible for the no-fiber inline fast path? Must be a PROVEN-non-blocking op.
+// task_self_trap + mach_reply_port both just mint/return a port via current_task()'s space and
+// never suspend. Each gated by its hatch (task_self_trap rides the global hatch only).
+static bool ringFastPathEligible(uint32_t callnum) {
+	if (!ringFastOpsEnabled()) {
+		return false;
+	}
+	if (callnum == dserver_callnum_mach_reply_port) {
+		return ringFastMachReplyPortEnabled();
+	}
+	if (callnum == dserver_callnum_task_self_trap) {
+		return true;
+	}
+	return false;
+}
+
 uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::Thread>& thread) {
 	using namespace DarlingServer;
 	uint32_t serviced = 0;
@@ -1456,8 +1492,19 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 			uint64_t _phaseT2 = Metrics::rdtscCycles(); // dispatch end / body start
 #endif
 			if (call) {
-				// run inline on the main loop (self-traps never block) -- perf#2b path
-				call->thread()->doWork();
+				// perf #18 P6.1: for proven-non-blocking allowlisted ops, run WITHOUT the
+				// microthread fiber (doWorkInline) -- the P6 breakdown showed the fiber is ~half
+				// the hot-path cost. doWorkInline returns false if it declined (not the simple
+				// fresh-call case) -> fall back to the generic fiber doWork(). Anything not
+				// fast-eligible (or with the escape hatch off) takes the generic path unchanged
+				// (= perf#2b inline-on-main-loop-via-fiber; self-traps never block).
+				if (ringFastPathEligible(callnum)) {
+					if (!call->thread()->doWorkInline()) {
+						call->thread()->doWork();
+					}
+				} else {
+					call->thread()->doWork();
+				}
 				++serviced;
 #ifdef DSERVER_RING_PHASE_PROF
 				uint64_t _phaseT3 = Metrics::rdtscCycles(); // body end

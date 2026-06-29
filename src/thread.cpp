@@ -652,6 +652,115 @@ doneWorking:
 	return;
 };
 
+#ifdef DSERVER_RING_TRANSPORT
+bool DarlingServer::Thread::doWorkInline() {
+	// perf #18 P6.1 (dar-ohp): run a proven-non-blocking Call without the microthread fiber.
+	// This is doWork() with the fiber stripped: same guards, same context-enter (so current_task
+	// resolves identically), same processCall + exception containment + metrics as
+	// microthreadWorker(), then the same essential completion cleanup as doneWorking -- but the
+	// call runs on the CURRENT (main-loop) stack instead of a makecontext fiber.
+	//
+	// SAFETY: the caller guarantees the call never suspends. We therefore never touch the fiber
+	// state (backToThreadTopContext / _resumeContext / _stack) and assert it stays non-suspended.
+	std::unique_lock<std::shared_mutex> lock(_rwlock);
+
+	if (_deferralState != DeferralState::NotDeferred) {
+		_deferralState = DeferralState::DeferredPending;
+		return false;
+	}
+	if (_running) {
+		microthreadLog.warning() << _tid << "(" << _nstid << "): doWorkInline on already-running microthread" << microthreadLog.endLog;
+		return false;
+	}
+	if (_terminating || (_dead && !_activeCall) || _suspended || _continuationCallback || !_pendingCall) {
+		// any of these means this is NOT the simple "fresh non-blocking call" case the inline
+		// path is for; let the caller fall back to the full doWork() which handles them.
+		return false;
+	}
+
+	_running = true;
+	currentThreadVar = shared_from_this();
+	dtape_thread_entering(_dtapeThread);
+	_suspended = false;
+	lock.unlock();
+	_runningCondvar.notify_all();
+
+	// --- body: mirror microthreadWorker() without the fiber-return setcontext ---------------
+	makePendingCallActive(); // moves _pendingCall -> _activeCall (same as the fiber path)
+
+	auto& _metrics = DarlingServer::Metrics::shared();
+	uint64_t _callStartUs = DarlingServer::Metrics::nowMonoUs();
+	auto _callNumber = _activeCall->number();
+
+	try {
+		_activeCall->processCall();
+	} catch (const std::system_error& err) {
+		microthreadLog.error() << "Uncaught std::system_error from inline processCall ("
+			<< DarlingServer::Call::callNumberToString(_callNumber) << "): " << err.what()
+			<< " (code " << err.code().value() << ")" << microthreadLog.endLog;
+		try { _activeCall->sendBasicReply(-err.code().value()); } catch (...) {}
+	} catch (const std::exception& ex) {
+		microthreadLog.error() << "Uncaught exception from inline processCall ("
+			<< DarlingServer::Call::callNumberToString(_callNumber) << "): " << ex.what() << microthreadLog.endLog;
+		try { _activeCall->sendBasicReply(-EINVAL); } catch (...) {}
+	} catch (...) {
+		microthreadLog.error() << "Uncaught non-std exception from inline processCall ("
+			<< DarlingServer::Call::callNumberToString(_callNumber) << ")" << microthreadLog.endLog;
+		try { _activeCall->sendBasicReply(-EINVAL); } catch (...) {}
+	}
+
+	{
+		uint64_t now = DarlingServer::Metrics::nowMonoUs();
+		uint64_t serviceUs = (now >= _callStartUs) ? (now - _callStartUs) : 0;
+		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
+		_metrics.rpcLatency.record(serviceUs);
+		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
+	}
+
+	// processCall() on a non-blocking op must have run to completion. If somehow it suspended
+	// (a misclassified op), that is a contract violation -> we'd have corrupted the fiber model.
+	// Detect it loudly rather than silently mishandle.
+	bool canRelease = false;
+	{
+		std::unique_lock<std::shared_mutex> relock(_rwlock);
+		if (_suspended) {
+			// Should be impossible for an allowlisted op. The microthread "suspended" without a
+			// fiber to resume onto -> we cannot honor it. Log; leave _running cleared so the
+			// thread isn't wedged. (The guest will time out on this op and UDS-fall-back.)
+			microthreadLog.error() << *this << ": doWorkInline call suspended -- not fast-path eligible!" << microthreadLog.endLog;
+			_suspended = false;
+		}
+		_activeCall = nullptr;
+		dtape_thread_exiting(_dtapeThread);
+		currentThreadVar = nullptr;
+		_running = false;
+
+		if (_dead && !_activeCall && !_terminating) {
+			_terminating = true;
+			canRelease = true;
+		}
+		if (_terminating && !_dead) {
+			relock.unlock();
+			notifyDead();
+		} else {
+			if (!_terminating && !_dead && !_pendingInterrupts.empty()) {
+				if (!_pendingCall) {
+					_pendingCall = _pendingInterrupts.front();
+					_pendingInterrupts.pop();
+					Server::sharedInstance().scheduleThread(shared_from_this());
+				}
+			}
+			relock.unlock();
+		}
+	}
+	_runningCondvar.notify_all();
+	if (canRelease) {
+		_scheduleRelease();
+	}
+	return true;
+};
+#endif
+
 void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, libsimple_lock_t* unlockMe) {
 	if (this != currentThreadVar.get()) {
 		throw std::runtime_error("Attempt to suspend thread other than current thread");
