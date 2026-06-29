@@ -24,6 +24,10 @@
 #include <darlingserver/server.hpp>
 #include <darlingserver/logging.hpp>
 #include <darlingserver/metrics.hpp>
+#ifdef DSERVER_RING_TRANSPORT
+	#include <darlingserver/ring.hpp>
+	#include <darlingserver/monitor.hpp>
+#endif
 #include <filesystem>
 #include <fstream>
 
@@ -1561,6 +1565,15 @@ void DarlingServer::Thread::jumpToResume(void* stack, size_t stackSize) {
 void DarlingServer::Thread::notifyDead() {
 	bool canRelease = false;
 
+#ifdef DSERVER_RING_TRANSPORT
+	// perf #18 (dar-dar6x4-perf-5dq.30): grab the ring + its Monitor out from under _rwlock
+	// and release them AFTER unlocking -- removeMonitor() touches Server state and could
+	// otherwise reintroduce the dar-6x4 lock-across-suspend hazard class. The RingBuffer dtor
+	// unmaps + closes the eventfd.
+	std::shared_ptr<RingBuffer> ringToRelease = nullptr;
+	std::shared_ptr<Monitor> ringMonitorToRelease = nullptr;
+#endif
+
 	{
 		std::unique_lock lock(_rwlock);
 		if (_dead) {
@@ -1570,6 +1583,13 @@ void DarlingServer::Thread::notifyDead() {
 		threadLog.info() << *this << ": thread dying" << threadLog.endLog;
 		_dead = true;
 
+#ifdef DSERVER_RING_TRANSPORT
+		ringMonitorToRelease = std::move(_ringMonitor);
+		ringToRelease = std::move(_ring);
+		_ringMonitor = nullptr;
+		_ring = nullptr;
+#endif
+
 		if (!_activeCall) {
 			// if we have no active call, we won't ever need to run again,
 			// so set `_terminating` to make sure that doesn't happen
@@ -1577,6 +1597,15 @@ void DarlingServer::Thread::notifyDead() {
 			canRelease = true;
 		}
 	}
+
+#ifdef DSERVER_RING_TRANSPORT
+	// _rwlock is dropped now; tear down the ring's epoll Monitor and release the mapping.
+	if (ringMonitorToRelease) {
+		Server::sharedInstance().removeMonitor(ringMonitorToRelease);
+	}
+	ringMonitorToRelease = nullptr;
+	ringToRelease = nullptr; // RingBuffer dtor: munmap + close eventfd
+#endif
 
 	// keep ourselves alive until the duct-taped context is done
 	_selfReference = shared_from_this();
@@ -1596,6 +1625,30 @@ bool DarlingServer::Thread::isDead() const {
 	std::shared_lock lock(_rwlock);
 	return _dead;
 };
+
+#ifdef DSERVER_RING_TRANSPORT
+void DarlingServer::Thread::attachRing(std::shared_ptr<RingBuffer> ring, std::shared_ptr<Monitor> monitor) {
+	std::shared_ptr<RingBuffer> oldRing = nullptr;
+	std::shared_ptr<Monitor> oldMonitor = nullptr;
+	{
+		std::unique_lock lock(_rwlock);
+		// a thread attaches at most once in practice, but replace defensively
+		oldRing = std::move(_ring);
+		oldMonitor = std::move(_ringMonitor);
+		_ring = ring;
+		_ringMonitor = monitor;
+	}
+	// drop any prior ring's Monitor outside the lock (same hazard discipline as notifyDead)
+	if (oldMonitor) {
+		Server::sharedInstance().removeMonitor(oldMonitor);
+	}
+};
+
+std::shared_ptr<DarlingServer::RingBuffer> DarlingServer::Thread::ring() const {
+	std::shared_lock lock(_rwlock);
+	return _ring;
+};
+#endif
 
 void DarlingServer::Thread::_dispose() {
 	threadLog.debug() << *this << ": dispose thread context" << threadLog.endLog;

@@ -123,6 +123,15 @@ namespace DarlingServer {
 		bool _dead = false;
 		std::shared_ptr<Thread> _selfReference = nullptr;
 
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 (dar-dar6x4-perf-5dq.30): the shared-memory ring this thread attached (if
+		// any), and the Monitor watching its wake eventfd. Held here so they live exactly as
+		// long as the Thread and are torn down on death. _ringMonitor is removed + _ring reset
+		// in notifyDead() so the mapping + eventfd are released with the thread.
+		std::shared_ptr<class RingBuffer> _ring = nullptr;
+		std::shared_ptr<class Monitor> _ringMonitor = nullptr;
+#endif
+
 		static void microthreadWorker();
 		static void microthreadContinuation();
 
@@ -277,6 +286,14 @@ namespace DarlingServer {
 		 */
 		void notifyDead();
 		bool isDead() const;
+
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18: attach a validated shared-memory ring to this thread and start watching its
+		// wake eventfd. Takes ownership of the ring + its Monitor; both are released in
+		// notifyDead(). Replaces any prior ring (a thread attaches at most once in practice).
+		void attachRing(std::shared_ptr<class RingBuffer> ring, std::shared_ptr<class Monitor> monitor);
+		std::shared_ptr<class RingBuffer> ring() const;
+#endif
 
 		/**
 		 * @note Only to be used by direct XNU traps! (e.g. Mach IPC, psynch, etc.)
