@@ -344,6 +344,38 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // with a pre-mutation server guard, dar-1il.2 item 1 option B) is built and gated. See mach_traps.c
 // _kernelrpc_mach_port_mod_refs_trap_impl.
 //
+// === PERMANENT MEMBERSHIP CANON (dar-1il.2) -- ALL must hold to add an op to THIS macro =========
+// An op may ride the simple C2S ring ONLY if every one of these is true. This is the authoritative
+// checklist; the prose above is the rationale. Adding an op that fails any of these has caused a
+// real launchd wedge (deallocate, mod_refs).
+//   1. NO caller S2C upcall. The op must never drive a server-to-client upcall (mmap/munmap/
+//      mprotect/msync) to the CALLING thread -- a thread parked on a ring reply is not in recvmsg
+//      and cannot service it -> deadlock. (This is SEPARATE from "non-blocking"; the fiber does not
+//      save you.)
+//   2. NO destroy-capable side effect. The op must not, for ANY argument combination, destroy a
+//      port/right (last-ref drop, explicit destroy) -- destroying a mapped-region-backed object
+//      triggers rule-1's munmap S2C. "Bookkeeping-only / create-or-ref" ops qualify; anything that
+//      can tear down does not.
+//   3. Safety decidable BEFORE mutation. The decision "is this call ring-safe?" must be answerable
+//      from the request args alone, BEFORE taking ipc_space/any lock and BEFORE mutating state. If
+//      safety only becomes knowable mid-mutation (e.g. after the refcount is read under the lock),
+//      there is no valid preflight and the op is INELIGIBLE -- you cannot start, discover "oops,
+//      need S2C", and roll back.
+//   4. Opcode set in the ABI negotiation. The op participates in DSERVER_RING_C2S_OPCODES (which the
+//      attach handshake hashes into c2s_opcode_hash); a build/version skew rejects the ring -> all
+//      UDS, never a silent per-op drop.
+//   5. SIDE-EFFECT A/B, not just return-code A/B. Correctness vs UDS must assert post-op namespace
+//      STATE (right present/type/refcount, name reclamation, no garbage on error edges), not only a
+//      byte-identical kern_return_t -- a transport bug can return the right code with the wrong
+//      state.
+//
+// "WRONG LANE, NOT BAD OP" (the frame for ops that fail the canon): an op rejected here is not
+// permanently UDS-doomed -- it is in the WRONG LANE. deallocate / mod_refs fail rules 1-3 because the
+// SIMPLE fast ring has no way to deliver a caller-side S2C while the caller is parked. A future
+// DUPLEX-ring lane that can accept caller-side S2C mid-call (the caller services upcalls while
+// waiting for its reply) is the right home for destroy-capable ops. Until that lane exists they stay
+// UDS; do NOT smuggle them back onto the simple ring via a "clever subset" that still risks an S2C.
+//
 // NOTE this is the TRANSPORT allowlist (Tier 1 = ride the ring via the generic fiber doWork); it is
 // DISTINCT from the no-fiber inline fast path (ringFastPathEligible / Tier 2), a strictly smaller,
 // separately-proven set. Never conflate the two.
