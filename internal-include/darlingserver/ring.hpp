@@ -22,6 +22,15 @@
 #include <darlingserver/utility.hpp>
 
 namespace DarlingServer {
+	class Thread;
+
+	// perf #18 P4: service every C2S request a thread's ring has published, dispatching each
+	// through the normal Call path and redirecting the reply onto the s2c ring. Defined in
+	// call.cpp (it reuses the Call machinery there); declared here so the server's main-loop
+	// spin phase (server.cpp) can drain rings directly, not only the eventfd Monitor callback.
+	// Returns the number of requests serviced.
+	uint32_t ringServiceThread(const std::shared_ptr<Thread>& thread);
+
 	class RingBuffer {
 	private:
 		void* _map = nullptr;     // the RW mapping of the guest memfd (size _size)
@@ -69,13 +78,30 @@ namespace DarlingServer {
 		bool publishReply(uint32_t seq, uint32_t callnum, int32_t code, const void* body, uint32_t bodyLen);
 
 		/**
-		 * Wake a guest that is FUTEX_WAITing on the s2c futex word (bump the word, then
-		 * FUTEX_WAKE). Cheap no-op cost if the guest is spinning (it just sees the new tail).
+		 * Wake a guest that is FUTEX_WAITing on the s2c futex word. perf #18 P4: this is now
+		 * CONDITIONAL -- it always bumps the s2c_futex word (so a guest racing its pre-sleep
+		 * recheck sees the change), but only issues the FUTEX_WAKE syscall when the guest has
+		 * parked (s2c_waiters != 0, via dserver_ring_server_should_wake). A spinning guest costs
+		 * zero syscalls. Returns true if a FUTEX_WAKE was actually issued (for metrics/tests).
 		 */
-		void wakeGuest();
+		bool wakeGuest();
 
 		/** Drain the wake eventfd (called from the Monitor callback so it stops re-firing). */
 		void drainWake();
+
+		/**
+		 * perf #18 P4: publish the server's current sleep state (DSERVER_RING_SRV_*) into the
+		 * shared control block so a producing guest can skip the doorbell while we poll. A single
+		 * release-store; the guest reads it with acquire in dserver_ring_guest_should_doorbell().
+		 */
+		void setServerState(uint32_t state);
+
+		/**
+		 * perf #18 P4: true if the c2s (request) ring has at least one published, unconsumed slot.
+		 * Used by the server's pre-epoll spin phase to decide whether there is work to drain
+		 * without committing to service it. Bounds-safe (defends against a corrupt guest tail).
+		 */
+		bool hasPendingRequests() const;
 	};
 };
 

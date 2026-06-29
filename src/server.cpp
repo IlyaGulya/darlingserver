@@ -42,6 +42,11 @@
 
 #include <darlingserver/logging.hpp>
 #include <darlingserver/metrics.hpp>
+#ifdef DSERVER_RING_TRANSPORT
+	#include <darlingserver/ring.hpp>
+	#include <cstdlib>
+	#include <time.h>
+#endif
 
 static DarlingServer::Server* sharedInstancePointer = nullptr;
 
@@ -719,7 +724,70 @@ void DarlingServer::Server::start() {
 		}
 
 		struct epoll_event events[16];
-		int ret = epoll_wait(_epollFD, events, 16, -1);
+		int ret;
+
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 P4 (dar-dar6x4-perf-5dq.33): adaptive pre-epoll spin (the gist's wake model).
+		// Before committing to a blocking epoll_wait we busy-poll the attached rings for a bounded
+		// budget so a hot RPC stream is serviced with zero doorbell syscalls and zero scheduler
+		// handoffs. The budget is small (balanced default 20us) and we ALSO poll epoll with a 0
+		// timeout each iteration so UDS + other Monitors are never starved -- if anything else is
+		// ready we break straight out and handle it. Only when the budget elapses with no ring or
+		// epoll activity do we arm + block, exactly as a server with no rings always has.
+		_resolveRingSpinBudget();
+		bool haveRings;
+		{
+			std::unique_lock lock(_ringThreadsLock);
+			haveRings = !_ringThreads.empty();
+		}
+		ret = -2; // sentinel: "not yet blocked"
+		if (haveRings && _ringSpinNs > 0) {
+			struct timespec ts0;
+			clock_gettime(CLOCK_MONOTONIC, &ts0);
+			uint64_t startNs = (uint64_t)ts0.tv_sec * 1000000000ull + ts0.tv_nsec;
+			_setAllRingStates(DSERVER_RING_SRV_ACTIVE_POLLING);
+			for (;;) {
+				uint32_t serviced = _drainRings();
+
+				// Harvest any UDS / Monitor / wakeup readiness without blocking, so the ring spin
+				// never delays them. If something is ready, take it now (ret > 0 -> dispatch loop).
+				ret = epoll_wait(_epollFD, events, 16, 0);
+				if (ret != 0) {
+					break; // ready fds (ret>0) or error (ret<0, handled below)
+				}
+				if (serviced > 0) {
+					continue; // did real work -> keep the budget alive (reset by staying hot)
+				}
+
+				struct timespec ts1;
+				clock_gettime(CLOCK_MONOTONIC, &ts1);
+				uint64_t nowNs = (uint64_t)ts1.tv_sec * 1000000000ull + ts1.tv_nsec;
+				if (nowNs - startNs >= _ringSpinNs) {
+					break; // budget exhausted with nothing to do -> fall through to arm + block
+				}
+				__builtin_ia32_pause();
+			}
+		}
+
+		if (ret == -2 || ret == 0) {
+			// Either we never spun (no rings / low-power) or the spin budget elapsed idle. Arm the
+			// sleep state with the gist's critical recheck: publish SLEEP_ARMED, drain ONCE more
+			// (closing the publish/sleep race -- a guest that produced after our last drain but
+			// before reading SLEEP_ARMED will have doorbelled, but a guest that read ACTIVE_POLLING
+			// and skipped the doorbell is caught here), and only if still idle commit to epoll.
+			_setAllRingStates(DSERVER_RING_SRV_SLEEP_ARMED);
+			if (haveRings && _drainRings() > 0) {
+				// raced in a request -> go service its reply path; don't sleep.
+				_setAllRingStates(DSERVER_RING_SRV_ACTIVE_POLLING);
+				continue;
+			}
+			_setAllRingStates(DSERVER_RING_SRV_SLEEPING_EPOLL);
+			ret = epoll_wait(_epollFD, events, 16, -1);
+			_setAllRingStates(DSERVER_RING_SRV_ACTIVE_POLLING);
+		}
+#else
+		ret = epoll_wait(_epollFD, events, 16, -1);
+#endif
 
 		if (ret < 0) {
 			if (errno == EINTR) {
@@ -915,6 +983,105 @@ void DarlingServer::Server::removeMonitor(std::shared_ptr<Monitor> monitor) {
 	// force an event loop wakeup (so the removal can be finalized as soon as possible)
 	eventfd_write(_wakeupFD, 1);
 };
+
+#ifdef DSERVER_RING_TRANSPORT
+void DarlingServer::Server::registerRingThread(std::shared_ptr<Thread> thread) {
+	std::unique_lock lock(_ringThreadsLock);
+	// prune dead entries while we're here, and avoid duplicates
+	for (size_t i = 0; i < _ringThreads.size();) {
+		auto t = _ringThreads[i].lock();
+		if (!t) {
+			_ringThreads.erase(_ringThreads.begin() + i);
+		} else if (t.get() == thread.get()) {
+			return; // already registered
+		} else {
+			++i;
+		}
+	}
+	_ringThreads.push_back(thread);
+};
+
+void DarlingServer::Server::unregisterRingThread(std::shared_ptr<Thread> thread) {
+	std::unique_lock lock(_ringThreadsLock);
+	for (size_t i = 0; i < _ringThreads.size();) {
+		auto t = _ringThreads[i].lock();
+		if (!t || t.get() == thread.get()) {
+			_ringThreads.erase(_ringThreads.begin() + i);
+		} else {
+			++i;
+		}
+	}
+};
+
+void DarlingServer::Server::_setAllRingStates(uint32_t state) {
+	std::unique_lock lock(_ringThreadsLock);
+	for (auto& weak : _ringThreads) {
+		if (auto t = weak.lock()) {
+			if (auto r = t->ring()) {
+				r->setServerState(state);
+			}
+		}
+	}
+};
+
+uint32_t DarlingServer::Server::_drainRings() {
+	// Snapshot the live thread set under the lock, then service OUTSIDE the lock: ringServiceThread
+	// runs the full Call path (which can register/unregister rings, take Process/Thread locks, and
+	// suspend microthreads) -- holding _ringThreadsLock across that would invite the dar-6x4
+	// lock-across-suspend hazard class. The snapshot is shared_ptrs so the threads stay alive.
+	std::vector<std::shared_ptr<Thread>> live;
+	{
+		std::unique_lock lock(_ringThreadsLock);
+		live.reserve(_ringThreads.size());
+		for (size_t i = 0; i < _ringThreads.size();) {
+			auto t = _ringThreads[i].lock();
+			if (!t) {
+				_ringThreads.erase(_ringThreads.begin() + i);
+			} else {
+				live.push_back(std::move(t));
+				++i;
+			}
+		}
+	}
+	uint32_t serviced = 0;
+	for (auto& t : live) {
+		serviced += ringServiceThread(t);
+	}
+	if (serviced > 0) {
+		Metrics::shared().ringServicedSpin.fetch_add(serviced, std::memory_order_relaxed);
+	}
+	return serviced;
+};
+
+void DarlingServer::Server::_resolveRingSpinBudget() {
+	if (_ringSpinResolved) {
+		return;
+	}
+	_ringSpinResolved = true;
+
+	// Default budget by mode (the gist's low-power/balanced/latency). balanced is the default:
+	// a short adaptive spin so a back-to-back RPC burst stays hot without burning a core on an
+	// idle desktop. DARLING_SERVER_SPIN_US overrides the microsecond budget directly.
+	uint64_t us = 20; // balanced default
+	if (const char* mode = getenv("DARLING_SERVER_MODE")) {
+		if (strcmp(mode, "low-power") == 0) {
+			us = 0;      // straight to epoll; never poll
+		} else if (strcmp(mode, "latency") == 0) {
+			us = 200;    // aggressive spin (pinning recommended)
+		} else {
+			us = 20;     // balanced / unknown
+		}
+	}
+	if (const char* env = getenv("DARLING_SERVER_SPIN_US")) {
+		char* end = nullptr;
+		unsigned long v = strtoul(env, &end, 10);
+		if (end && *end == '\0') {
+			us = (uint64_t)v;
+		}
+	}
+	_ringSpinNs = us * 1000ull;
+};
+#endif // DSERVER_RING_TRANSPORT
 
 DarlingServer::Monitor::Monitor(std::shared_ptr<FD> descriptor, Event events, bool edgeTriggered, bool oneshot, std::function<void(std::shared_ptr<Monitor>, Event)> callback):
 	_fd(descriptor),

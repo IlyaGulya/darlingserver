@@ -53,4 +53,29 @@ if [ "$RATIO" -lt 50 ]; then
 fi
 echo "  GATE PASSED (${RATIO}x >= 50x): the polling/spin wake model eliminates the per-call syscall/sleep."
 echo
+
+# perf #18 P4 (.33): the integration GATE. The bench above proves the MODEL is fast in the
+# abstract; this proves the REAL shared predicates the server + guest compile (from
+# rpc-supplement.h) are conditional, not the v0 always-wake. RED arm (-DWAKE_MODEL_OLD) must fail.
+echo "== GATE: wake-model decision predicates are conditional (RED->GREEN) =="
+PRED_SRC="$HERE/ring_wake_predicates_test.c"
+INC="$HERE/../include"
+if [ ! -f "$PRED_SRC" ]; then
+	echo "GATE skipped: $PRED_SRC missing"; exit 2
+fi
+GREEN_BIN="$TMP/wp_green"; RED_BIN="$TMP/wp_red"
+if ! "$CC" -O2 -std=c11 -I"$INC" -o "$GREEN_BIN" "$PRED_SRC" 2>"$TMP/wp_green.log"; then
+	echo "GATE FAILED: GREEN arm did not compile:"; cat "$TMP/wp_green.log"; exit 1
+fi
+if ! "$GREEN_BIN"; then
+	echo "GATE FAILED: GREEN arm (real predicates) does not satisfy the wake-model invariants"; exit 1
+fi
+if ! "$CC" -O2 -std=c11 -DWAKE_MODEL_OLD -I"$INC" -o "$RED_BIN" "$PRED_SRC" 2>/dev/null; then
+	echo "GATE FAILED: RED arm did not compile"; exit 1
+fi
+if "$RED_BIN" >/dev/null 2>&1; then
+	echo "GATE FAILED: RED arm (v0 always-wake) PASSED -- the test does not actually exercise conditionality"; exit 1
+fi
+echo "  GATE PASSED: real predicates are conditional; the v0 always-wake arm fails as required."
+echo
 echo "ring_wake_model bench+gate: OK"

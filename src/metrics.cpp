@@ -63,6 +63,13 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"forks\": " << forks.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"inline_handled\": " << inlineHandled.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"queued_to_pool\": " << queuedToPool.load(std::memory_order_relaxed) << ",\n";
+#ifdef DSERVER_RING_TRANSPORT
+	out << "  \"ring_serviced_spin\": " << ringServicedSpin.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_serviced_doorbell\": " << ringServicedDoorbell.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_doorbells_received\": " << ringDoorbellsReceived.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_wakes_issued\": " << ringWakesIssued.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_wakes_skipped\": " << ringWakesSkipped.load(std::memory_order_relaxed) << ",\n";
+#endif
 	out << "  \"last_reply_age_ms\": " << lastReplyAgeMs << ",\n";
 	if (!extraGauges.empty()) {
 		out << "  " << extraGauges << ",\n";
