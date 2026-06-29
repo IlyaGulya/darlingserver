@@ -1406,6 +1406,24 @@ static bool ringFastPathEligible(uint32_t callnum) {
 	return false;
 }
 
+// perf #18 P6.1 step 2 (dar-ohp): is this slot eligible for the SURGICAL direct dispatch (skip
+// Call/Message entirely, run dtape_mach_reply_port + publish straight onto the ring)? Stricter than
+// ringFastPathEligible: EXACTLY mach_reply_port, the per-op hatch on, and a no-payload/no-arena
+// shape (the trap takes no arguments; any body/descriptors/arena means a malformed or unexpected
+// request -> reject and fall back to the framed path which validates fully). The shape guard is the
+// security boundary for the no-Call path: we never decode an attacker-shaped slot here.
+static bool fastMachReplyPortEligible(uint32_t callnum, uint32_t reqlen, uint32_t arenaLen) {
+#ifndef NO_SHAPE_GUARD
+	if (reqlen != 0 || arenaLen != 0) {
+		return false; // mach_reply_port has an empty request body and no arena
+	}
+#endif
+	if (callnum != dserver_callnum_mach_reply_port) {
+		return false;
+	}
+	return ringFastOpsEnabled() && ringFastMachReplyPortEnabled();
+}
+
 uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::Thread>& thread) {
 	using namespace DarlingServer;
 	uint32_t serviced = 0;
@@ -1439,6 +1457,64 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 		uint32_t callnum = req->callnum;
 		uint32_t reqlen = req->length;
 		uint32_t seq = req->seq;
+		uint32_t arenalen = req->arena_len;
+
+		// perf #18 P6.1 step 2 (dar-ohp): SURGICAL direct dispatch for mach_reply_port. Skip the
+		// Message rebuild + callFromMessage registry re-lookup + Call heap-alloc that step 1 still
+		// pays. The thread is already held (shared_ptr) for this whole slot iteration, so its
+		// lifetime is guaranteed without the registry lookup; doMachReplyPortInline runs the bare
+		// dtape trap on it and publishes the reply itself. Free the request slot FIRST (same as the
+		// generic path), then dispatch. If it declines (busy/dead/etc.), fall through to the generic
+		// step-1 path below, which re-stages the Message and handles every edge case.
+		if (fastMachReplyPortEligible(callnum, reqlen, arenalen)) {
+			dserver_ring_consumer_advance(c2s); // free the slot before running the op
+#ifdef DSERVER_RING_PHASE_PROF
+			uint64_t _fpT0 = Metrics::rdtscCycles();
+#endif
+			if (thread->doMachReplyPortInline(seq)) {
+				++serviced;
+				Metrics::shared().ringFastHit.fetch_add(1, std::memory_order_relaxed);
+#ifdef DSERVER_RING_PHASE_PROF
+				// The fast path collapses drain+dispatch+body into one window; record the whole
+				// thing as "body" (it IS the op) minus the publish cycles the inline op stashed.
+				uint64_t _fpT1 = Metrics::rdtscCycles();
+				auto& m = Metrics::shared();
+				uint64_t pub = thread->takeRingPublishCycles();
+				uint64_t total = _fpT1 - _fpT0;
+				uint64_t body = (total > pub) ? (total - pub) : 0;
+				m.phaseBodyCycles.fetch_add(body, std::memory_order_relaxed);
+				m.phasePublishCycles.fetch_add(pub, std::memory_order_relaxed);
+				m.phaseSamples.fetch_add(1, std::memory_order_relaxed);
+#endif
+				continue;
+			}
+			// declined inline -> rebuild + run via the generic path (the slot is already consumed,
+			// so re-stage the Message from the copied-out header; reqlen==0 means no body to copy).
+			Metrics::shared().ringFastFallback.fetch_add(1, std::memory_order_relaxed);
+			size_t fbSize = sizeof(dserver_rpc_callhdr_t);
+			Message fbMsg(fbSize, 0);
+			fbMsg.data().resize(fbSize);
+			auto* fbHdr = reinterpret_cast<dserver_rpc_callhdr_t*>(fbMsg.data().data());
+			fbHdr->number = static_cast<dserver_callnum_t>(callnum);
+			fbHdr->pid = process->nsid();
+			fbHdr->tid = thread->nsid();
+			fbHdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
+			fbMsg.setAddress(thread->address());
+			fbMsg.setPID(process->id());
+			thread->beginRingReply(seq);
+			try {
+				auto fbCall = Call::callFromMessage(std::move(fbMsg));
+				if (fbCall) {
+					if (!fbCall->thread()->doWorkInline()) {
+						fbCall->thread()->doWork();
+					}
+					++serviced;
+				}
+			} catch (const std::exception& ex) {
+				callLog.error() << "ring fast-path fallback dispatch threw: " << ex.what() << callLog.endLog;
+			}
+			continue;
+		}
 
 		// P3 allowlist: only no-arg, single-uint32-port-reply traps may ride the ring for now.
 		// task_self_trap was the first migration (correctness-first; it's cached per-process so

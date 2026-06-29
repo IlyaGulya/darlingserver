@@ -759,6 +759,125 @@ bool DarlingServer::Thread::doWorkInline() {
 	}
 	return true;
 };
+
+bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
+	// perf #18 P6.1 step 2 (dar-ohp): the surgical one-op path. This is doWorkInline() with the
+	// Call/Message framing ALSO removed: no _pendingCall, no processCall(), no callFromMessage --
+	// we run the bare dtape primitive and publish the reply onto the ring ourselves. The duct-tape
+	// context setup/teardown is IDENTICAL to doWorkInline (so current_task() resolves to this
+	// thread's space exactly as MachReplyPort::processCall would see it).
+	auto ring = _ring;
+	if (!ring) {
+		return false; // caller falls back to the generic path
+	}
+
+	std::unique_lock<std::shared_mutex> lock(_rwlock);
+
+	if (_deferralState != DeferralState::NotDeferred) {
+		_deferralState = DeferralState::DeferredPending;
+		return false;
+	}
+	if (_running) {
+		microthreadLog.warning() << _tid << "(" << _nstid << "): doMachReplyPortInline on already-running microthread" << microthreadLog.endLog;
+		return false;
+	}
+	if (_terminating || _dead || _suspended || _continuationCallback || _pendingCall || _activeCall) {
+		// Not the simple "fresh, idle thread servicing a no-arg trap" case. There is no Call to run
+		// here (we bypass callFromMessage), so a _pendingCall/_activeCall would be left dangling --
+		// decline and let the caller take the generic step-1 path which handles all of these.
+		return false;
+	}
+
+	_running = true;
+	currentThreadVar = shared_from_this();
+	dtape_thread_entering(_dtapeThread);
+	_suspended = false;
+	lock.unlock();
+	_runningCondvar.notify_all();
+
+	// --- body: the bare Mach primitive, identical to what MachReplyPort::processCall calls ------
+	auto& _metrics = DarlingServer::Metrics::shared();
+	uint64_t _callStartUs = DarlingServer::Metrics::nowMonoUs();
+	uint32_t port = dtape_mach_reply_port();
+
+	// publish {replyhdr.code=0}{uint32 port_name} straight onto the s2c ring + wake the guest.
+	// Byte-identical to the reply the generic path produces via pushCallReply for this op.
+#ifdef DSERVER_RING_PHASE_PROF
+	uint64_t _pubT0 = Metrics::rdtscCycles();
+#endif
+	bool published = ring->publishReply(seq, static_cast<uint32_t>(dserver_callnum_mach_reply_port), 0, &port, sizeof(port));
+#ifdef DSERVER_RING_PHASE_PROF
+	_ringPublishCycles = Metrics::rdtscCycles() - _pubT0;
+#endif
+	if (published) {
+		ring->wakeGuest();
+	}
+
+	{
+		uint64_t now = DarlingServer::Metrics::nowMonoUs();
+		uint64_t serviceUs = (now >= _callStartUs) ? (now - _callStartUs) : 0;
+		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
+		_metrics.rpcLatency.record(serviceUs);
+		_metrics.recordCall(static_cast<uint32_t>(dserver_callnum_mach_reply_port), serviceUs);
+	}
+
+	// --- completion cleanup: mirror doWorkInline's (no fiber, no _activeCall ever set) ----------
+	bool canRelease = false;
+	{
+		std::unique_lock<std::shared_mutex> relock(_rwlock);
+		if (_suspended) {
+			// Impossible for mach_reply_port (it never blocks). Log loudly; clear so we don't wedge.
+			microthreadLog.error() << *this << ": doMachReplyPortInline suspended -- mach_reply_port must never block!" << microthreadLog.endLog;
+			_suspended = false;
+		}
+		dtape_thread_exiting(_dtapeThread);
+		currentThreadVar = nullptr;
+		_running = false;
+
+		if (_dead && !_activeCall && !_terminating) {
+			_terminating = true;
+			canRelease = true;
+		}
+		if (_terminating && !_dead) {
+			relock.unlock();
+			notifyDead();
+		} else {
+			if (!_terminating && !_dead && !_pendingInterrupts.empty()) {
+				if (!_pendingCall) {
+					_pendingCall = _pendingInterrupts.front();
+					_pendingInterrupts.pop();
+					Server::sharedInstance().scheduleThread(shared_from_this());
+				}
+			}
+			relock.unlock();
+		}
+	}
+	_runningCondvar.notify_all();
+	if (canRelease) {
+		_scheduleRelease();
+	}
+
+	// If the publish failed (s2c full), tell the caller to fall back so the guest still gets a
+	// reply via the generic path. The dtape trap already ran (it minted a real port); re-running
+	// it via callFromMessage would leak that port. So instead of "return false to re-dispatch",
+	// we treat a publish failure as a HARD inline failure only when nothing was minted. Here the
+	// port WAS minted and the only loss is the wake; publishReply already UDS-falls-back inside
+	// pushCallReply for the generic path, but we don't have that here. Simplest correct choice:
+	// if publish failed, send the reply via UDS directly so we never double-mint.
+	if (!published) {
+		// Build the minimal UDS reply and send it. Reuse the same reply convention.
+		dserver_rpc_reply_mach_reply_port_t reply;
+		reply.header.number = dserver_callnum_mach_reply_port;
+		reply.header.code = 0;
+		reply.body.port_name = port;
+		Message replyMsg(sizeof(reply), 0);
+		replyMsg.data().resize(sizeof(reply));
+		memcpy(replyMsg.data().data(), &reply, sizeof(reply));
+		replyMsg.setAddress(_address);
+		Server::sharedInstance().sendMessage(std::move(replyMsg));
+	}
+	return true;
+};
 #endif
 
 void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, libsimple_lock_t* unlockMe) {
