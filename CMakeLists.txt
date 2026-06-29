@@ -59,10 +59,14 @@ endif()
 option(DSERVER_SINGLE_THREADED "Only use a single thread per workqueue in darlingserver" ON)
 
 # perf #18 (dar-dar6x4-perf-5dq.30): shared-memory ring transport for the hot-path RPC.
-# OFF by default -- the ring ABI/handler code is compiled out so a normal build is unaffected
-# (the ring_attach RPC is still defined, but its handler replies "unsupported"). Turn ON to
-# build the server with ring support for A/B against UDS.
-option(DSERVER_RING_TRANSPORT "Build darlingserver with shared-memory ring transport support (perf#18)" OFF)
+# perf#18 Phase B Stage 1 (dar-dar6x4-perf-5dq.30, 2026-06-29): default flipped OFF->ON for
+# dev/nightly. The simple fast ring carries the FROZEN op set only {task_self_trap, mach_reply_port,
+# mach_port_allocate, mach_port_insert_right}; destroy-capable ops stay UDS (Phase A compile-time
+# guardrail). Rollback: this default back to OFF + rebuild (knob #3), or runtime DARLING_SERVER_FAST_OPS=0
+# (knob #2, ring still used via generic fiber). RELEASE/PROD packaging policy is separate and unchanged.
+# When OFF the ring ABI/handler code is compiled out (the ring_attach RPC is still defined, but its
+# handler replies "unsupported"). See tests/PERF18-RING-DEFAULT-ON-DECISION.md.
+option(DSERVER_RING_TRANSPORT "Build darlingserver with shared-memory ring transport support (perf#18)" ON)
 
 if (DSERVER_SINGLE_THREADED)
 	add_compile_definitions(
