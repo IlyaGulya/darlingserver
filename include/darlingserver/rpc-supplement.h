@@ -294,6 +294,49 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // are P4; P3 only migrates small inline-only ops.
 #define DSERVER_RING_FLAG_REPLY_ERROR 0x1u
 
+// --- C2S ring opcode allowlist: the SINGLE source of truth (perf #18 P5-bulk, dar-1il.1) ------
+//
+// The set of dserver_callnum_* values a guest may publish onto the c2s ring (and that the server
+// will therefore service over the ring) MUST be defined in exactly ONE place. Both sides consume
+// THIS X-macro:
+//   * the guest (dserver-ring.c) -- only these ops have a ring helper / route over the ring;
+//   * the server (call.cpp ringServiceThread) -- the `eligible` check is generated from this list.
+//
+// THE PROTOCOL INVARIANT (no silent drop): if the guest can publish an opcode onto the ring, the
+// server MUST service it over the ring (or reply an explicit error). The fatal failure mode this
+// list exists to PREVENT is drift: an opcode the guest routes over the ring but the server does
+// NOT allowlist -> the server consumes the request slot and produces no reply -> the guest is
+// stranded on its bounded reply-wait (it published, so it will NOT UDS-fall-back for that call) ->
+// effective per-call wedge. This was the exact bug class P5 hit under an early per-op server hatch
+// (see dar-1il P5 comment). Keying both sides off one macro makes that drift a compile-time
+// impossibility, and ring_drift_gate_test.c asserts the two derived sets are identical.
+//
+// Each entry carries the BARE op name; a consumer forms the enum value as dserver_callnum_##name
+// (so this header stays independent of the GENERATED rpc.h -- the consumer includes that itself).
+//
+// MEMBERSHIP RULE: an op belongs here iff it is C2S, reply-bearing, fd-free, has an empty body +
+// small inline reply (the port traps) or a small inline body + header-only reply (the port/right
+// bookkeeping ops -- result is the kern_return_t, any out-value travels by the existing guest-memory
+// write the generic Call path already performs), AND -- CRITICALLY -- it NEVER triggers a
+// server-to-client (S2C) upcall to the calling thread. This last rule is load-bearing: a thread
+// parked on a ring reply is NOT sitting in a UDS recvmsg, so it CANNOT service an S2C call. An op
+// that needs an S2C upcall to the caller (e.g. a port destruction that drives a vm munmap upcall)
+// will deadlock: the server microthread blocks on the S2C reply semaphore while the guest blocks in
+// the ring futex-wait, neither able to make progress. This is exactly why mach_port_deallocate is
+// NOT here (see dar-1il.1): under launchd's real workload it destroys ports backing mapped regions
+// -> munmap S2C -> wedge. It stays on UDS, where the caller's recvmsg can service the S2C. The
+// safe ops below only CREATE/REF (allocate, insert_right) or adjust refs without a caller upcall.
+//
+// NOTE this is the TRANSPORT allowlist (Tier 1 = ride the ring via the generic fiber doWork); it is
+// DISTINCT from the no-fiber inline fast path (ringFastPathEligible / Tier 2), a strictly smaller,
+// separately-proven set. Never conflate the two.
+#define DSERVER_RING_C2S_OPCODES(X) \
+	X(task_self_trap) \
+	X(mach_reply_port) \
+	X(mach_port_mod_refs) \
+	X(mach_port_allocate) \
+	X(mach_port_insert_right)
+
 // Prefix of every REPLY payload: the RPC result code (what the UDS reply header.code carries),
 // followed by the call's reply body. Kept separate from dserver_ring_slot so the slot stays a
 // pure transport header and the payload stays a faithful copy of the UDS reply body.
