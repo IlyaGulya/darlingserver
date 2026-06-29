@@ -1097,7 +1097,9 @@ void DarlingServer::Server::_resolveRingSpinBudget() {
 		<< ". Disable: rebuild without DSERVER_RING_TRANSPORT (full transport off), or set"
 		<< " DARLING_SERVER_FAST_OPS=0 (all inline fast paths off) /"
 		<< " DARLING_SERVER_FAST_MACH_REPLY_PORT=0 (just mach_reply_port). Mode via DARLING_SERVER_MODE="
-		<< "low-power|balanced|latency or DARLING_SERVER_SPIN_US=<n>." << ringLog.endLog;
+		<< "low-power|balanced|latency or DARLING_SERVER_SPIN_US=<n>."
+		<< " If you hit a hang/crash that may be transport-related, RE-RUN with DARLING_SERVER_FAST_OPS=0"
+		<< " (or a non-ring build) and report whether it reproduces." << ringLog.endLog;
 };
 #endif // DSERVER_RING_TRANSPORT
 
