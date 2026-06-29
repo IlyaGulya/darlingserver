@@ -27,8 +27,11 @@
 
 #include <sys/mman.h>
 #include <sys/eventfd.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #include <unistd.h>
 #include <cstring>
+#include <cstdint>
 
 DarlingServer::RingBuffer::RingBuffer(void* map, size_t size, FD&& eventfd, const dserver_ring_shm_t& cb):
 	_map(map),
@@ -117,6 +120,53 @@ uint32_t DarlingServer::RingBuffer::slotSize() const {
 
 uint32_t DarlingServer::RingBuffer::slotCount() const {
 	return _cb.slot_count;
+};
+
+bool DarlingServer::RingBuffer::publishReply(uint32_t seq, uint32_t callnum, int32_t code, const void* body, uint32_t bodyLen) {
+	dserver_ring_t* s2c = s2cRing();
+	uint32_t slotSize = _cb.slot_size;
+	uint32_t slotCount = _cb.slot_count;
+	uint32_t inlineCap = slotSize - (uint32_t)sizeof(dserver_ring_slot_t);
+
+	// header (code) + body must fit one inline slot. (Arena replies are P4.)
+	if ((uint64_t)sizeof(dserver_ring_reply_hdr_t) + bodyLen > inlineCap) {
+		return false;
+	}
+
+	dserver_ring_slot_t* rep = dserver_ring_producer_begin(s2c, slotSize, slotCount);
+	if (!rep) {
+		return false; // s2c full -> guest retries / UDS-falls-back
+	}
+
+	char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
+	dserver_ring_reply_hdr_t* rhdr = (dserver_ring_reply_hdr_t*)payload;
+	rhdr->code = code;
+	if (bodyLen > 0 && body) {
+		std::memcpy(payload + sizeof(dserver_ring_reply_hdr_t), body, bodyLen);
+	}
+	rep->callnum = callnum;
+	rep->seq = seq;
+	rep->length = (uint32_t)sizeof(dserver_ring_reply_hdr_t) + bodyLen;
+	rep->arena_off = 0;
+	rep->arena_len = 0;
+	rep->flags = (code != 0) ? DSERVER_RING_FLAG_REPLY_ERROR : 0u;
+
+	dserver_ring_producer_publish(s2c);
+	return true;
+};
+
+void DarlingServer::RingBuffer::wakeGuest() {
+	// The s2c futex word lives in the control block at the head of the mapping. Bump it (so a
+	// guest that races the check sees a change) and FUTEX_WAKE one waiter. Guests that are
+	// spinning rather than sleeping simply observe the new s2c tail and never enter the kernel.
+	uint32_t* word = &((dserver_ring_shm_t*)_map)->s2c_futex;
+	__atomic_fetch_add(word, 1u, __ATOMIC_RELEASE);
+	syscall(SYS_futex, word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+};
+
+void DarlingServer::RingBuffer::drainWake() {
+	eventfd_t value;
+	eventfd_read(_eventfd.fd(), &value);
 };
 
 #endif // DSERVER_RING_TRANSPORT

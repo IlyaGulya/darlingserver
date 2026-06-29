@@ -1355,10 +1355,102 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 // them on death). The Monitor callback currently just drains the wake eventfd -- no call is
 // migrated onto the ring yet (that's P3), so there is nothing to dispatch; this proves the
 // attach/teardown lifecycle end-to-end.
+#ifdef DSERVER_RING_TRANSPORT
+// perf #18 P3: service all C2S requests published on a thread's ring. Runs in the ring's
+// Monitor callback on the MAIN event loop (the wake eventfd fired). For each request slot we
+// rebuild the exact UDS-format request bytes the guest would have sent over the socket
+// ({callhdr, body}), construct the SAME Call object via callFromMessage(), arm the thread's
+// one-shot ring-reply sink (beginRingReply), and run it INLINE via doWork() -- identical to
+// the perf#2b main-loop fast path (server.cpp). The reply is redirected onto the s2c ring by
+// Thread::pushCallReply(). Reusing the whole Call path is deliberate: every exec-path fix
+// (dar-l8k UAF, dar-6x4 rwlock-across-suspend, the dar-gwn reply-on-drop guards) applies
+// unchanged -- only the transport in and the reply sink out differ.
+//
+// SECURITY: the slot's callnum/length are attacker-controlled. dserver_ring_consumer_begin()
+// already refuses a corrupt c2s tail; here we additionally (a) bound the inline body to the
+// slot, (b) only accept a small allowlist of ring-eligible call numbers (P3 = task_self_trap),
+// dropping anything else so the guest UDS-falls-back, and (c) never deref a guest pointer.
+static void darRingServiceC2S(const std::shared_ptr<DarlingServer::Thread>& thread) {
+	using namespace DarlingServer;
+	auto ring = thread->ring();
+	if (!ring) {
+		return;
+	}
+	const auto& cb = ring->controlBlock();
+	dserver_ring_t* c2s = ring->c2sRing();
+	uint32_t slotSize = cb.slot_size;
+	uint32_t slotCount = cb.slot_count;
+	uint32_t inlineCap = slotSize - static_cast<uint32_t>(sizeof(dserver_ring_slot_t));
+
+	auto process = thread->process();
+	if (!process) {
+		return;
+	}
+
+	// bounded drain: never loop more than slotCount times even if a buggy/hostile peer keeps
+	// the tail ahead (consumer_advance bounds us anyway, but be explicit).
+	for (uint32_t guard = 0; guard < slotCount; ++guard) {
+		dserver_ring_slot_t* req = dserver_ring_consumer_begin(c2s, slotSize, slotCount);
+		if (!req) {
+			break; // empty or corrupt tail
+		}
+
+		// Copy the transport header out before trusting it (guest can mutate concurrently).
+		uint32_t callnum = req->callnum;
+		uint32_t reqlen = req->length;
+		uint32_t seq = req->seq;
+
+		// P3 allowlist: only no-arg self-traps may ride the ring for now. Anything else ->
+		// drop (consume so we don't spin); the guest will UDS-fall-back for that op.
+		bool eligible = (callnum == dserver_callnum_task_self_trap);
+		if (!eligible || reqlen > inlineCap) {
+			dserver_ring_consumer_advance(c2s);
+			continue;
+		}
+
+		// Rebuild the UDS-format request: {callhdr, body}. For task_self_trap there is no body.
+		// Copy the (bounded) inline body out of the slot into a server-owned Message buffer so
+		// the guest can't race-mutate it after we validate.
+		size_t totalSize = sizeof(dserver_rpc_callhdr_t) + reqlen;
+		Message reqMsg(totalSize, 0);
+		reqMsg.data().resize(totalSize);
+		auto* hdr = reinterpret_cast<dserver_rpc_callhdr_t*>(reqMsg.data().data());
+		hdr->number = static_cast<dserver_callnum_t>(callnum);
+		hdr->pid = process->id();
+		hdr->tid = thread->id();
+		hdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
+		if (reqlen > 0) {
+			memcpy(reqMsg.data().data() + sizeof(dserver_rpc_callhdr_t),
+			       reinterpret_cast<const char*>(req) + sizeof(dserver_ring_slot_t),
+			       reqlen);
+		}
+		reqMsg.setAddress(thread->address());
+
+		// done reading the request slot; free it before running the call
+		dserver_ring_consumer_advance(c2s);
+
+		// Arm the one-shot ring-reply sink, then dispatch through the normal Call path.
+		thread->beginRingReply(seq);
+		try {
+			auto call = Call::callFromMessage(std::move(reqMsg));
+			if (call) {
+				// run inline on the main loop (self-traps never block) -- perf#2b path
+				call->thread()->doWork();
+			}
+		} catch (const std::exception& ex) {
+			callLog.error() << "ring C2S dispatch threw: " << ex.what() << callLog.endLog;
+			// leave the ring-reply armed flag to be cleared on the next reply; the guest will
+			// time out on this op and UDS-fall-back. Keep serving the rest.
+		}
+	}
+}
+#endif
+
 void DarlingServer::Call::RingAttach::processCall() {
 #ifdef DSERVER_RING_TRANSPORT
 	uint32_t rejectReason = dserver_ring_reject_total_size; // default-deny
 	int code = 0;
+	int guestWakeFd = -1; // dup of the wake eventfd handed back to the guest (-1 on reject)
 
 	if (auto thread = _thread.lock()) {
 		if (_body.ring_fd < 0) {
@@ -1379,6 +1471,48 @@ void DarlingServer::Call::RingAttach::processCall() {
 				callLog.debug() << "ring_attach accepted for TID " << thread->nsid()
 					<< " (" << cb.slot_count << " slots of " << cb.slot_size << "B)"
 					<< callLog.endLog;
+
+				// Watch the ring's wake eventfd. The guest writes it to signal "I published a
+				// request"; the callback drains it and services the C2S ring. HangUp tears the
+				// ring down. We pass the Monitor a dup of the eventfd (the RingBuffer owns the
+				// original) so the two lifetimes stay independent.
+				int wakeDup = ::dup(ring->eventfd());
+				// And a SECOND dup to hand back to the guest (Variant 2 wake design): the guest
+				// writes this fd to wake the server. The generated reply machinery takes
+				// ownership of guestWakeFd and closes it after the SCM_RIGHTS send.
+				guestWakeFd = ::dup(ring->eventfd());
+				if (wakeDup < 0 || guestWakeFd < 0) {
+					if (wakeDup >= 0) ::close(wakeDup);
+					if (guestWakeFd >= 0) { ::close(guestWakeFd); guestWakeFd = -1; }
+					rejectReason = static_cast<uint32_t>(dserver_ring_reject_total_size);
+				} else {
+					std::weak_ptr<Thread> weakThread = thread;
+					auto monitor = std::make_shared<Monitor>(
+						std::make_shared<FD>(wakeDup),
+						Monitor::Event::Readable | Monitor::Event::HangUp,
+						false, false,
+						[weakThread](std::shared_ptr<Monitor> thisMonitor, Monitor::Event events) {
+							auto t = weakThread.lock();
+							if (auto r = (t ? t->ring() : nullptr)) {
+								r->drainWake();
+							} else {
+								// thread/ring gone -- drain raw so the fd stops firing
+								eventfd_t value;
+								eventfd_read(thisMonitor->fd()->fd(), &value);
+							}
+							if (static_cast<uint64_t>(events & Monitor::Event::HangUp) != 0) {
+								Server::sharedInstance().removeMonitor(thisMonitor);
+								return;
+							}
+							// Service every request the guest published since the last wake.
+							if (t) {
+								darRingServiceC2S(t);
+							}
+						}
+					);
+					Server::sharedInstance().addMonitor(monitor);
+					thread->attachRing(ring, monitor);
+				}
 			} else {
 				callLog.info() << "ring_attach rejected for TID " << thread->nsid()
 					<< " reason " << rejectReason << " -- thread stays on UDS" << callLog.endLog;
@@ -1388,42 +1522,13 @@ void DarlingServer::Call::RingAttach::processCall() {
 		code = -ESRCH;
 	}
 
-	_sendReply(code, rejectReason);
+	_sendReply(code, rejectReason, guestWakeFd);
 #else
 	// feature compiled out: a ring-capable guest gets a clean "unsupported" and falls back
-	// to UDS. reject_reason is non-zero so the guest never believes the ring was accepted.
-	_sendReply(0, static_cast<uint32_t>(1) /* dserver_ring_reject_magic-ish: any non-ok */);
+	// to UDS. reject_reason is non-zero so the guest never believes the ring was accepted;
+	// wake_fd is -1 (no ring).
+	_sendReply(0, static_cast<uint32_t>(1) /* any non-ok */, -1);
 #endif
 };
 
 DSERVER_CLASS_SOURCE_DEFS;
-
-				// Watch the ring's wake eventfd. The guest writes it to signal "I published a
-				// request"; for now the callback just drains it (no C2S call is on the ring
-				// yet -- P3). HangUp tears the ring down. We pass a non-owning FD to the
-				// Monitor (the RingBuffer owns the eventfd lifetime) by dup'ing it into the
-				// Monitor's FD so the two lifetimes stay independent.
-				int wakeDup = ::dup(ring->eventfd());
-				if (wakeDup < 0) {
-					rejectReason = static_cast<uint32_t>(dserver_ring_reject_total_size);
-				} else {
-					std::weak_ptr<Thread> weakThread = thread;
-					auto monitor = std::make_shared<Monitor>(
-						std::make_shared<FD>(wakeDup),
-						Monitor::Event::Readable | Monitor::Event::HangUp,
-						false, false,
-						[weakThread](std::shared_ptr<Monitor> thisMonitor, Monitor::Event events) {
-							// drain the eventfd so it doesn't re-fire spuriously
-							eventfd_t value;
-							eventfd_read(thisMonitor->fd()->fd(), &value);
-							if (static_cast<uint64_t>(events & Monitor::Event::HangUp) != 0) {
-								Server::sharedInstance().removeMonitor(thisMonitor);
-								return;
-							}
-							// P3 will dispatch the C2S ring slots here. For now: nothing on the
-							// ring, so just having drained the wake is correct.
-						}
-					);
-					Server::sharedInstance().addMonitor(monitor);
-					thread->attachRing(ring, monitor);
-				}

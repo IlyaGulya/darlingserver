@@ -1461,6 +1461,35 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 	} else if (_deferReplyForS2C) {
 		_deferredReply = std::move(reply);
 	} else if (!_dead) {
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 P3: if this reply belongs to a ring-originated call, publish it onto the s2c
+		// ring + wake the guest instead of sending a UDS datagram. One-shot: consume the flag.
+		// The reply Message data is dserver_rpc_reply_<call>_t = {replyhdr{number,code}, body};
+		// we carry the code + body bytes onto the ring (the guest reconstructs the same body).
+		if (_ringReplyPending && _ring) {
+			_ringReplyPending = false;
+			const auto& bytes = reply.data();
+			if (bytes.size() >= sizeof(dserver_rpc_replyhdr_t)) {
+				const dserver_rpc_replyhdr_t* rhdr = reinterpret_cast<const dserver_rpc_replyhdr_t*>(bytes.data());
+				const uint8_t* body = bytes.data() + sizeof(dserver_rpc_replyhdr_t);
+				uint32_t bodyLen = static_cast<uint32_t>(bytes.size() - sizeof(dserver_rpc_replyhdr_t));
+				auto ring = _ring; // keep alive across the unlocked publish
+				uint32_t seq = _ringReplySeq;
+				uint32_t callnum = static_cast<uint32_t>(rhdr->number);
+				int32_t code = rhdr->code;
+				// publish under the lock is fine (no suspend, no Server-state mutation); the
+				// FUTEX_WAKE is a bare syscall and likewise can't re-enter our locks.
+				if (!ring->publishReply(seq, callnum, code, body, bodyLen)) {
+					// s2c full: fall back to a UDS reply so the guest still gets its answer.
+					Server::sharedInstance().sendMessage(std::move(reply));
+				} else {
+					ring->wakeGuest();
+				}
+				return;
+			}
+			// malformed (too short) -> fall through to UDS below
+		}
+#endif
 		Server::sharedInstance().sendMessage(std::move(reply));
 	}
 };
@@ -1627,6 +1656,12 @@ void DarlingServer::Thread::attachRing(std::shared_ptr<RingBuffer> ring, std::sh
 std::shared_ptr<DarlingServer::RingBuffer> DarlingServer::Thread::ring() const {
 	std::shared_lock lock(_rwlock);
 	return _ring;
+};
+
+void DarlingServer::Thread::beginRingReply(uint32_t seq) {
+	std::unique_lock lock(_rwlock);
+	_ringReplyPending = true;
+	_ringReplySeq = seq;
 };
 #endif
 

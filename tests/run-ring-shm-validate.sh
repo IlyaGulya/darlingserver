@@ -58,4 +58,27 @@ fi
 echo
 echo "ring_attach_check gate: RED->GREEN OK"
 echo
+
+# --- ring datapath (P3): SPSC + server C2S service loop + reply convention, on a real
+#     memfd-backed ring, with adversarial corruption + backpressure. ASan on both arms. ---
+DSRC="$HERE/ring_datapath_test.cpp"
+echo "== datapath GREEN arm (real SPSC + service loop, ASan) =="
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -fsanitize=address -I"$INC" -o "$TMP/dp_green" "$DSRC"; then
+	echo "datapath GREEN arm failed to COMPILE"; exit 2
+fi
+if ! "$TMP/dp_green"; then
+	echo "datapath GREEN arm FAILED"; exit 1
+fi
+echo
+echo "== datapath RED arm (accept-all stub, ASan: adversarial cases MUST fail) =="
+if ! "$CXX" -std=c++17 -D_GNU_SOURCE -fsanitize=address -DRING_DATAPATH_STUB -I"$INC" -o "$TMP/dp_red" "$DSRC"; then
+	echo "datapath RED arm failed to COMPILE -- gate broken"; exit 2
+fi
+if "$TMP/dp_red"; then
+	echo "datapath RED arm PASSED but must FAIL -- gate not exercising the datapath"; exit 1
+fi
+echo "  datapath RED arm correctly failed."
+echo
+echo "ring_datapath gate: RED->GREEN OK"
+echo
 echo "all perf#18 ring gates: OK"
