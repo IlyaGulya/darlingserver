@@ -112,15 +112,16 @@ namespace DarlingServer {
 		bool _deferReplyForS2C = false;
 		std::optional<Message> _deferredReply = std::nullopt;
 
-		// perf #18 D9 (dar-1il.4): sticky per-call heatmap facts, recorded at the recordCall site.
-		// They must SURVIVE past pushCallReply (which consumes _ringReplyPending before recordCall
-		// runs), so they are tracked separately here. _heatmapCallWasRing latches at dispatch (the
-		// generic ring path sets it right after beginRingReply); _heatmapCallDidS2c latches in
-		// _s2cPerform when an S2C upcall is performed to THIS thread. Both are reset when a fresh call
-		// becomes active. Pure diagnostics: only READ when the heatmap is armed, but the bool writes are
-		// unconditional and trivial (a single store), so no hot-path branch is added when disarmed.
+		// perf #18 D9 (dar-1il.4): sticky per-call heatmap transport latch, recorded at the recordCall
+		// site. It must SURVIVE past pushCallReply (which consumes _ringReplyPending before recordCall
+		// runs), so it is tracked separately here. _heatmapCallWasRing latches at dispatch (the generic
+		// ring path sets it right after beginRingReply) and is reset when a fresh call becomes active.
+		// Pure diagnostic: only READ when the heatmap is armed, but the bool write is unconditional and
+		// trivial (a single store), so no hot-path branch is added when disarmed. perf #18 D14
+		// (dar-1il.9): the former companion _heatmapCallDidS2c sticky bool was REMOVED -- caller-S2C is
+		// now attributed PER-CALL at _s2cPerform via Metrics::recordCallerS2cFor(_activeCall), which
+		// eliminates the cross-op leak the sticky latch caused on exec/teardown threads (D13 finding).
 		bool _heatmapCallWasRing = false;
-		bool _heatmapCallDidS2c = false;
 
 		struct InterruptContext {
 			std::optional<Message> savedReply = std::nullopt;

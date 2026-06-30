@@ -396,6 +396,25 @@ namespace DarlingServer {
 			if (didCallerS2c) perCallDidCallerS2c[idx].fetch_add(1, std::memory_order_relaxed);
 		}
 
+		// perf #18 D14 (dar-1il.9): per-CALL-scoped caller-S2C attribution. The D9 caller_s2c column
+		// used to be a sticky per-thread bool (_heatmapCallDidS2c) latched in _s2cPerform and consumed
+		// at the NEXT recordCall -- which OVER-ATTRIBUTED an exec/teardown munmap S2C to whatever op was
+		// recorded next on that thread (D13 saw mldr_path caller_s2c=3 frozen while ring calls grew to
+		// 284, even though the transport-correct s2c_munmap_ring_parent stayed 0). This bumps the bucket
+		// for the op that is ACTUALLY executing at the moment the S2C fires (the active call's number),
+		// so there is no cross-op leak. Call from _s2cPerform with the active parent's callnum. Cheap,
+		// lock-free; no-op unless armed -- same guard as recordCallHeatmap.
+		void recordCallerS2cFor(uint32_t callNumber) {
+			if (!heatmapOn.load(std::memory_order_relaxed)) {
+				return;
+			}
+			size_t idx = callNumber & 0xffu;
+			if (idx >= kMaxCallNumbers) {
+				return;
+			}
+			perCallDidCallerS2c[idx].fetch_add(1, std::memory_order_relaxed);
+		}
+
 		// last reply timestamp (CLOCK_MONOTONIC microseconds), for last_reply_age_ms
 		std::atomic<uint64_t> lastReplyMonoUs {0};
 
