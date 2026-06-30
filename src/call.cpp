@@ -1523,6 +1523,14 @@ static bool ringFastPathEligible(uint32_t callnum) {
 	if (callnum == dserver_callnum_task_self_trap) {
 		return true;
 	}
+	// perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap are the remaining members of the
+	// pure-mint self-trap family. Same processCall structure as task_self_trap (dtape_*_self_trap mint
+	// + _sendReply -- no port->task translation, no refcounting, no fiber-sensitive stack state), so
+	// they are no-fiber-inline-safe exactly like it. They ride the global fast-ops hatch only (like
+	// task_self_trap, not the per-op mach_reply_port hatch).
+	if (callnum == dserver_callnum_thread_self_trap || callnum == dserver_callnum_host_self_trap) {
+		return true;
+	}
 	return false;
 }
 
