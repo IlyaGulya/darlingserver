@@ -112,6 +112,16 @@ namespace DarlingServer {
 		bool _deferReplyForS2C = false;
 		std::optional<Message> _deferredReply = std::nullopt;
 
+		// perf #18 D9 (dar-1il.4): sticky per-call heatmap facts, recorded at the recordCall site.
+		// They must SURVIVE past pushCallReply (which consumes _ringReplyPending before recordCall
+		// runs), so they are tracked separately here. _heatmapCallWasRing latches at dispatch (the
+		// generic ring path sets it right after beginRingReply); _heatmapCallDidS2c latches in
+		// _s2cPerform when an S2C upcall is performed to THIS thread. Both are reset when a fresh call
+		// becomes active. Pure diagnostics: only READ when the heatmap is armed, but the bool writes are
+		// unconditional and trivial (a single store), so no hot-path branch is added when disarmed.
+		bool _heatmapCallWasRing = false;
+		bool _heatmapCallDidS2c = false;
+
 		struct InterruptContext {
 			std::optional<Message> savedReply = std::nullopt;
 			std::shared_ptr<Call> interruptedCall = nullptr;
