@@ -78,6 +78,15 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"ring_duplex_reject\": " << ringDuplexReject.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_parent\": " << ringDuplexParent.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_decline\": " << ringDuplexDecline.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_vmdealloc_parent\": " << ringDuplexVmdeallocParent.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_vmdealloc_decline\": " << ringDuplexVmdeallocDecline.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_vmdealloc_s2c\": " << ringDuplexVmdeallocS2c.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_vmdealloc_final\": " << ringDuplexVmdeallocFinal.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_vmdealloc_timeout\": " << ringDuplexVmdeallocTimeout.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_vmdealloc_disarmed\": " << ringDuplexVmdeallocDisarmed.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"s2c_munmap_ring_parent\": " << s2cMunmapRingParent.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"s2c_munmap_uds_parent\": " << s2cMunmapUdsParent.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"s2c_munmap_no_parent\": " << s2cMunmapNoParent.load(std::memory_order_relaxed) << ",\n";
 #ifdef DSERVER_RING_PHASE_PROF
 	out << "  \"phase_samples\": " << phaseSamples.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"phase_drain_cycles\": " << phaseDrainCycles.load(std::memory_order_relaxed) << ",\n";

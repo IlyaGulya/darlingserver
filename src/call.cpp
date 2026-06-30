@@ -1403,6 +1403,35 @@ static bool ringDuplexSelftestEnabled() {
 	}();
 	return v;
 }
+
+// perf #18 P8 D5 (dar-1il.3.2.2): the BOOT-SCOPED launchd vm_deallocate-via-duplex proof harness (option 1,
+// gist 3e928115). The caller-S2C munmap deadlock the duplex lane exists to cure is reachable in practice
+// ONLY in launchd/early-init (guest pid 1) on a normal boot; a warm leaf command never drives it. So the
+// ONLY way to get a LIVE caller-S2C cure proof is to let launchd route a vm_deallocate over the duplex lane
+// AT BOOT -- but globally enabling that (or an inherited env hatch) is the forbidden init-wedge hazard. This
+// harness threads that needle: it is a ONE-SHOT, BUDGET-LIMITED, AUTO-DISARMING proof, armed ONLY by an env
+// var ON THE SERVER PROCESS ITSELF (DARLING_SERVER_D5_VMDEALLOC_PROOF=<budget>, set when LAUNCHING the
+// server -- never a guest daemon's inherited env, so shellspawn/leaf processes are untouched). The routing
+// CONJUNCTION (below, in ringServiceThread) additionally requires guest pid==1 + the vm_deallocate callnum +
+// the duplex caps + a clean mailbox, and AUTO-DISARMS (budget->0) after the first successful caller-S2C, so
+// at most <budget> launchd vm_deallocates ever ride the lane and every park is bounded fail-closed.
+//
+// proofBudget(): the remaining number of launchd vm_deallocates allowed onto the duplex lane. Initialized
+// once from the env (0 = disarmed/off, the default). decremented to 0 on the first proven caller-S2C.
+static std::atomic<int>& d5VmDeallocProofBudget() {
+	static std::atomic<int> budget{[]() {
+		const char* e = getenv("DARLING_SERVER_D5_VMDEALLOC_PROOF");
+		if (!e) return 0;
+		int v = atoi(e);
+		if (v < 0) v = 0;
+		if (v > 3) v = 3; // gist: ideally 1-3 events; hard cap the blast radius.
+		return v;
+	}()};
+	return budget;
+}
+static bool d5VmDeallocProofArmed() {
+	return d5VmDeallocProofBudget().load(std::memory_order_relaxed) > 0;
+}
 // Is this callnum eligible for the no-fiber inline fast path? Must be a PROVEN-non-blocking op.
 // task_self_trap + mach_reply_port both just mint/return a port via current_task()'s space and
 // never suspend. Each gated by its hatch (task_self_trap rides the global hatch only).
@@ -1573,6 +1602,86 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 				callLog.error() << "ring duplex deallocate dispatch threw: " << ex.what() << callLog.endLog;
 			}
 			thread->setRingDuplexParentActive(false);
+			continue;
+		}
+
+		// perf #18 P8 D5 (dar-1il.3.2.2): mach_vm_deallocate as a DUPLEX PARENT. Unlike D4's
+		// mach_port_deallocate (whose munmap S2C is unreachable in Darling because make_memory_entry is a
+		// stub), vm_deallocate DOES drive a real caller munmap S2C (vm_map_remove -> dtape_hook_task_free_
+		// pages -> _munmap -> _s2cPerform) -- it is the op that genuinely exercises (and proves) the duplex
+		// lane's caller-S2C cure. Same machinery as D4: run on the GENERIC fiber path with
+		// _ringDuplexParentActive set so the munmap S2C rides the duplex mailbox instead of the UDS S2C a
+		// ring-parked caller can't service. The PRE-MUTATION routing decline is HERE, keyed on the SPECIFIC
+		// VM_DEALLOCATE cap (a D4-only-capable caller must NOT have a vm_deallocate routed onto the lane).
+		if (callnum == (uint32_t)dserver_callnum_mach_vm_deallocate) {
+			// perf #18 P8 D6 (caller-S2C sideband) PROOF CONJUNCTION (gist 3e928115 answer #2). Route a
+			// vm_deallocate onto the duplex lane ONLY if EVERY condition holds; else DECLINE pre-dispatch (no
+			// mutation -> guest UDS-falls-back, the old behavior). The SYNTHETIC WARM real-munmap proof: a
+			// test guest allocates a real page locally then sends vm_deallocate of it with
+			// target==mach_task_self() OVER the duplex ring (bypassing the trap's local-munmap gate). The
+			// server _kernelrpc_mach_vm_deallocate_trap resolves target to the CURRENT task and frees the
+			// caller's REAL pages -> vm_map_remove -> task_free_pages -> a REAL caller-S2C munmap which, since
+			// the caller is a ring-parked duplex parent, rides the duplex mailbox = ring_duplex_s2c>0 LIVE on
+			// the real transport (real _s2cPerform munmap, real guest munmap pump, real fiber resume, real
+			// final reply -- NOT a fake echo, NOT fabricated success). PARENT-CENTRIC guard: armed proof +
+			// duplex-vm cap + shape (NOT pid -- the active pump-capable ring parent IS the carrier, set by
+			// dispatching here with _ringDuplexParentActive). Budget-bounded + auto-disarm caps blast radius.
+			// A decline here is ALWAYS pre-mutation (no double-effect).
+			bool armed = d5VmDeallocProofArmed();
+			bool capable = thread->duplexVmDeallocateCapable();
+			bool goodShape = (reqlen == sizeof(dserver_call_mach_vm_deallocate_t));
+			if (!armed || !capable || !goodShape) {
+				dserver_ring_consumer_advance(c2s);
+				thread->ring()->publishReply(seq, callnum, DSERVER_RING_DUPLEX_DECLINE, nullptr, 0);
+				thread->ring()->wakeGuest();
+				Metrics::shared().ringDuplexDecline.fetch_add(1, std::memory_order_relaxed);
+				Metrics::shared().ringDuplexVmdeallocDecline.fetch_add(1, std::memory_order_relaxed);
+				++serviced;
+				continue;
+			}
+			// ARMED + pid-1 + capable + good shape: dispatch onto the duplex lane. Its munmap S2C (if the
+			// freed range is server-managed -- which launchd's early-init vm_deallocates are) rides the
+			// duplex mailbox and increments ring_duplex_vmdealloc_s2c -- the LIVE caller-S2C cure proof.
+			Metrics::shared().ringDuplexParent.fetch_add(1, std::memory_order_relaxed);
+			Metrics::shared().ringDuplexVmdeallocParent.fetch_add(1, std::memory_order_relaxed);
+			size_t totalSize = sizeof(dserver_rpc_callhdr_t) + reqlen;
+			Message reqMsg(totalSize, 0);
+			reqMsg.data().resize(totalSize);
+			auto* hdr = reinterpret_cast<dserver_rpc_callhdr_t*>(reqMsg.data().data());
+			hdr->number = static_cast<dserver_callnum_t>(callnum);
+			hdr->pid = process->nsid();
+			hdr->tid = thread->nsid();
+			hdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
+			memcpy(reqMsg.data().data() + sizeof(dserver_rpc_callhdr_t),
+			       reinterpret_cast<const char*>(req) + sizeof(dserver_ring_slot_t), reqlen);
+			reqMsg.setAddress(thread->address());
+			reqMsg.setPID(process->id());
+			dserver_ring_consumer_advance(c2s); // free the slot before running the op
+			thread->beginRingReply(seq);
+			thread->setRingDuplexParentActive(true);
+			thread->setRingDuplexVmdeallocProof(true); // tag so _drainDuplexReply bumps the vmdealloc counters
+			try {
+				auto call = Call::callFromMessage(std::move(reqMsg));
+				if (call) {
+					call->thread()->doWork();
+					Metrics::shared().ringDuplexVmdeallocFinal.fetch_add(1, std::memory_order_relaxed);
+					++serviced;
+				}
+			} catch (const std::exception& ex) {
+				callLog.error() << "ring duplex vm_deallocate dispatch threw: " << ex.what() << callLog.endLog;
+			}
+			thread->setRingDuplexVmdeallocProof(false);
+			thread->setRingDuplexParentActive(false);
+			// AUTO-DISARM: if this dispatch produced a real caller-S2C (the proof goal), spend one budget
+			// unit; once it hits 0 the proof is disarmed and no further launchd vm_deallocate rides the lane.
+			if (thread->takeRingDuplexVmdeallocS2cFired()) {
+				int prev = d5VmDeallocProofBudget().fetch_sub(1, std::memory_order_relaxed);
+				if (prev <= 1) {
+					Metrics::shared().ringDuplexVmdeallocDisarmed.fetch_add(1, std::memory_order_relaxed);
+					callLog.error() << "[D5PROOF] launchd vm_deallocate caller-S2C cured over duplex lane; "
+					                << "proof auto-disarmed (budget exhausted)" << callLog.endLog;
+				}
+			}
 			continue;
 		}
 
