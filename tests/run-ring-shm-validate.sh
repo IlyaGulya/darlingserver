@@ -368,4 +368,12 @@ if [ -f "$DXSRC" ] && [ -n "$GEN_RPC" ]; then
 	fi
 fi
 
+# --- P8 D3 (dar-1il.3.1.1): the END-TO-END real-dylib duplex selftest is a SYSTEM test (it must boot
+#     darling + use the deployed guest dylib + real server), so it cannot run inside this hermetic host
+#     suite. It lives in run-duplex-real-selftest.sh and is part of the D3 acceptance run, NOT this
+#     suite. Pointer only:
+echo "note: the real-dylib duplex selftest (D3 end-to-end) is a SYSTEM gate -- run separately:"
+echo "      bash tests/run-duplex-real-selftest.sh both   # RED (no-pump, no-wedge) then GREEN (PASS + counter)"
+echo
+
 echo "all perf#18 ring gates: OK"

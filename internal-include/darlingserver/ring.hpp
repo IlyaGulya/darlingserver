@@ -102,6 +102,20 @@ namespace DarlingServer {
 		 * without committing to service it. Bounds-safe (defends against a corrupt guest tail).
 		 */
 		bool hasPendingRequests() const;
+
+		// --- perf #18 P8 D3 (dar-1il.3.1.1): duplex lane mailbox access -----------------------------
+		// The duplex mailbox lives in the SHARED mapping (the live page), NOT in the server-owned _cb
+		// COPY -- the copy is layout-only and never re-read. These reach the live page so the duplex
+		// upcall/reply words the guest pump writes are actually observed. The duplex datapath uses ONLY
+		// the pure helpers in rpc-supplement.h (dserver_ring_duplex_*) over this pointer, so the wake
+		// model + correlation that ring_duplex_wake_gate_test / ring_duplex_roundtrip_test pin hold
+		// byte-for-byte in the real transport. nullptr-safe to call before attach (returns nullptr).
+		dserver_ring_shm_t* liveControlBlock() const; // the shared page (duplex words live here)
+
+		// True iff the guest advertised the given duplex capability bit at attach (cb.duplex_caps).
+		// A real op may take the duplex S2C path ONLY when this holds for its cap -- part of the
+		// conjunction guard (no duplex to a guest that never agreed to pump).
+		bool duplexCapable(uint32_t capBit) const;
 	};
 };
 

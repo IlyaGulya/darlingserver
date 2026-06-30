@@ -1445,6 +1445,188 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 	return std::move(*reply);
 };
 
+#ifdef DSERVER_RING_TRANSPORT
+// perf #18 P8 D3 (dar-1il.3.1.1): the GUARDED duplex publish for an S2C upcall -- the iron conjunction
+// guard + the mailbox publish. This is the SHARED primitive: in D3 the synthetic sentinel parent op
+// drives it (state-machine completion in the drain); in Phase E the real _s2cPerform of a duplex-
+// eligible op (deallocate) will drive it the same way and complete by upping its parked fiber. Returns
+// true iff the duplex path was taken (the upcall is now in flight); false means the guard declined and
+// the caller MUST take its verbatim fallback (UDS for a real op; failure-reply for the synthetic op --
+// never a fabricated success).
+//
+// MUST be entered with `lock` (a unique_lock on _rwlock) held. On success it leaves the in-flight
+// markers armed and `lock` STILL HELD (the caller drops it); the drain side (_drainDuplexReply) takes
+// _rwlock too, so the markers are published atomically vs. the harvest. The upcall mailbox publish is
+// a release-store linearization point; the guest pump observes it with acquire.
+bool DarlingServer::Thread::_s2cTryDuplexLocked(uint32_t upcallOp, uint32_t arg, std::unique_lock<std::shared_mutex>& lock) {
+	(void)lock; // documents the lock contract; we operate under the held lock
+	// --- the iron conjunction guard: duplex ONLY if ALL hold, else the caller falls back ----------
+	// (2) the caller has a v4+ ring that advertised the SELFTEST duplex capability.
+	auto ring = _ring; // _ring is guarded by _rwlock; we hold it
+	if (!ring || !ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_SELFTEST)) {
+		return false;
+	}
+	dserver_ring_shm_t* cb = ring->liveControlBlock();
+	if (!cb) {
+		return false;
+	}
+	// (4) the upcall shape is one the minimal protocol supports.
+	if (upcallOp != DSERVER_RING_DUPLEX_UPCALL_ECHO) {
+		return false;
+	}
+	// (5) one-outstanding invariant: no upcall already in flight on this thread, and the mailbox slot
+	//     is free (no stale unconsumed upcall/reply). A stale ready bit -> decline (don't clobber).
+	if (_duplexUpcallInFlight) {
+		return false;
+	}
+	if (dserver_ring_duplex_upcall_available(cb)) {
+		return false; // a prior upcall is still unhandled in the mailbox -> not safe to publish
+	}
+	if (__atomic_load_n(&cb->duplex_reply_ready, __ATOMIC_ACQUIRE) != 0u) {
+		return false; // a stale reply sits unconsumed -> decline rather than risk mis-correlation
+	}
+	// (3)+(6) allocate NONZERO, monotonic correlation ids (ABA-safe: never reused while a stale reply
+	//     could exist, because we just checked the mailbox is clean and we bump per upcall).
+	uint32_t parentId = _duplexNextId++;
+	uint32_t upcallId = _duplexNextId++;
+	if (parentId == 0) { parentId = _duplexNextId++; } // wrap guard: 0 means "none"
+	if (upcallId == 0) { upcallId = _duplexNextId++; }
+
+	// Arm the in-flight markers BEFORE publishing the upcall, so the drain (which takes _rwlock) can
+	// only ever observe a consistent (in-flight + correlation ids) state. (1)+(7) the caller-is-in-
+	// duplex-wait and same-ring-instance conditions are intrinsic here: this IS the caller thread's
+	// own ring, and the upcall targets that same ring's mailbox -- there is no cross-thread or
+	// cross-ring delivery in this path.
+	_duplexParentId = parentId;
+	_duplexUpcallId = upcallId;
+	_duplexReplyReady = false;
+	_duplexUpcallInFlight = true;
+	_duplexInFlightFast.store(true, std::memory_order_release); // lock-free mirror for the hot drain
+
+	// publish the upcall (release-store linearization) while still holding the lock.
+	dserver_ring_duplex_publish_upcall(cb, upcallOp, parentId, upcallId, arg);
+
+	// the guest may be spinning its wait-pump (no syscall) or parked on the s2c futex; bump+conditional
+	// FUTEX_WAKE exactly like a Lane-1 reply so a parked pump is woken without a syscall when it spins.
+	ring->wakeGuest();
+
+	return true;
+};
+
+// perf #18 P8 D3: harvest a correlated duplex reply for this thread, if one is in flight + ready, and
+// COMPLETE the parent op. Called from the main-loop ring drain for every ring thread -- this is the
+// resume point that keeps the server wait SCOPED to the op (no dedicated waiter thread, no blocking of
+// the dserver). For the D3 synthetic sentinel, completion = publish the parent FINAL reply onto the
+// s2c ring (routing #8). Returns true iff it did work (harvest or reject). Takes _rwlock itself.
+bool DarlingServer::Thread::_drainDuplexReply() {
+	// Hot path: the overwhelming common case is no duplex in flight on this thread. Skip the _rwlock
+	// entirely with a single relaxed atomic load so the Lane-1 drain cost is unchanged (one load per
+	// thread per drain, no lock). Only when a duplex upcall is genuinely in flight do we take the lock.
+	if (!_duplexInFlightFast.load(std::memory_order_acquire)) {
+		return false;
+	}
+	std::shared_ptr<RingBuffer> ringForReply;
+	uint32_t finalSeq = 0;
+	uint32_t finalResult = 0;
+	int32_t  finalCode = 0;
+	bool completeSentinel = false;
+	{
+		std::unique_lock lock(_rwlock);
+		if (!_duplexUpcallInFlight) {
+			return false; // nothing parked on a duplex reply
+		}
+		auto ring = _ring;
+		if (!ring) {
+			return false;
+		}
+		dserver_ring_shm_t* cb = ring->liveControlBlock();
+		if (!cb) {
+			return false;
+		}
+		int mismatch = 0;
+		if (dserver_ring_duplex_reply_ready(cb, _duplexParentId, _duplexUpcallId, &mismatch)) {
+			// correlated reply: harvest it, consume the slot, clear the in-flight state.
+			_duplexReplyStatus = cb->duplex_reply_status;
+			_duplexReplyArg = cb->duplex_reply_arg;
+			_duplexReplyReady = true;
+			dserver_ring_duplex_consume_reply(cb);
+			_duplexUpcallInFlight = false;
+			_duplexInFlightFast.store(false, std::memory_order_release);
+			Metrics::shared().ringDuplexS2c.fetch_add(1, std::memory_order_relaxed);
+			// D3 synthetic sentinel completion: stage the parent final reply (published below, lock
+			// dropped). _duplexSentinelSeq != 0 marks this as a sentinel parent (vs. a future real-op
+			// fiber park, which would instead up _s2cReplySempahore -- not used in D3).
+			if (_duplexSentinelSeq != 0) {
+				completeSentinel = true;
+				ringForReply = ring;
+				finalSeq = _duplexSentinelSeq;
+				// the parent op's result IS the echo result the guest computed for the upcall (status 0
+				// means the upcall succeeded; a nonzero status fails the parent).
+				finalResult = _duplexReplyArg;
+				finalCode = (_duplexReplyStatus == 0) ? 0 : -1;
+				_duplexSentinelSeq = 0;
+			}
+		} else if (mismatch) {
+			// a reply landed that does NOT correlate (wrong parent/upcall id: a buggy/hostile guest or
+			// a stale reply from a torn-down op). Refuse to resume on it: drop the slot, count it, and
+			// FAIL the parent (no wedge, no fabricated success). pitfall #2 (ABA) + #3 (wrong corr).
+			dserver_ring_duplex_consume_reply(cb);
+			_duplexUpcallInFlight = false;
+			_duplexInFlightFast.store(false, std::memory_order_release);
+			Metrics::shared().ringDuplexReject.fetch_add(1, std::memory_order_relaxed);
+			if (_duplexSentinelSeq != 0) {
+				completeSentinel = true;
+				ringForReply = ring;
+				finalSeq = _duplexSentinelSeq;
+				finalResult = 0;
+				finalCode = -1; // mis-correlation -> the synthetic parent fails
+				_duplexSentinelSeq = 0;
+			}
+		} else {
+			return false; // in flight but no reply yet
+		}
+	}
+
+	if (completeSentinel && ringForReply) {
+		// publish the synthetic parent's final reply onto the s2c ring. Reply convention mirrors the
+		// Lane-1 port-trap reply ({reply_hdr.code, uint32 result}); the guest selftest reads `result`.
+		uint32_t body = finalResult;
+		if (!ringForReply->publishReply(finalSeq, DSERVER_RING_DUPLEX_SELFTEST_CALLNUM, finalCode, &body, (uint32_t)sizeof(body))) {
+			// s2c full: the guest will time out on the parent + UDS-fall-back in a real lane. For the
+			// synthetic selftest this is a transient miss; count it as an s2c-full like Lane-1.
+			Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
+		}
+		ringForReply->wakeGuest();
+		return true;
+	}
+	return true;
+};
+
+bool DarlingServer::Thread::drainDuplexReply() {
+	return _drainDuplexReply();
+};
+
+// perf #18 P8 D3: issue ONE synthetic duplex ECHO upcall for the sentinel parent op (seq = the parent
+// request's ring seq). Runs the guarded publish; if the guard passes, the upcall is in flight and the
+// parent reply will be published by _drainDuplexReply when the correlated reply arrives. Returns true
+// if the duplex path was taken (parent reply deferred to the drain); false if the guard declined, in
+// which case the CALLER must publish the synthetic parent's failure reply immediately (no fabricated
+// success). NOT a microthread/fiber path -- this is a synchronous state-machine kickoff from the ring
+// service loop, so it never parks (the brief's "publish upcall + return; later drain completes").
+bool DarlingServer::Thread::duplexSelftestUpcall(uint32_t arg, uint32_t seq) {
+	std::unique_lock lock(_rwlock);
+	if (_duplexUpcallInFlight) {
+		return false; // one-outstanding: a prior selftest is mid-flight on this thread
+	}
+	_duplexSentinelSeq = seq; // mark this in-flight upcall as a sentinel parent (drain completes it)
+	bool took = _s2cTryDuplexLocked(DSERVER_RING_DUPLEX_UPCALL_ECHO, arg, lock);
+	if (!took) {
+		_duplexSentinelSeq = 0; // guard declined -> not in flight; caller publishes the failure reply
+	}
+	return took;
+};
+#endif // DSERVER_RING_TRANSPORT
+
 uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int protection, int flags, int fd, off_t offset, int& outErrno) {
 	// XXX: not sure if we want to force all allocations in 32-bit processes to be in the 32-bit address space.
 	//      for now, we leave it up to the caller.
