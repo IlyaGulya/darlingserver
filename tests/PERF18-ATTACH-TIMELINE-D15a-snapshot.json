@@ -1,0 +1,230 @@
+{
+  "rpcs_serviced": 10368,
+  "messages_received": 9873,
+  "ring_fast_hit": 1000,
+  "ring_fast_fail": 0,
+  "ring_s2c_full": 0,
+  "ring_fast_suspend": 0,
+  "clients_blocked_in_rpc": 0,
+  "attach_census_on": 1,
+  "attach_census_processes": 500,
+  "attach_census_first_uds_calls": 297,
+  "attach_census_total_pre_attach_eligible": 9,
+  "attach_attempts": 704,
+  "attach_successes": 500,
+  "attach_rejects": 204,
+  "attach_mldr_callers": 0,
+  "attach_dylib_callers": 0,
+  "attach_no_ring_code": 0,
+  "attach_reject_by_reason": {
+    "2": 204
+  },
+  "attach_ordinal": {
+    "count": 500,
+    "mean_us": 11,
+    "p50_us": 4,
+    "p95_us": 32,
+    "p99_us": 64,
+    "max_us": 52
+  },
+  "attach_census": {
+    "dserver_callnum_checkin": {
+      "pre_attach_uds": 297,
+      "post_attach_uds": 212,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_checkout": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 207,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_vchroot_path": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 407,
+      "pre_attach_eligible": 1,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_started_suspended": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 203,
+      "pre_attach_eligible": 1,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_get_tracer": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 203,
+      "pre_attach_eligible": 1,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_uidgid": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 204,
+      "pre_attach_eligible": 1,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_set_thread_handles": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 6,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_vchroot": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 1,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mldr_path": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 1,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_fork_wait_for_child": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 296,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_interrupt_enter": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 264,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_interrupt_exit": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 264,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_console_open": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 9,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_set_dyld_info": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 203,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_set_executable_path": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 203,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_kqchan_mach_port_open": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 8,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_kqchan_proc_open": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 7,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_pthread_canceled": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 1816,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_task_self_trap": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 203,
+      "pre_attach_eligible": 1,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_host_self_trap": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 205,
+      "pre_attach_eligible": 1,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_thread_self_trap": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 213,
+      "pre_attach_eligible": 1,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_mach_reply_port": {
+      "pre_attach_uds": 2,
+      "post_attach_uds": 408,
+      "pre_attach_eligible": 2,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_mach_msg_overwrite": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 2099,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_deallocate": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 1131,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_mod_refs": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 2,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_move_member": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 18,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_construct": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 2,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_destruct": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 2,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_request_notification": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 8,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_get_attributes": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 6,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_semaphore_signal": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 4,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_semaphore_timedwait": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 34,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_ring_attach": {
+      "pre_attach_uds": 298,
+      "post_attach_uds": 406,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    }
+  }
+}

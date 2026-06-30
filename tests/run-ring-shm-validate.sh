@@ -554,4 +554,43 @@ else
 	echo
 fi
 
+# --- perf #18 D15a (dar-1il.10): ring-attach TIMELINE / reclaimability census gate. Links metrics.cpp.
+#     Pins: default-OFF no-op when disarmed, pre/post-attach UDS split, eligible-pool accounting, and
+#     attach attempt/reject tallies. RED arms break the disarmed-noop and the eligible-split rules. ---
+ACSRC="$HERE/attach_census_gate_test.cpp"
+ACIMPL="$HERE/../src/metrics.cpp"
+if [ -z "$GEN_RPC" ] || [ -z "$ININC" ] || [ ! -f "$ACSRC" ] || [ ! -f "$ACIMPL" ]; then
+	echo "== attach-census gate SKIPPED (generated rpc.h / internal-include / sources not found) =="
+	echo
+else
+	echo "== attach-census GREEN arm (pre/post split + eligible pool + attach outcomes) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/ac_green" "$ACSRC" "$ACIMPL" 2>/dev/null; then
+		echo "attach-census GREEN arm failed to COMPILE"; exit 2
+	fi
+	if ! "$TMP/ac_green"; then
+		echo "attach-census GREEN arm FAILED -- pre/post split or eligible accounting wrong"; exit 1
+	fi
+	echo
+	echo "== attach-census RED arm 1 (-DRED_BREAK_DISARMED_NOOP: disarmed recording must change counts, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_DISARMED_NOOP -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/ac_red1" "$ACSRC" "$ACIMPL" 2>/dev/null; then
+		echo "attach-census RED arm 1 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/ac_red1" >/dev/null 2>&1; then
+		echo "attach-census RED arm 1 PASSED but must FAIL -- default-OFF no-op invariant not exercised"; exit 1
+	fi
+	echo "  attach-census RED arm 1 correctly failed."
+	echo
+	echo "== attach-census RED arm 2 (-DRED_BREAK_ELIGIBLE_SPLIT: ineligible call counted as eligible, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_ELIGIBLE_SPLIT -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/ac_red2" "$ACSRC" "$ACIMPL" 2>/dev/null; then
+		echo "attach-census RED arm 2 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/ac_red2" >/dev/null 2>&1; then
+		echo "attach-census RED arm 2 PASSED but must FAIL -- eligible-pool accounting not exercised"; exit 1
+	fi
+	echo "  attach-census RED arm 2 correctly failed."
+	echo
+	echo "attach-census gate: RED->GREEN OK"
+	echo
+fi
+
 echo "all perf#18 ring gates: OK"

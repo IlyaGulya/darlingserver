@@ -46,6 +46,21 @@ static DarlingServer::Log callLog("calls");
 
 DarlingServer::Log DarlingServer::Call::rpcReplyLog("replies");
 
+// perf #18 D15a (dar-1il.10): static ring-eligibility classifier for the attach-timeline census.
+// Mirrors the dispatch allowlist (DSERVER_RING_C2S_OPCODES, rpc-supplement.h) -- the SAME macro the
+// ringServiceThread dispatch keys off -- so "eligible" here means exactly "this op would have ridden
+// the ring had the process attached". Recon only; never gates real dispatch.
+bool DarlingServer::Call::ringEligibleCallnum(uint32_t callNumber) {
+#ifdef DSERVER_RING_TRANSPORT
+#define DSERVER_RING_C2S_ELIGIBLE_CENSUS(op) || (callNumber == (uint32_t)dserver_callnum_##op)
+	return (false DSERVER_RING_C2S_OPCODES(DSERVER_RING_C2S_ELIGIBLE_CENSUS));
+#undef DSERVER_RING_C2S_ELIGIBLE_CENSUS
+#else
+	(void)callNumber;
+	return false;
+#endif
+}
+
 std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Message&& requestMessage) {
 	if (requestMessage.data().size() < sizeof(dserver_rpc_callhdr_t)) {
 		throw std::invalid_argument("Message buffer was too small for call header");
@@ -2001,6 +2016,22 @@ void DarlingServer::Call::RingAttach::processCall() {
 			} else {
 				callLog.info() << "ring_attach rejected for TID " << thread->nsid()
 					<< " reason " << rejectReason << " -- thread stays on UDS" << callLog.endLog;
+			}
+
+			// perf #18 D15a (dar-1il.10): attach-timeline census. Record the outcome and, on success,
+			// latch the ordinal at which the ring attached (= how many UDS calls this process ran
+			// before the ring existed -- the size of the pre-attach window). guestWakeFd>=0 means the
+			// ring was mapped + the thread registered (true success). No-op unless the census is armed.
+			if (Metrics::shared().attachCensusOn.load(std::memory_order_relaxed)) {
+				bool success = (guestWakeFd >= 0);
+				uint64_t ordinalAtAttach = 0;
+				if (auto p = thread->process()) {
+					ordinalAtAttach = p->currentUdsCallOrdinal();
+					if (success) {
+						p->markRingAttachedAtOrdinal(ordinalAtAttach == 0 ? 1 : ordinalAtAttach);
+					}
+				}
+				Metrics::shared().recordAttachOutcome(success, rejectReason, ordinalAtAttach);
 			}
 		}
 	} else {
