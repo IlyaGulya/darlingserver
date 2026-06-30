@@ -343,6 +343,59 @@ namespace DarlingServer {
 			}
 		}
 
+		// ---- perf #18 D9 (dar-1il.4): global RPC heatmap + lane-eligibility census ----
+		// Goal: stop guessing the next op to ring-migrate; rank candidates by DATA. The D8 census
+		// taught the lesson that "op is hot" != "op is reclaimable" (mach_msg_overwrite was the hottest
+		// RPC but ~88% blocking-receive -> only ~1.6% of all RPC reclaimable -> STOP). So D9 measures, per
+		// call number, BOTH hotness (already in perCallCount/perCallLatency) AND the runtime facts that
+		// decide lane eligibility:
+		//   - TRANSPORT split: how many of this op's calls were serviced over the ring vs UDS today. An op
+		//     already mostly-ring has little headroom; a hot op still 100% UDS is the prize.
+		//   - latency split per transport: uds_p50 vs ring_p50 sizes the per-call win a migration buys.
+		//   - used_fiber: did the op suspend its microthread (generic doWork) rather than run inline? A
+		//     blocking/fiber op is NOT a Tier-2 no-fiber candidate.
+		//   - did_caller_s2c: did servicing this op drive a caller-S2C upcall (the duplex-lane hazard)? A
+		//     nonzero count means the op needs the duplex lane (Lane 2), not the simple ring (Lane 1).
+		// These are ACCUMULATED per call number, lock-free, and -- like the D8 census -- only recorded
+		// when ARMED (heatmapOn, env DARLING_SERVER_RPC_HEATMAP=1 on a warm server). When off, the
+		// recording is skipped entirely so the hot path is byte-identical to today (no behavior change).
+		// The remaining eligibility axes (may_block, destroy-capable, complex/OOL payload, closed
+		// req->reply) are STATIC properties of a call number, so they are classified once at snapshot
+		// time from a table -- not threaded through the hot path. See snapshotJSON / classifyCallnum.
+		std::atomic<bool> heatmapOn {false}; // armed by DARLING_SERVER_RPC_HEATMAP=1 (warm-server hatch)
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallUdsCount {};      // serviced over UDS
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallRingCount {};     // serviced over the ring (any lane)
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallUsedFiber {};     // suspended the microthread (generic doWork)
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallDidCallerS2c {};  // drove a caller-S2C upcall while servicing
+		std::array<LatencyHistogram, kMaxCallNumbers> perCallUdsLatency {};         // service time on the UDS path
+		std::array<LatencyHistogram, kMaxCallNumbers> perCallRingLatency {};        // service time on the ring path
+
+		// Transport tag for the heatmap (what lane actually serviced this call).
+		enum class CallTransport { Uds, Ring };
+
+		// Record one serviced RPC for the D9 heatmap. Cheap, lock-free; no-op unless armed. Called
+		// alongside recordCall() from the same service-completion sites, passing the runtime facts those
+		// sites already know (which transport drained it, whether it suspended a fiber, whether it drove a
+		// caller-S2C). `usedFiber`/`didCallerS2c` are best-effort booleans, not perfect profiling.
+		void recordCallHeatmap(uint32_t callNumber, uint64_t microseconds, CallTransport transport, bool usedFiber, bool didCallerS2c) {
+			if (!heatmapOn.load(std::memory_order_relaxed)) {
+				return;
+			}
+			size_t idx = callNumber & 0xffu;
+			if (idx >= kMaxCallNumbers) {
+				return;
+			}
+			if (transport == CallTransport::Ring) {
+				perCallRingCount[idx].fetch_add(1, std::memory_order_relaxed);
+				perCallRingLatency[idx].record(microseconds);
+			} else {
+				perCallUdsCount[idx].fetch_add(1, std::memory_order_relaxed);
+				perCallUdsLatency[idx].record(microseconds);
+			}
+			if (usedFiber)    perCallUsedFiber[idx].fetch_add(1, std::memory_order_relaxed);
+			if (didCallerS2c) perCallDidCallerS2c[idx].fetch_add(1, std::memory_order_relaxed);
+		}
+
 		// last reply timestamp (CLOCK_MONOTONIC microseconds), for last_reply_age_ms
 		std::atomic<uint64_t> lastReplyMonoUs {0};
 

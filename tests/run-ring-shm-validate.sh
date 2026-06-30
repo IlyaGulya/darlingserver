@@ -503,4 +503,44 @@ else
 	echo
 fi
 
+# --- P8 D9 (dar-1il.4): global RPC heatmap + lane-eligibility census gate. Links the real metrics.cpp
+#     + internal-include (Metrics + the static lane-class table via rpc-supplement.h). Pins: default-OFF
+#     no-op when disarmed, transport split, used_fiber/caller_s2c accumulation, and the lane-verdict
+#     derivation. RED arms break the disarmed-noop invariant and the caller-S2C-forces-duplex rule. ---
+HMSRC="$HERE/rpc_heatmap_gate_test.cpp"
+HMIMPL="$HERE/../src/metrics.cpp"
+if [ -z "$GEN_RPC" ] || [ -z "$ININC" ] || [ ! -f "$HMSRC" ] || [ ! -f "$HMIMPL" ]; then
+	echo "== RPC heatmap gate SKIPPED (generated rpc.h / internal-include / sources not found) =="
+	echo
+else
+	echo "== RPC heatmap GREEN arm (transport split + flags + lane verdicts) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/hm_green" "$HMSRC" "$HMIMPL" 2>/dev/null; then
+		echo "heatmap GREEN arm failed to COMPILE"; exit 2
+	fi
+	if ! "$TMP/hm_green"; then
+		echo "heatmap GREEN arm FAILED -- transport/flags/verdict logic wrong"; exit 1
+	fi
+	echo
+	echo "== heatmap RED arm 1 (-DRED_BREAK_DISARMED_NOOP: disarmed recording must change counts, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_DISARMED_NOOP -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/hm_red1" "$HMSRC" "$HMIMPL" 2>/dev/null; then
+		echo "heatmap RED arm 1 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/hm_red1" >/dev/null 2>&1; then
+		echo "heatmap RED arm 1 PASSED but must FAIL -- default-OFF no-op invariant not exercised"; exit 1
+	fi
+	echo "  heatmap RED arm 1 correctly failed."
+	echo
+	echo "== heatmap RED arm 2 (-DRED_BREAK_VERDICT_S2C: caller-S2C op claimed tier2, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_VERDICT_S2C -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/hm_red2" "$HMSRC" "$HMIMPL" 2>/dev/null; then
+		echo "heatmap RED arm 2 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/hm_red2" >/dev/null 2>&1; then
+		echo "heatmap RED arm 2 PASSED but must FAIL -- caller-S2C->duplex verdict rule not exercised"; exit 1
+	fi
+	echo "  heatmap RED arm 2 correctly failed."
+	echo
+	echo "RPC heatmap gate: RED->GREEN OK"
+	echo
+fi
+
 echo "all perf#18 ring gates: OK"

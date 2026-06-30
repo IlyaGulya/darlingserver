@@ -20,6 +20,10 @@
 #include <darlingserver/metrics.hpp>
 
 #include <darlingserver/rpc.h>
+// perf #18 D9 (dar-1il.4): the static lane-class table (dserver_ring_op_class / DSERVER_RING_CLASS_*).
+// Defined only when rpc.h is in scope (which it is, above), so the heatmap can annotate each measured
+// callnum with its KNOWN canon class alongside the MEASURED runtime facts.
+#include <darlingserver/rpc-supplement.h>
 
 #include <time.h>
 #include <sstream>
@@ -155,6 +159,91 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 		    << "}";
 	}
 	out << (first ? "}\n" : "\n  }\n");
+
+	// perf #18 D9 (dar-1il.4): global RPC heatmap + lane-eligibility census. Emitted only when armed
+	// (heatmapOn, env DARLING_SERVER_RPC_HEATMAP=1) -- when off, this whole block is one cheap branch
+	// and the table is `{}` so a reader can tell "armed but empty" from "not armed". For every call
+	// number actually serviced while armed, emit BOTH the measured runtime facts (transport split,
+	// per-transport p50, used_fiber/caller_s2c counts) AND the KNOWN static canon class (from
+	// dserver_ring_op_class), then derive a lane VERDICT that combines them. The verdict is the lane
+	// this op COULD ride next; the ranking (count x reclaimable-latency x eligibility) is computed by
+	// the offline reader from these fields -- the server stays a dumb, cheap recorder.
+	out << ",\n";
+	out << "  \"rpc_heatmap_on\": " << (heatmapOn.load(std::memory_order_relaxed) ? 1 : 0) << ",\n";
+	out << "  \"rpc_heatmap\": {";
+	bool hfirst = true;
+	for (size_t i = 0; i < kMaxCallNumbers; ++i) {
+		uint64_t uds = perCallUdsCount[i].load(std::memory_order_relaxed);
+		uint64_t ring = perCallRingCount[i].load(std::memory_order_relaxed);
+		if (uds == 0 && ring == 0) {
+			continue;
+		}
+		const char* name = dserver_callnum_to_string(static_cast<dserver_callnum_t>(i));
+		if (!name) {
+			name = dserver_callnum_to_string(static_cast<dserver_callnum_t>(DSERVER_CALL_UNMANAGED_FLAG | i));
+		}
+		char numbuf[32];
+		if (!name) {
+			std::snprintf(numbuf, sizeof(numbuf), "callnum_%zu", i);
+			name = numbuf;
+		}
+		uint64_t total = uds + ring;
+		uint64_t usedFiber = perCallUsedFiber[i].load(std::memory_order_relaxed);
+		uint64_t callerS2c = perCallDidCallerS2c[i].load(std::memory_order_relaxed);
+		const LatencyHistogram& uh = perCallUdsLatency[i];
+		const LatencyHistogram& rh = perCallRingLatency[i];
+
+		// Static canon class for this callnum (0 == unclassified, treat as UDS-only-by-default). The
+		// table only lists ring-relevant ops; most hot ops are unclassified and judged by measured facts.
+		uint32_t cls = dserver_ring_op_class(static_cast<uint32_t>(i));
+		if (!cls) {
+			cls = dserver_ring_op_class(static_cast<uint32_t>(DSERVER_CALL_UNMANAGED_FLAG | i));
+		}
+		const bool clsSimple  = (cls & DSERVER_RING_CLASS_SIMPLE_C2S) != 0;
+		const bool clsNoFiber = (cls & DSERVER_RING_CLASS_NOFIBER_FAST) != 0;
+		const bool clsDestroy = (cls & DSERVER_RING_CLASS_DESTROY) != 0;
+		const bool clsS2c     = (cls & DSERVER_RING_CLASS_CALLER_S2C) != 0;
+
+		// Lane VERDICT: combine the canon class (authoritative when present) with measured facts.
+		//  - already-on-ring   : the op is in the simple-ring set and we observed it riding the ring.
+		//  - duplex-only       : canon marks it destroy/caller-S2C, OR we MEASURED a caller-S2C -> Lane 2.
+		//  - tier2-candidate   : never used a fiber AND never an S2C -> a no-fiber direct-dispatch candidate.
+		//  - lane1-candidate   : completed on a fiber, no caller-S2C, currently (mostly) UDS -> Lane 1.
+		//  - needs-review      : anything else (mixed/destroy-unknown) -- a human must classify.
+		const char* verdict;
+		if (clsDestroy || clsS2c || callerS2c > 0) {
+			verdict = "duplex-only";
+		} else if (clsSimple && ring > 0) {
+			verdict = "already-on-ring";
+		} else if (usedFiber == 0 && callerS2c == 0) {
+			verdict = "tier2-candidate";
+		} else if (callerS2c == 0) {
+			verdict = "lane1-candidate";
+		} else {
+			verdict = "needs-review";
+		}
+
+		out << (hfirst ? "\n" : ",\n");
+		hfirst = false;
+		out << "    \"" << name << "\": {"
+		    << "\"total\": " << total
+		    << ", \"uds\": " << uds
+		    << ", \"ring\": " << ring
+		    << ", \"used_fiber\": " << usedFiber
+		    << ", \"caller_s2c\": " << callerS2c
+		    << ", \"uds_p50_us\": " << uh.quantile(0.50)
+		    << ", \"uds_p99_us\": " << uh.quantile(0.99)
+		    << ", \"ring_p50_us\": " << rh.quantile(0.50)
+		    << ", \"ring_p99_us\": " << rh.quantile(0.99)
+		    << ", \"class_simple\": " << (clsSimple ? 1 : 0)
+		    << ", \"class_nofiber\": " << (clsNoFiber ? 1 : 0)
+		    << ", \"class_destroy\": " << (clsDestroy ? 1 : 0)
+		    << ", \"class_caller_s2c\": " << (clsS2c ? 1 : 0)
+		    << ", \"verdict\": \"" << verdict << "\""
+		    << "}";
+	}
+	out << (hfirst ? "}\n" : "\n  }\n");
+
 	out << "}\n";
 	return out.str();
 }

@@ -395,6 +395,17 @@ void DarlingServer::Thread::microthreadWorker() {
 		// perf #9 (dar-dar6x4-perf-5dq.16): per-call-number breakdown so perf #7 can
 		// see which RPC numbers dominate the guest's recvmsg-wait.
 		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
+		// perf #18 D9 (dar-1il.4): heatmap. This is the GENERIC fiber worker, so used_fiber=true (the
+		// call ran on a suspendable microthread -- a blocking/fiber op, NOT Tier-2-no-fiber-eligible).
+		// transport + caller-S2C come from the sticky latches set during dispatch/servicing.
+		_metrics.recordCallHeatmap(
+			static_cast<uint32_t>(_callNumber), serviceUs,
+			currentThreadVar->_heatmapCallWasRing ? DarlingServer::Metrics::CallTransport::Ring
+			                                      : DarlingServer::Metrics::CallTransport::Uds,
+			/* usedFiber */ true,
+			currentThreadVar->_heatmapCallDidS2c);
+		currentThreadVar->_heatmapCallWasRing = false;
+		currentThreadVar->_heatmapCallDidS2c = false;
 		if (_callNumber == DarlingServer::Call::Number::Checkin) {
 			_metrics.checkinLatency.record(serviceUs);
 		}
@@ -716,6 +727,16 @@ bool DarlingServer::Thread::doWorkInline() {
 		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
 		_metrics.rpcLatency.record(serviceUs);
 		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
+		// perf #18 D9 (dar-1il.4): heatmap. This is doWorkInline -- the Tier-2 NO-FIBER ring path. By
+		// construction it ran a ring-originated allowlisted op without suspending (used_fiber=false); a
+		// real suspend here is a contract violation handled below. transport=ring.
+		_metrics.recordCallHeatmap(
+			static_cast<uint32_t>(_callNumber), serviceUs,
+			DarlingServer::Metrics::CallTransport::Ring,
+			/* usedFiber */ false,
+			_heatmapCallDidS2c);
+		_heatmapCallWasRing = false;
+		_heatmapCallDidS2c = false;
 	}
 
 	// processCall() on a non-blocking op must have run to completion. If somehow it suspended
@@ -825,6 +846,12 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
 		_metrics.rpcLatency.record(serviceUs);
 		_metrics.recordCall(static_cast<uint32_t>(dserver_callnum_mach_reply_port), serviceUs);
+		// perf #18 D9 (dar-1il.4): heatmap. The surgical mach_reply_port path: ring transport, no fiber,
+		// pure mint (never an S2C). It bypasses beginRingReply/processCall, so pass the facts directly.
+		_metrics.recordCallHeatmap(
+			static_cast<uint32_t>(dserver_callnum_mach_reply_port), serviceUs,
+			DarlingServer::Metrics::CallTransport::Ring,
+			/* usedFiber */ false, /* didCallerS2c */ false);
 	}
 
 	// --- completion cleanup: mirror doWorkInline's (no fiber, no _activeCall ever set) ----------
@@ -1388,6 +1415,14 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 			}
 		}
 #endif
+
+		// perf #18 D9 (dar-1il.4): latch that the active call drove a CALLER-S2C upcall (an S2C to THIS
+		// thread, i.e. while it is the caller waiting for a reply). Any caller-S2C means the op is NOT a
+		// simple closed req->reply -- it needs the duplex lane (Lane 2), not the simple ring (Lane 1) --
+		// so the heatmap must flag it regardless of S2C type or ring build. Cheap unconditional store.
+		if (currentThread().get() == this) {
+			_heatmapCallDidS2c = true;
+		}
 
 		call.setAddress(_address);
 	}
@@ -2386,6 +2421,9 @@ void DarlingServer::Thread::beginRingReply(uint32_t seq) {
 	std::unique_lock lock(_rwlock);
 	_ringReplyPending = true;
 	_ringReplySeq = seq;
+	// perf #18 D9: latch that this call is ring-originated so the heatmap can attribute its transport
+	// at recordCall time (by then _ringReplyPending has been consumed by the reply publish).
+	_heatmapCallWasRing = true;
 };
 #ifdef DSERVER_RING_PHASE_PROF
 uint64_t DarlingServer::Thread::takeRingPublishCycles() {
