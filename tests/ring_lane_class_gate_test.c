@@ -129,6 +129,11 @@ int main(void) {
 	D11_OP_CHECK(started_suspended);
 	D11_OP_CHECK(get_tracer);
 	D11_OP_CHECK(task_is_64_bit);
+	// perf #18 D13 (dar-1il.8): the path ops have the SAME lane-class as the D11 batch -- SimpleRingC2S,
+	// Tier-1 ONLY, neither destroy nor caller-S2C. (The path bytes ride /proc/mem, not the payload, so
+	// there is no arena and /proc/mem access is not a caller-S2C.)
+	D11_OP_CHECK(mldr_path);
+	D11_OP_CHECK(vchroot_path);
 #undef D11_OP_CHECK
 
 	// --- the UDS-only ops are tagged destroy-capable + caller-S2C, and are NOT SimpleRingC2SEligible

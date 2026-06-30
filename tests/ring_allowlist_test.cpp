@@ -60,6 +60,9 @@ int main(void) {
 	CHECK(ringEligible(dserver_callnum_started_suspended), "started_suspended is ring-eligible [D11]");
 	CHECK(ringEligible(dserver_callnum_get_tracer), "get_tracer is ring-eligible [D11]");
 	CHECK(ringEligible(dserver_callnum_task_is_64_bit), "task_is_64_bit is ring-eligible [D11]");
+	// perf #18 D13 (dar-1il.8): the path ops (fixed 16B body / 8B reply; path via /proc/mem, no arena).
+	CHECK(ringEligible(dserver_callnum_mldr_path), "mldr_path is ring-eligible [D13]");
+	CHECK(ringEligible(dserver_callnum_vchroot_path), "vchroot_path is ring-eligible [D13]");
 
 	// A representative op that is NOT migrated must be rejected (stays on UDS). kprintf takes a
 	// request body and is not in the macro, so it must NEVER be ring-eligible.
