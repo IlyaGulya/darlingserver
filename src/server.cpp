@@ -491,6 +491,23 @@ DarlingServer::Server::Server(std::string prefix):
 		}
 	}
 
+	// perf #18 D15a (dar-1il.10): arm the ring-ATTACH TIMELINE / reclaimability census if requested.
+	// OFF by default; a pure measurement (no behavior change) that records the per-process pre-attach
+	// UDS window -- which eligible ops run over UDS before the guest lazily attaches its ring, the
+	// ordinal at which attach happens, and attach attempt/reject tallies. D14 found the reclaimable UDS
+	// tail is pre-attach-dominated; this sizes it and informs whether to move attach earlier (and how).
+	// Set DARLING_SERVER_ATTACH_CENSUS=1 at server start. Read attach_census_* via the stat socket.
+	if (const char* env = getenv("DARLING_SERVER_ATTACH_CENSUS")) {
+		if (env[0] == '1') {
+			Metrics::shared().attachCensusOn.store(true, std::memory_order_relaxed);
+			static DarlingServer::Log attachLog("attachcensus");
+			attachLog.error() << "[NOTICE] perf#18 D15a ring-attach timeline census ARMED"
+				<< " (DARLING_SERVER_ATTACH_CENSUS=1). Pure measurement, no behavior change."
+				<< " Read attach_census_* via the stat socket; pre-attach eligible-UDS by callnum."
+				<< attachLog.endLog;
+		}
+	}
+
 	// remove the old socket (if it exists)
 	unlink(_socketPath.c_str());
 
@@ -705,6 +722,24 @@ void DarlingServer::Server::start() {
 				try {
 					auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
 					if (call) {
+						// perf #18 D15a (dar-1il.10): attach-timeline census. This is the GENUINE UDS
+						// receive site (the main event loop reading the listener socket) -- ring calls
+						// are dispatched in ringServiceThread and never pass through here, so a call
+						// recorded here is unambiguously UDS-transported. Record the per-process UDS
+						// ordinal + whether the ring had attached yet + static ring-eligibility, so we
+						// can size the pre-attach eligible-UDS window. No-op unless the census is armed.
+						if (Metrics::shared().attachCensusOn.load(std::memory_order_relaxed)) {
+							if (auto t = call->thread()) {
+								if (auto p = t->process()) {
+									uint64_t ord = p->nextUdsCallOrdinal();
+									bool attachedYet = p->ringAttachedYet();
+									bool eligible = DarlingServer::Call::ringEligibleCallnum(
+										static_cast<uint32_t>(call->number()));
+									Metrics::shared().recordAttachCensusUdsCall(
+										static_cast<uint32_t>(call->number()), ord, attachedYet, eligible);
+								}
+							}
+						}
 						// perf #2b (dar-dar6x4-perf-5dq.8): run the call INLINE on the main
 						// event loop instead of always handing it to the worker pool. The
 						// profile (perf #2a) showed ~70% of server CPU was the main-loop ->
