@@ -474,6 +474,23 @@ DarlingServer::Server::Server(std::string prefix):
 		}
 	}
 
+	// perf #18 D9 (dar-1il.4): arm the global RPC HEATMAP + lane-eligibility census if requested. OFF by
+	// default; a pure measurement (no behavior change) that records, per call number, the transport split
+	// (uds vs ring), per-transport latency, and the runtime facts that decide lane eligibility
+	// (used_fiber, caller_s2c). The point: stop GUESSING the next op to ring-migrate (the D8 lesson --
+	// the hottest op was barely reclaimable) and find it by DATA. Read rpc_heatmap via the stat socket;
+	// rank by count x (uds_p50 - ring_p50) x eligibility. Set DARLING_SERVER_RPC_HEATMAP=1 at server start.
+	if (const char* env = getenv("DARLING_SERVER_RPC_HEATMAP")) {
+		if (env[0] == '1') {
+			Metrics::shared().heatmapOn.store(true, std::memory_order_relaxed);
+			static DarlingServer::Log heatmapLog("heatmap");
+			heatmapLog.error() << "[NOTICE] perf#18 D9 global RPC heatmap + lane-eligibility census ARMED"
+				<< " (DARLING_SERVER_RPC_HEATMAP=1). Pure measurement, no behavior change."
+				<< " Read rpc_heatmap via the stat socket; per-callnum transport split + lane verdict."
+				<< heatmapLog.endLog;
+		}
+	}
+
 	// remove the old socket (if it exists)
 	unlink(_socketPath.c_str());
 
