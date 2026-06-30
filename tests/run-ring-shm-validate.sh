@@ -375,6 +375,54 @@ if [ -f "$DXSRC" ] && [ -n "$GEN_RPC" ]; then
 		echo
 	fi
 
+	# --- Phase D5 (P8, dar-1il.3.2.2): the VM_DEALLOCATE-via-duplex shape gate. vm_deallocate is the op
+	#     that ACTUALLY drives a caller munmap S2C in Darling (D4's mach_port_deallocate does not). Its
+	#     munmap IS the op, so the properties are sharper: (A) the munmap S2C MUST fire -- a parent that
+	#     completes-success without it lies about a still-mapped range; (B) the caller range is munmap'd
+	#     EXACTLY ONCE -- no partial-then-UDS second munmap (a re-mapped address would be corrupted);
+	#     (C) a dropped reply fails closed + bounded. Also pins the new CAP bit distinct (compile-time
+	#     #error). GREEN before any vm_deallocate wiring. ---
+	VMDSRC="$HERE/ring_duplex_vm_dealloc_gate_test.c"
+	if [ -f "$VMDSRC" ]; then
+		echo "== duplex-vm-dealloc GREEN arm (S2C-required + munmap-once + fail-closed-bounded) =="
+		if ! "$CC" -std=c11 -I"$GEN_RPC" -I"$INC" -o "$TMP/vmd_green" "$VMDSRC" 2>/dev/null; then
+			echo "duplex-vm-dealloc GREEN arm failed to COMPILE"; exit 2
+		fi
+		if ! "$TMP/vmd_green"; then
+			echo "duplex-vm-dealloc GREEN arm FAILED -- vm_deallocate-via-duplex is not S2C-required/once-only"; exit 1
+		fi
+		echo
+		echo "== duplex-vm-dealloc RED arm A (-DDUPLEX_VM_SKIP_S2C: complete without the munmap S2C, MUST fail) =="
+		if ! "$CC" -std=c11 -DDUPLEX_VM_SKIP_S2C -I"$GEN_RPC" -I"$INC" -o "$TMP/vmd_redA" "$VMDSRC" 2>/dev/null; then
+			echo "duplex-vm-dealloc RED arm A failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/vmd_redA" >/dev/null 2>&1; then
+			echo "duplex-vm-dealloc RED arm A PASSED but must FAIL -- gate not requiring the munmap S2C"; exit 1
+		fi
+		echo "  duplex-vm-dealloc RED arm A correctly failed."
+		echo
+		echo "== duplex-vm-dealloc RED arm B (-DDUPLEX_VM_DOUBLE_MUNMAP: second munmap of reused range, MUST fail) =="
+		if ! "$CC" -std=c11 -DDUPLEX_VM_DOUBLE_MUNMAP -I"$GEN_RPC" -I"$INC" -o "$TMP/vmd_redB" "$VMDSRC" 2>/dev/null; then
+			echo "duplex-vm-dealloc RED arm B failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/vmd_redB" >/dev/null 2>&1; then
+			echo "duplex-vm-dealloc RED arm B PASSED but must FAIL -- gate not exercising the double-munmap guard"; exit 1
+		fi
+		echo "  duplex-vm-dealloc RED arm B correctly failed."
+		echo
+		echo "== duplex-vm-dealloc RED arm C (-DDUPLEX_VM_FABRICATE_ON_DROP: fake success on dropped reply, MUST fail) =="
+		if ! "$CC" -std=c11 -DDUPLEX_VM_FABRICATE_ON_DROP -I"$GEN_RPC" -I"$INC" -o "$TMP/vmd_redC" "$VMDSRC" 2>/dev/null; then
+			echo "duplex-vm-dealloc RED arm C failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/vmd_redC" >/dev/null 2>&1; then
+			echo "duplex-vm-dealloc RED arm C PASSED but must FAIL -- gate not exercising the fail-closed guard"; exit 1
+		fi
+		echo "  duplex-vm-dealloc RED arm C correctly failed."
+		echo
+		echo "ring_duplex_vm_dealloc gate: RED->GREEN OK"
+		echo
+	fi
+
 	# --- P8 D1/D2 (dar-1il.3.1): LIVE synthetic duplex roundtrip over the REAL mailbox helpers.
 	#     Two real threads (server publishes upcall + scope-waits; guest pumps + replies) on a real
 	#     mailbox. Proves the transport (not just the model): roundtrip completes, caller-thread
