@@ -191,4 +191,24 @@ bool DarlingServer::RingBuffer::hasPendingRequests() const {
 	return dserver_ring_consumer_begin(c2s, _cb.slot_size, _cb.slot_count) != nullptr;
 };
 
+dserver_ring_shm_t* DarlingServer::RingBuffer::liveControlBlock() const {
+	// The duplex mailbox words are written by BOTH sides on the shared page; reach the live mapping
+	// (not the layout-only _cb copy). _map is the validated RW mapping; null before attach.
+	return reinterpret_cast<dserver_ring_shm_t*>(_map);
+};
+
+bool DarlingServer::RingBuffer::duplexCapable(uint32_t capBit) const {
+	dserver_ring_shm_t* cb = liveControlBlock();
+	if (!cb) {
+		return false;
+	}
+	// ABI v4+ guarantees the duplex words exist; the guest publishes its supported caps at attach.
+	// _cb (the validated copy) carries the negotiated abi_version, so we gate on it without re-reading
+	// the live page's version (which the guest could in principle mutate post-attach).
+	if (_cb.abi_version < 4u) {
+		return false;
+	}
+	return (__atomic_load_n(&cb->duplex_caps, __ATOMIC_ACQUIRE) & capBit) != 0u;
+};
+
 #endif // DSERVER_RING_TRANSPORT

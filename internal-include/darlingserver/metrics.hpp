@@ -175,6 +175,15 @@ namespace DarlingServer {
 		std::atomic<uint64_t> ringFastFail {0};
 		std::atomic<uint64_t> ringS2cFull {0};
 		std::atomic<uint64_t> ringFastSuspend {0};
+		// perf #18 P8 D3 (dar-1il.3.1.1): the duplex lane. ringDuplexS2c = an S2C upcall delivered to
+		// a ring-parked caller via the duplex mailbox (instead of the UDS S2C path) AND completed (the
+		// correlated reply came back + the server resumed). ringDuplexReject = a duplex reply that
+		// failed correlation (wrong parent/upcall id) -- the server refused to resume on it and fell
+		// the op back to UDS. Both MUST be 0 unless the duplex selftest is actively driven; a nonzero
+		// ringDuplexS2c on a normal boot would mean a real op wrongly took the duplex path (a bug --
+		// the conjunction guard is supposed to gate it to the env-driven selftest only).
+		std::atomic<uint64_t> ringDuplexS2c {0};
+		std::atomic<uint64_t> ringDuplexReject {0};
 
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in

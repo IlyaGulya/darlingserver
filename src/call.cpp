@@ -1349,6 +1349,19 @@ static bool ringFastMachReplyPortEnabled() {
 	}();
 	return v;
 }
+// perf #18 P8 D3 (dar-1il.3.1.1): the DUPLEX SELFTEST hatch. Default OFF (must be set to "1"). The
+// sentinel parent op (DSERVER_RING_DUPLEX_SELFTEST_CALLNUM) is recognized in the ring service loop ONLY
+// when this is on, so the duplex lane never activates on any real op or on a normal boot -- it is the
+// outer kill-switch on top of the per-thread conjunction guard. (Membership-wise the sentinel callnum
+// is OUTSIDE the RPC range + not in DSERVER_RING_C2S_OPCODES, so with the hatch off it falls through to
+// the eligible check, is not allowlisted, and is dropped exactly like any unknown callnum.)
+static bool ringDuplexSelftestEnabled() {
+	static const bool v = []() {
+		const char* e = getenv("DARLING_SERVER_DUPLEX_SELFTEST");
+		return e && e[0] == '1' && e[1] == '\0';
+	}();
+	return v;
+}
 // Is this callnum eligible for the no-fiber inline fast path? Must be a PROVEN-non-blocking op.
 // task_self_trap + mach_reply_port both just mint/return a port via current_task()'s space and
 // never suspend. Each gated by its hatch (task_self_trap rides the global hatch only).
@@ -1437,6 +1450,29 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 		uint32_t reqlen = req->length;
 		uint32_t seq = req->seq;
 		uint32_t arenalen = req->arena_len;
+
+		// perf #18 P8 D3 (dar-1il.3.1.1): the synthetic DUPLEX SELFTEST parent op. Recognized ONLY
+		// behind the env hatch + ONLY for the out-of-RPC-range sentinel callnum, so no real op and no
+		// normal boot ever reaches it. Shape: an empty-or-one-uint32 body carrying the echo arg. We free
+		// the slot, then kick off ONE guarded duplex S2C upcall (publish + return -- it does NOT park;
+		// the main-loop drain completes the parent by publishing its final reply when the correlated
+		// reply arrives). If the conjunction guard declines (no v4 ring / no cap / busy / stale mailbox),
+		// publish the parent's FAILURE reply immediately so the guest selftest never wedges.
+		if (ringDuplexSelftestEnabled() && callnum == DSERVER_RING_DUPLEX_SELFTEST_CALLNUM) {
+			uint32_t arg = 0;
+			if (reqlen >= sizeof(uint32_t) && reqlen <= inlineCap) {
+				memcpy(&arg, reinterpret_cast<const char*>(req) + sizeof(dserver_ring_slot_t), sizeof(arg));
+			}
+			dserver_ring_consumer_advance(c2s); // free the slot before kicking off the upcall
+			if (!thread->duplexSelftestUpcall(arg, seq)) {
+				// guard declined -> the duplex path was NOT taken; fail the parent reply now (code != 0,
+				// no fabricated success). The guest selftest sees the error code + UDS-equivalent miss.
+				thread->ring()->publishReply(seq, DSERVER_RING_DUPLEX_SELFTEST_CALLNUM, -1, nullptr, 0);
+				thread->ring()->wakeGuest();
+			}
+			++serviced;
+			continue;
+		}
 
 		// perf #18 P6.1 step 2 (dar-ohp): SURGICAL direct dispatch for mach_reply_port. Skip the
 		// Message rebuild + callFromMessage registry re-lookup + Call heap-alloc that step 1 still

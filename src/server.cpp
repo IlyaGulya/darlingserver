@@ -1045,6 +1045,16 @@ uint32_t DarlingServer::Server::_drainRings() {
 	}
 	uint32_t serviced = 0;
 	for (auto& t : live) {
+		// perf #18 P8 D3 (dar-1il.3.1.1): harvest any pending DUPLEX upcall reply for this thread
+		// FIRST. A thread blocked in a duplex S2C upcall has its microthread fiber parked on its reply
+		// semaphore; the guest pump publishes the reply into the ring mailbox. This is the main-loop
+		// resume point: a correlated reply ups the semaphore so the fiber is rescheduled, all without a
+		// dedicated waiter thread (the "scope the server wait to the op, don't block the dserver"
+		// requirement). No-op for threads with nothing in flight. Counts as serviced so the spin budget
+		// stays hot while a duplex roundtrip is mid-flight.
+		if (t->drainDuplexReply()) {
+			++serviced;
+		}
 		serviced += ringServiceThread(t);
 	}
 	if (serviced > 0) {
