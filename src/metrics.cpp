@@ -244,6 +244,69 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	}
 	out << (hfirst ? "}\n" : "\n  }\n");
 
+	// perf #18 D15a (dar-1il.10): ring-attach TIMELINE / reclaimability census. Emitted only when armed
+	// (attachCensusOn, env DARLING_SERVER_ATTACH_CENSUS=1); zeros/empty otherwise so a reader can tell
+	// "armed but empty" from "not armed". The decision-critical field is attach_census_pre_attach by
+	// callnum (eligible subset) -- the UDS calls that ran before the guest lazily attached its ring and
+	// would have ridden the ring had attach happened earlier. The ordinal histogram shows HOW DEEP into
+	// each process's UDS-call sequence attach lands.
+	out << ",\n";
+	out << "  \"attach_census_on\": " << (attachCensusOn.load(std::memory_order_relaxed) ? 1 : 0) << ",\n";
+	out << "  \"attach_census_processes\": " << attachCensusProcesses.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_census_first_uds_calls\": " << attachCensusFirstUdsCalls.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_census_total_pre_attach_eligible\": " << attachCensusTotalPreAttachEligible.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_attempts\": " << attachAttempts.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_successes\": " << attachSuccesses.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_rejects\": " << attachRejects.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_mldr_callers\": " << attachMldrCallers.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_dylib_callers\": " << attachDylibCallers.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_no_ring_code\": " << attachNoRingCode.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_reject_by_reason\": {";
+	{
+		bool rfirst = true;
+		for (size_t i = 0; i < kMaxRejectReasons; ++i) {
+			uint64_t c = attachRejectByReason[i].load(std::memory_order_relaxed);
+			if (c == 0) continue;
+			out << (rfirst ? "" : ", ") << "\"" << i << "\": " << c;
+			rfirst = false;
+		}
+	}
+	out << "},\n";
+	appendHistogram(out, "attach_ordinal", attachOrdinalHistogram); out << ",\n";
+	// Per-callnum pre/post-attach UDS split + the pre-attach eligible subset (the reclaimable pool).
+	out << "  \"attach_census\": {";
+	bool afirst = true;
+	for (size_t i = 0; i < kMaxCallNumbers; ++i) {
+		uint64_t pre = preAttachUdsByCallnum[i].load(std::memory_order_relaxed);
+		uint64_t post = postAttachUdsByCallnum[i].load(std::memory_order_relaxed);
+		if (pre == 0 && post == 0) continue;
+		uint64_t preElig = preAttachEligibleUdsByCallnum[i].load(std::memory_order_relaxed);
+		const char* name = dserver_callnum_to_string(static_cast<dserver_callnum_t>(i));
+		if (!name) {
+			name = dserver_callnum_to_string(static_cast<dserver_callnum_t>(DSERVER_CALL_UNMANAGED_FLAG | i));
+		}
+		char numbuf[32];
+		if (!name) {
+			std::snprintf(numbuf, sizeof(numbuf), "callnum_%zu", i);
+			name = numbuf;
+		}
+		out << (afirst ? "\n" : ",\n");
+		afirst = false;
+		// ring_eligible: derive from the static lane-class table (SIMPLE_C2S members are exactly the
+		// C2S allowlist). Keeps Metrics free of any Call coupling. A row with pre_attach_eligible>0 is
+		// necessarily eligible; this flag also marks eligible ops whose pre-attach count happens to be 0.
+		uint32_t cls = dserver_ring_op_class(static_cast<uint32_t>(i));
+		if (!cls) cls = dserver_ring_op_class(static_cast<uint32_t>(DSERVER_CALL_UNMANAGED_FLAG | i));
+		bool ringEligible = (cls & DSERVER_RING_CLASS_SIMPLE_C2S) != 0;
+		out << "    \"" << name << "\": {"
+		    << "\"pre_attach_uds\": " << pre
+		    << ", \"post_attach_uds\": " << post
+		    << ", \"pre_attach_eligible\": " << preElig
+		    << ", \"ring_eligible\": " << (ringEligible ? 1 : 0)
+		    << "}";
+	}
+	out << (afirst ? "}\n" : "\n  }\n");
+
 	out << "}\n";
 	return out.str();
 }

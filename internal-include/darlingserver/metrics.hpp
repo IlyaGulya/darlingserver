@@ -254,6 +254,98 @@ namespace DarlingServer {
 		std::atomic<uint64_t> msgSendOnlyPortDesc {0};// ... COMPLEX && >=1 port / ool-ports descriptor -> namespace/refcount
 		std::atomic<uint64_t> msgCensusHdrReadFail {0};// header readMemory failed (classified as complex-unknown, counted here)
 
+		// ---- perf #18 D15a (dar-1il.10): ring-attach TIMELINE / reclaimability census ----
+		// RECON-ONLY. The guest attaches its ring LAZILY on its first eligible op (gr_*_trap ->
+		// __dserver_ring_try_attach), so every process runs a burst of UDS calls before the ring
+		// exists. D14 showed the reclaimable UDS tail is dominated by this pre-attach window. This
+		// census measures the window so D15 can choose among: A) attach during the checkin handshake,
+		// B) explicit early attach in mldr/init, C) attach-on-first-eligible-op (status quo, just
+		// earlier), D) server-side prewarm. OFF by default; armed by DARLING_SERVER_ATTACH_CENSUS=1 on
+		// a warm server (attachCensusOn). When off, recording is skipped so the hot path is unchanged.
+		// All buckets are lock-free atomics; recorded at the callFromMessage UDS choke point + the
+		// ring_attach handler. "pre-attach" for a call == its process has not yet latched a successful
+		// ring_attach at the moment the call arrives (Process::ringAttachedYet()).
+		std::atomic<bool> attachCensusOn {false};   // armed by DARLING_SERVER_ATTACH_CENSUS=1
+		// Per-callnum tables (preAttachUdsByCallnum / postAttachUdsByCallnum / preAttachEligibleUdsByCallnum)
+		// are declared further down, after kMaxCallNumbers is in scope. Aggregate timeline facts:
+		std::atomic<uint64_t> attachCensusProcesses {0};      // distinct processes whose ring_attach SUCCEEDED (= timeline samples)
+		std::atomic<uint64_t> attachCensusFirstUdsCalls {0};  // count of "ordinal==1" UDS calls seen (== distinct processes that made >=1 UDS call)
+		std::atomic<uint64_t> attachCensusTotalPreAttachEligible {0}; // total pre-attach eligible UDS calls across all processes (the reclaimable pool)
+		// Histogram of the UDS-call ordinal at which ring_attach succeeded (1 = attached before/at its
+		// first UDS call; large = many UDS calls ran first). log2 buckets reuse LatencyHistogram.
+		LatencyHistogram attachOrdinalHistogram;
+		// ring_attach attempt/outcome tallies (the handler sees every attach RPC).
+		std::atomic<uint64_t> attachAttempts {0};   // ring_attach RPCs processed
+		std::atomic<uint64_t> attachSuccesses {0};  // accepted (ring mapped, thread registered)
+		std::atomic<uint64_t> attachRejects {0};    // rejected for any reason
+		// reject reasons, indexed by dserver_ring_reject_t (small enum; 16 covers it with margin).
+		static constexpr size_t kMaxRejectReasons = 16;
+		std::array<std::atomic<uint64_t>, kMaxRejectReasons> attachRejectByReason {};
+		// Guest-reported binary facts (set via a tiny env-gated checkin-time breadcrumb; OPTIONAL --
+		// if the guest side is not wired, these stay 0 and the doc notes the binary type was inferred
+		// server-side from the early-call fingerprint instead). attachMldrCallers / attachDylibCallers
+		// are mutually exclusive guesses; attachNoRingCode = a caller that reported no ring transport
+		// compiled in (e.g. the mldr binary).
+		std::atomic<uint64_t> attachMldrCallers {0};
+		std::atomic<uint64_t> attachDylibCallers {0};
+		std::atomic<uint64_t> attachNoRingCode {0};
+
+		// Record one UDS-transported call for the attach-timeline census. `callNumber` raw; `ordinal`
+		// is the process's 1-based UDS-call sequence number; `attachedYet` is whether the process had
+		// already latched a successful ring_attach; `eligible` is static ring-eligibility. No-op unless
+		// armed. Called from callFromMessage (the UDS choke point -- ring calls never pass through it).
+		void recordAttachCensusUdsCall(uint32_t callNumber, uint64_t ordinal, bool attachedYet, bool eligible) {
+			if (!attachCensusOn.load(std::memory_order_relaxed)) {
+				return;
+			}
+			size_t idx = callNumber & 0xffu;
+			if (idx >= kMaxCallNumbers) {
+				return;
+			}
+			if (ordinal == 1) {
+				attachCensusFirstUdsCalls.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (attachedYet) {
+				postAttachUdsByCallnum[idx].fetch_add(1, std::memory_order_relaxed);
+			} else {
+				preAttachUdsByCallnum[idx].fetch_add(1, std::memory_order_relaxed);
+				if (eligible) {
+					preAttachEligibleUdsByCallnum[idx].fetch_add(1, std::memory_order_relaxed);
+					attachCensusTotalPreAttachEligible.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		}
+
+		// Record a ring_attach outcome (called from the RingAttach handler). On success, `ordinal` is
+		// the process's UDS-call ordinal AT attach time (how many UDS calls preceded the ring). No-op
+		// unless armed.
+		void recordAttachOutcome(bool success, uint32_t rejectReason, uint64_t ordinalAtAttach) {
+			if (!attachCensusOn.load(std::memory_order_relaxed)) {
+				return;
+			}
+			attachAttempts.fetch_add(1, std::memory_order_relaxed);
+			if (success) {
+				attachSuccesses.fetch_add(1, std::memory_order_relaxed);
+				attachCensusProcesses.fetch_add(1, std::memory_order_relaxed);
+				attachOrdinalHistogram.record(ordinalAtAttach);
+			} else {
+				attachRejects.fetch_add(1, std::memory_order_relaxed);
+				if (rejectReason < kMaxRejectReasons) {
+					attachRejectByReason[rejectReason].fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		}
+
+		// Record a guest-reported binary fact at checkin (env-gated guest breadcrumb; optional).
+		void recordAttachBinaryFact(bool isMldr, bool hasRingCode) {
+			if (!attachCensusOn.load(std::memory_order_relaxed)) {
+				return;
+			}
+			if (isMldr) attachMldrCallers.fetch_add(1, std::memory_order_relaxed);
+			else        attachDylibCallers.fetch_add(1, std::memory_order_relaxed);
+			if (!hasRingCode) attachNoRingCode.fetch_add(1, std::memory_order_relaxed);
+		}
+
 #ifdef DSERVER_RING_TRANSPORT
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in
@@ -295,6 +387,15 @@ namespace DarlingServer {
 		static constexpr size_t kMaxCallNumbers = 256;
 		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallCount {};
 		std::array<LatencyHistogram, kMaxCallNumbers> perCallLatency {};
+
+		// perf #18 D15a (dar-1il.10): attach-timeline per-callnum tables (declared here so kMaxCallNumbers
+		// is in scope). preAttach = UDS calls seen BEFORE this process's ring attached (reclaimable-if-
+		// attach-were-earlier); postAttach = residual UDS once the ring exists (foreign-thread/non-owner
+		// or ineligible); preAttachEligible = the subset of preAttach that is ring-eligible (the pool a
+		// migration of attach-time would actually move onto the ring). See recordAttachCensusUdsCall.
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> preAttachUdsByCallnum {};
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> postAttachUdsByCallnum {};
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> preAttachEligibleUdsByCallnum {};
 
 		// Record one serviced RPC of the given call number with the given service time.
 		// callNumber is the raw dserver_callnum value (the UNMANAGED flag, if set, is
