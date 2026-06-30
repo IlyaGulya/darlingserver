@@ -307,6 +307,55 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	}
 	out << (afirst ? "}\n" : "\n  }\n");
 
+	// perf #18 D17 (dar-1il.12): POST-D16 residual-UDS classifier. Emitted only when armed
+	// (residualCensusOn, env DARLING_SERVER_RESIDUAL_CENSUS=1); zeros otherwise. The decision-critical
+	// fields: residual_reason buckets separate reason A (first-eligible-before-this-thread's-lane:
+	// thread_no_ring_proc_none + thread_no_ring_proc_has) from B/D (thread_has_ring = an eligible op on
+	// UDS despite a live lane). residual_uds_despite_lane (per callnum) names any op exhibiting the B/D
+	// signal; if empty, the residual is pure A and unavoidable without an attach-time change (D18).
+	out << ",\n";
+	out << "  \"residual_census_on\": " << (residualCensusOn.load(std::memory_order_relaxed) ? 1 : 0) << ",\n";
+	{
+		static const char* const reasonNames[RR_COUNT] = {
+			"thread_no_ring_proc_none", // A: whole-process pre-attach (mldr/dyld/first op)
+			"thread_no_ring_proc_has",  // A: this thread's lane not up yet (a sibling's is)
+			"thread_has_ring",          // B/D: eligible op on UDS despite a live lane
+			"control_plane",            // checkin / ring_attach
+			"ineligible",               // a non-eligible op on UDS (expected)
+		};
+		out << "  \"residual_reason\": {";
+		bool rrfirst = true;
+		for (size_t i = 0; i < RR_COUNT; ++i) {
+			out << (rrfirst ? "\n" : ",\n");
+			rrfirst = false;
+			out << "    \"" << reasonNames[i] << "\": " << residualReason[i].load(std::memory_order_relaxed);
+		}
+		out << "\n  },\n";
+	}
+	out << "  \"residual_max_ring_threads_per_process\": " << maxRingThreadsPerProcess.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"residual_total_ring_threads_registered\": " << totalRingThreadsRegistered.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"residual_uds_despite_lane\": {";
+	{
+		bool ufirst = true;
+		for (size_t i = 0; i < kMaxCallNumbers; ++i) {
+			uint64_t c = udsDespiteLaneByCallnum[i].load(std::memory_order_relaxed);
+			if (c == 0) continue;
+			const char* name = dserver_callnum_to_string(static_cast<dserver_callnum_t>(i));
+			if (!name) {
+				name = dserver_callnum_to_string(static_cast<dserver_callnum_t>(DSERVER_CALL_UNMANAGED_FLAG | i));
+			}
+			char numbuf[32];
+			if (!name) {
+				std::snprintf(numbuf, sizeof(numbuf), "callnum_%zu", i);
+				name = numbuf;
+			}
+			out << (ufirst ? "\n" : ",\n");
+			ufirst = false;
+			out << "    \"" << name << "\": " << c;
+		}
+		out << (ufirst ? "}\n" : "\n  }\n");
+	}
+
 	out << "}\n";
 	return out.str();
 }

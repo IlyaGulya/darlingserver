@@ -290,6 +290,44 @@ namespace DarlingServer {
 		std::atomic<uint64_t> attachDylibCallers {0};
 		std::atomic<uint64_t> attachNoRingCode {0};
 
+		// Forward copy of kMaxCallNumbers (the canonical one is declared later, next to perCallLatency);
+		// the D17 per-callnum array below needs the size in scope here. static_assert below the canonical
+		// definition pins the two equal so they can never drift.
+		static constexpr size_t kMaxCallNumbersFwd = 256;
+
+		// perf #18 D17 (dar-1il.12): POST-D16 RESIDUAL UDS classifier (default-OFF; armed by
+		// DARLING_SERVER_RESIDUAL_CENSUS=1). After per-thread lanes (D16) the eligible-UDS pool dropped
+		// 1533->231; D17 answers WHY each residual eligible UDS call is still on UDS, to decide if it is
+		// (A) unavoidable first-eligible-call-before-this-thread's-lane-attaches, (B) a wrapper coverage
+		// gap, (C) lane exhaustion, or (D) a call site in a no-ring image (mldr). The classification is
+		// done from SERVER-OBSERVABLE per-(thread,process) state at the UDS receive choke point -- it needs
+		// NO lane-ownership change (a D17 constraint). The reason buckets are mutually exclusive per call:
+		enum ResidualReason : uint32_t {
+			RR_THREAD_NO_RING_PROC_NONE = 0, // thread has no ring AND its process never attached one yet
+			                                 //   => whole-process pre-attach window (mldr/dyld phase, or the
+			                                 //   very first eligible op of a fresh process). REASON A.
+			RR_THREAD_NO_RING_PROC_HAS  = 1, // thread has no ring NOW but a SIBLING thread's lane is up
+			                                 //   (process attached >=1). => this thread's first eligible op
+			                                 //   before ITS OWN lane attaches. REASON A (per-thread variant).
+			RR_THREAD_HAS_RING          = 2, // the thread HAS a live ring yet this eligible op still came over
+			                                 //   UDS. This is the B/D signal: either a call SITE that does not
+			                                 //   use the ring wrapper, or a transient ring-full forced fallback.
+			RR_CONTROL_PLANE            = 3, // checkin / ring_attach themselves (not eligible; counted for shape)
+			RR_INELIGIBLE               = 4, // a non-eligible op on UDS (expected; counted for completeness)
+			RR_COUNT                    = 5,
+		};
+		std::atomic<bool> residualCensusOn {false};
+		std::array<std::atomic<uint64_t>, RR_COUNT> residualReason {};
+		// Per-callnum count of the RR_THREAD_HAS_RING bucket (the only B/D-interesting one): an eligible op
+		// that came UDS despite the thread already owning a lane. If this is ~0 the residual is pure
+		// first-before-attach (A); if a specific op shows up here it is a wrapper gap / forced fallback (B/D).
+		std::array<std::atomic<uint64_t>, kMaxCallNumbersFwd> udsDespiteLaneByCallnum {};
+		// Peak number of threads with a live ring in any single process (a server-side proxy for the guest's
+		// "max lanes/process" -- the server registers one ring thread per attached guest thread). Set at
+		// snapshot time from Server (it owns the per-process thread sets); a gauge, not a hot-path counter.
+		std::atomic<uint64_t> maxRingThreadsPerProcess {0};
+		std::atomic<uint64_t> totalRingThreadsRegistered {0}; // cumulative ring-thread registrations (a server-side "lanes acquired" proxy)
+
 		// Record one UDS-transported call for the attach-timeline census. `callNumber` raw; `ordinal`
 		// is the process's 1-based UDS-call sequence number; `attachedYet` is whether the process had
 		// already latched a successful ring_attach; `eligible` is static ring-eligibility. No-op unless
@@ -346,6 +384,37 @@ namespace DarlingServer {
 			if (!hasRingCode) attachNoRingCode.fetch_add(1, std::memory_order_relaxed);
 		}
 
+		// perf #18 D17: classify ONE UDS-transported call by the reason it is still on UDS, from
+		// server-observable per-(thread,process) state at the UDS receive choke point. `threadHasRing` =
+		// the thread owns a live ring NOW; `procEverAttached` = the process latched >=1 successful
+		// ring_attach (Process::ringAttachedYet); `eligible` = static ring-eligibility; `controlPlane` =
+		// the call IS checkin/ring_attach. No-op unless the residual census is armed. The reason buckets
+		// are mutually exclusive; the per-callnum udsDespiteLane table is bumped only for the B/D-signal
+		// bucket (eligible op on a thread that already has a ring).
+		void recordResidualReason(uint32_t callNumber, bool threadHasRing, bool procEverAttached,
+		                          bool eligible, bool controlPlane) {
+			if (!residualCensusOn.load(std::memory_order_relaxed)) {
+				return;
+			}
+			ResidualReason r;
+			if (controlPlane) {
+				r = RR_CONTROL_PLANE;
+			} else if (!eligible) {
+				r = RR_INELIGIBLE;
+			} else if (threadHasRing) {
+				r = RR_THREAD_HAS_RING; // eligible op on UDS despite a live lane -> B/D signal
+				size_t idx = callNumber & 0xffu;
+				if (idx < kMaxCallNumbersFwd) {
+					udsDespiteLaneByCallnum[idx].fetch_add(1, std::memory_order_relaxed);
+				}
+			} else if (procEverAttached) {
+				r = RR_THREAD_NO_RING_PROC_HAS; // this thread's lane not up yet (sibling's is) -> A
+			} else {
+				r = RR_THREAD_NO_RING_PROC_NONE; // whole-process pre-attach (mldr/dyld/first op) -> A
+			}
+			residualReason[r].fetch_add(1, std::memory_order_relaxed);
+		}
+
 #ifdef DSERVER_RING_TRANSPORT
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in
@@ -385,6 +454,7 @@ namespace DarlingServer {
 		// indexing), so a fixed lock-free array indexed by the low bits is both cheap
 		// and allocation-free on the hot path. 256 covers the whole range with margin.
 		static constexpr size_t kMaxCallNumbers = 256;
+		static_assert(kMaxCallNumbers == kMaxCallNumbersFwd, "D17 forward copy of kMaxCallNumbers drifted");
 		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallCount {};
 		std::array<LatencyHistogram, kMaxCallNumbers> perCallLatency {};
 
