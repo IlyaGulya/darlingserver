@@ -459,6 +459,21 @@ DarlingServer::Server::Server(std::string prefix):
 	// perf #0 (dar-dar6x4-perf-5dq.6): record the server start time for uptime.
 	Metrics::shared().startMonoUs = Metrics::nowMonoUs();
 
+	// perf #18 P8 D8 (dar-1il.3.2.x): arm the mach_msg_overwrite SHAPE CENSUS if requested. OFF by
+	// default; a pure measurement (no behavior change) that classifies each msg_overwrite by
+	// send/receive + body descriptor shape so we can size the reclaimable fraction of its ~19%
+	// hotness before designing any ring migration. Set DARLING_SERVER_MSG_CENSUS=1 at server start.
+	if (const char* env = getenv("DARLING_SERVER_MSG_CENSUS")) {
+		if (env[0] == '1') {
+			Metrics::shared().msgCensusOn.store(true, std::memory_order_relaxed);
+			static DarlingServer::Log censusLog("census");
+			censusLog.error() << "[NOTICE] perf#18 D8 mach_msg_overwrite shape census ARMED"
+				<< " (DARLING_SERVER_MSG_CENSUS=1). Pure measurement, no behavior change."
+				<< " Read msg_* counters via the stat socket; msg_send_only_simple / msg_total"
+				<< " sizes the reclaimable share." << censusLog.endLog;
+		}
+	}
+
 	// remove the old socket (if it exists)
 	unlink(_socketPath.c_str());
 

@@ -460,4 +460,47 @@ echo "note: the real-dylib duplex selftest (D3 end-to-end) is a SYSTEM gate -- r
 echo "      bash tests/run-duplex-real-selftest.sh both   # RED (no-pump, no-wedge) then GREEN (PASS + counter)"
 echo
 
+# --- P8 D8 (dar-1il.3.2.x): mach_msg_overwrite SHAPE CENSUS classifier gate. Links the real
+#     metrics.cpp + internal-include (the Metrics class lives there). Skip if no generated rpc.h /
+#     internal-include is found (don't fail). ---
+ININC=""
+for cand in "$HERE/../internal-include" ; do
+	[ -f "$cand/darlingserver/metrics.hpp" ] && { ININC="$cand"; break; }
+done
+MCSRC="$HERE/msg_overwrite_census_test.cpp"
+MCIMPL="$HERE/../src/metrics.cpp"
+if [ -z "$GEN_RPC" ] || [ -z "$ININC" ] || [ ! -f "$MCSRC" ] || [ ! -f "$MCIMPL" ]; then
+	echo "== msg_overwrite census gate SKIPPED (generated rpc.h / internal-include / sources not found) =="
+	echo
+else
+	echo "== msg_overwrite census GREEN arm (classify send/recv/blocking + send-only descriptor split) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/mc_green" "$MCSRC" "$MCIMPL" 2>/dev/null; then
+		echo "census GREEN arm failed to COMPILE"; exit 2
+	fi
+	if ! "$TMP/mc_green"; then
+		echo "census GREEN arm FAILED -- the shape classifier mis-buckets"; exit 1
+	fi
+	echo
+	echo "== census RED arm 1 (-DRED_BREAK_BLOCKING: counts bounded receives as blocking, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_BLOCKING -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/mc_red1" "$MCSRC" "$MCIMPL" 2>/dev/null; then
+		echo "census RED arm 1 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/mc_red1" >/dev/null 2>&1; then
+		echo "census RED arm 1 PASSED but must FAIL -- blocking-receive rule not exercised"; exit 1
+	fi
+	echo "  census RED arm 1 correctly failed."
+	echo
+	echo "== census RED arm 2 (-DRED_BREAK_SENDONLY_PARTITION: double-counts OOL as simple, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_SENDONLY_PARTITION -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/mc_red2" "$MCSRC" "$MCIMPL" 2>/dev/null; then
+		echo "census RED arm 2 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/mc_red2" >/dev/null 2>&1; then
+		echo "census RED arm 2 PASSED but must FAIL -- send-only partition not exercised"; exit 1
+	fi
+	echo "  census RED arm 2 correctly failed."
+	echo
+	echo "msg_overwrite census gate: RED->GREEN OK"
+	echo
+fi
+
 echo "all perf#18 ring gates: OK"

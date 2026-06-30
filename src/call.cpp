@@ -256,6 +256,64 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		return nullptr;
 	}
 
+	// perf #18 P8 D8 (dar-1il.3.2.x): mach_msg_overwrite SHAPE CENSUS. Pure measurement, no behavior
+	// change: when armed (DARLING_SERVER_MSG_CENSUS=1, set once on a warm server), classify each
+	// mach_msg_overwrite by send/receive semantics (from the inline RPC args, free) and -- for the
+	// send path -- by the message body's complex/descriptor shape (one cheap readMemory of the header,
+	// skipped entirely when the census is off so the hot path is byte-identical). The goal is to size
+	// the reclaimable fraction of the ~19% msg_overwrite hotness BEFORE designing any ring migration.
+	if (header->number == dserver_callnum_mach_msg_overwrite &&
+	    Metrics::shared().msgCensusOn.load(std::memory_order_relaxed) &&
+	    requestMessage.data().size() >= sizeof(dserver_rpc_call_mach_msg_overwrite_t)) {
+		auto* mc = reinterpret_cast<const dserver_rpc_call_mach_msg_overwrite_t*>(header);
+		const int32_t option = mc->body.option;
+		const bool send = (option & 0x1) != 0; // MACH_SEND_MSG
+		Metrics::MsgComplexClass cclass = Metrics::MsgComplexClass::Unknown;
+		// mach_msg_header_t is 24 bytes in the user ABI (msgh_bits + size + remote/local/voucher port
+		// NAMES [4B each] + id), msgh_bits at offset 0. We use explicit sizes here so this stays free of
+		// the XNU message.h type (not reliably in scope in a darlingserver TU).
+		static const uint32_t kMsgHeaderSize = 24u;
+		static const uint32_t kMachMsghBitsComplex = 0x80000000u;
+		if (send && mc->body.send_size >= kMsgHeaderSize && process) {
+			// Read msgh_bits to tell simple-vs-complex; for a complex message classify by the first
+			// descriptor's type. No mutation, one or two small reads, skipped entirely when census off.
+			uint32_t msghBits = 0;
+			int rc = 0;
+			if (process->readMemory((uintptr_t)mc->body.msg, &msghBits, sizeof(msghBits), &rc)) {
+				if ((msghBits & kMachMsghBitsComplex) == 0) {
+					cclass = Metrics::MsgComplexClass::Simple;
+				} else {
+					// complex: classify by the FIRST descriptor's type (the dominant shape signal).
+					// layout: header(24) | mach_msg_body_t{ uint32 descriptor_count } | desc[0]...
+					// The `type` field is a :8 bitfield that, in every user descriptor variant (port /
+					// ool32 / ool64 / ool_ports / guarded_port), is the HIGH byte of the 4-byte word at
+					// byte offset 8 of the descriptor (after the 4/8-byte address-or-name + a 4-byte
+					// size-or-pad word). Holds for both the 32- and 64-bit user ABIs, so it needs no
+					// architecture branch. We read 12 bytes of desc[0] to reach it.
+					uint8_t dbuf[12];
+					const uintptr_t descStart = (uintptr_t)mc->body.msg + kMsgHeaderSize + sizeof(uint32_t);
+					if (mc->body.send_size >= kMsgHeaderSize + sizeof(uint32_t) + sizeof(dbuf) &&
+					    process->readMemory(descStart, dbuf, sizeof(dbuf), &rc)) {
+						uint32_t typeWord;
+						__builtin_memcpy(&typeWord, dbuf + 8, sizeof(typeWord));
+						uint32_t dtype = (typeWord >> 24) & 0xffu;
+						// MACH_MSG_PORT_DESCRIPTOR=0, OOL=1, OOL_PORTS=2, OOL_VOLATILE=3, GUARDED_PORT=4
+						if (dtype == 1 || dtype == 3) {
+							cclass = Metrics::MsgComplexClass::ComplexOol;       // OOL / OOL_VOLATILE memory
+						} else if (dtype == 0 || dtype == 2 || dtype == 4) {
+							cclass = Metrics::MsgComplexClass::ComplexPort;      // port / ool-ports / guarded-port
+						} else {
+							cclass = Metrics::MsgComplexClass::ComplexOther;
+						}
+					} else {
+						cclass = Metrics::MsgComplexClass::ComplexOther;
+					}
+				}
+			} // else: Unknown (header read failed) -> counted as msg_census_hdr_read_fail
+		}
+		Metrics::shared().recordMsgOverwriteCensus(option, mc->body.send_size, mc->body.rcv_size, mc->body.timeout, cclass);
+	}
+
 	// finally, let's construct the call class
 
 	#define CALL_CASE(_callName, _className) \

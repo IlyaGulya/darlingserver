@@ -95,6 +95,22 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"phase_publish_cycles\": " << phasePublishCycles.load(std::memory_order_relaxed) << ",\n";
 #endif
 #endif
+	// perf #18 P8 D8: mach_msg_overwrite shape census (always emitted; zeros unless armed by
+	// DARLING_SERVER_MSG_CENSUS=1). Read msg_send_only_simple / msg_total to size the reclaimable share.
+	out << "  \"msg_census_on\": " << (msgCensusOn.load(std::memory_order_relaxed) ? 1 : 0) << ",\n";
+	out << "  \"msg_total\": " << msgTotal.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_send_msg\": " << msgSendMsg.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_rcv_msg\": " << msgRcvMsg.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_send_only\": " << msgSendOnly.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_receive_only\": " << msgReceiveOnly.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_send_receive\": " << msgSendReceive.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_rcv_size_nonzero\": " << msgRcvSizeNonzero.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_blocking_receive\": " << msgBlockingReceive.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_send_only_simple\": " << msgSendOnlySimple.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_send_only_complex\": " << msgSendOnlyComplex.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_send_only_ool\": " << msgSendOnlyOol.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_send_only_port_descriptors\": " << msgSendOnlyPortDesc.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"msg_census_hdr_read_fail\": " << msgCensusHdrReadFail.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"last_reply_age_ms\": " << lastReplyAgeMs << ",\n";
 	if (!extraGauges.empty()) {
 		out << "  " << extraGauges << ",\n";
