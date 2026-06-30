@@ -184,6 +184,18 @@ namespace DarlingServer {
 		// the conjunction guard is supposed to gate it to the env-driven selftest only).
 		std::atomic<uint64_t> ringDuplexS2c {0};
 		std::atomic<uint64_t> ringDuplexReject {0};
+		// perf #18 P8 D4 (dar-1il.3.2.1): duplex PARENT routing counters (distinct from the S2C-upcall
+		// counters above). ringDuplexParent = a real op (mach_port_deallocate) was DISPATCHED onto the
+		// duplex lane (the caller advertised the cap, the shape was accepted, it ran on the fiber). This
+		// is the proof a deallocate actually RODE the duplex lane -- it bumps even when the op needs NO
+		// S2C (the common refcount>1 case), unlike ringDuplexS2c which only counts an actual munmap S2C.
+		// ringDuplexDecline = a duplex-routed op was DECLINED pre-dispatch (no cap / bad shape) and a
+		// DSERVER_RING_DUPLEX_DECLINE reply was sent so the guest UDS-falls-back (no mutation, no
+		// double-effect). NOTE: in Darling, mach_port_deallocate does not drive a munmap S2C in practice
+		// (mach_make_memory_entry_64 is stubbed), so ringDuplexParent can be >0 while ringDuplexS2c stays
+		// 0 -- the deallocate rode the lane but never needed the caller-S2C the lane exists to service.
+		std::atomic<uint64_t> ringDuplexParent {0};
+		std::atomic<uint64_t> ringDuplexDecline {0};
 
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in

@@ -1375,8 +1375,41 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 
 	s2cLog.debug() << *this << ": Going to send S2C message" << s2cLog.endLog;
 
-	// send the call
-	Server::sharedInstance().sendMessage(std::move(call));
+#ifdef DSERVER_RING_TRANSPORT
+	// perf #18 P8 D4 (dar-1il.3.2.1): if this thread's current call is a DUPLEX PARENT (a ring-originated
+	// mach_port_deallocate from a duplex-deallocate-capable caller) and the S2C is the munmap shape, route
+	// the upcall through the duplex MAILBOX instead of the UDS send. The fiber then parks on
+	// _s2cReplySempahore exactly as the UDS path below; the main-loop _drainDuplexReply harvests the
+	// correlated munmap reply, synthesizes _s2cReply, and ups the semaphore. The op runs entirely on the
+	// ring -- no UDS fallback after this point, so the destroy side effect is applied exactly once.
+	//
+	// The guard can DECLINE (no v5 ring / no DEALLOCATE cap / mailbox busy). That decline happens BEFORE
+	// any mutation only at the ROUTING layer (ringServiceThread), NOT here -- by the time _s2cPerform runs
+	// the dtape op has already begun mutating (we're mid-ipc_right_dealloc). So a decline HERE must NOT
+	// silently fall back to a UDS S2C for a ring-parked caller (it can't service it -> the very deadlock
+	// we're avoiding). Instead, a decline here is a hard error: we leave the in-flight markers clear and
+	// fall through to the UDS send, which is correct ONLY if the caller is NOT ring-parked. Since
+	// _ringDuplexParentActive implies a ring-parked caller, a decline here is a should-not-happen
+	// (the routing layer already verified the cap + clean mailbox); we log + take the UDS path as a
+	// last resort (the bounded guest wait then UDS-falls-back the op). In practice the guard passes.
+	bool duplexUpcallTaken = false;
+	if (_ringDuplexParentActive && expectedReplyNumber == dserver_s2c_msgnum_munmap) {
+		auto* mcall = reinterpret_cast<const dserver_s2c_call_munmap_t*>(call.data().data());
+		uint64_t addr = mcall->address;
+		uint64_t len = mcall->length;
+		std::unique_lock lock(_rwlock);
+		duplexUpcallTaken = _s2cTryDuplexMunmapLocked(dserver_s2c_msgnum_munmap, addr, len, lock);
+		if (!duplexUpcallTaken) {
+			s2cLog.error() << *this << ": duplex munmap guard declined mid-op (mailbox busy?); "
+			               << "falling through to UDS S2C (caller may be ring-parked)" << s2cLog.endLog;
+		}
+	}
+	if (!duplexUpcallTaken)
+#endif
+	{
+		// send the call (UDS S2C -- the unchanged path)
+		Server::sharedInstance().sendMessage(std::move(call));
+	}
 
 	// now let's wait for the reply
 	if (!dtape_semaphore_down_simple(_s2cReplySempahore)) {
@@ -1530,6 +1563,7 @@ bool DarlingServer::Thread::_drainDuplexReply() {
 	uint32_t finalResult = 0;
 	int32_t  finalCode = 0;
 	bool completeSentinel = false;
+	bool resumeRealFiber = false; // perf #18 P8 D4: up _s2cReplySempahore for a real-op duplex parent
 	{
 		std::unique_lock lock(_rwlock);
 		if (!_duplexUpcallInFlight) {
@@ -1548,30 +1582,54 @@ bool DarlingServer::Thread::_drainDuplexReply() {
 			// correlated reply: harvest it, consume the slot, clear the in-flight state.
 			_duplexReplyStatus = cb->duplex_reply_status;
 			_duplexReplyArg = cb->duplex_reply_arg;
+			int32_t replyErrno = cb->duplex_reply_errno;
 			_duplexReplyReady = true;
+			uint32_t realUpcallNum = _duplexRealUpcallNum;
 			dserver_ring_duplex_consume_reply(cb);
 			_duplexUpcallInFlight = false;
+			_duplexRealUpcallNum = 0;
 			_duplexInFlightFast.store(false, std::memory_order_release);
 			Metrics::shared().ringDuplexS2c.fetch_add(1, std::memory_order_relaxed);
-			// D3 synthetic sentinel completion: stage the parent final reply (published below, lock
-			// dropped). _duplexSentinelSeq != 0 marks this as a sentinel parent (vs. a future real-op
-			// fiber park, which would instead up _s2cReplySempahore -- not used in D3).
 			if (_duplexSentinelSeq != 0) {
+				// D3 synthetic sentinel completion: stage the parent final reply (published below, lock
+				// dropped). The parent op's result IS the echo result the guest computed for the upcall.
 				completeSentinel = true;
 				ringForReply = ring;
 				finalSeq = _duplexSentinelSeq;
-				// the parent op's result IS the echo result the guest computed for the upcall (status 0
-				// means the upcall succeeded; a nonzero status fails the parent).
 				finalResult = _duplexReplyArg;
 				finalCode = (_duplexReplyStatus == 0) ? 0 : -1;
 				_duplexSentinelSeq = 0;
+			} else if (realUpcallNum == (uint32_t)dserver_s2c_msgnum_munmap) {
+				// perf #18 P8 D4: REAL-op resume. Synthesize the _s2cReply Message exactly as the UDS S2C
+				// reply would arrive (a dserver_s2c_reply_munmap_t carrying the guest's munmap result), so
+				// _s2cPerform's reply-extraction + validation path is byte-identical to UDS. Then up
+				// _s2cReplySempahore to resume the parked fiber, which finishes the deallocate and emits
+				// its final reply via the existing deferred-reply->ring path.
+				Message s2cReply(sizeof(dserver_s2c_reply_munmap_t), 0);
+				auto* r = reinterpret_cast<dserver_s2c_reply_munmap_t*>(s2cReply.data().data());
+				r->header.call_number = 0;
+				r->header.pid = 0;
+				r->header.tid = 0;
+				r->header.architecture = 0;
+				r->header.s2c_number = dserver_s2c_msgnum_munmap;
+				r->return_value = _duplexReplyStatus; // guest's munmap return_value (0 ok / -1 error)
+				r->errno_result = replyErrno;
+				if (_s2cReply) {
+					// should be impossible (one outstanding upcall) -- but never clobber a pending reply.
+					s2cLog.error() << *this << ": duplex munmap reply but an _s2cReply was already pending" << s2cLog.endLog;
+				} else {
+					_s2cReply = std::move(s2cReply);
+					resumeRealFiber = true;
+				}
 			}
 		} else if (mismatch) {
 			// a reply landed that does NOT correlate (wrong parent/upcall id: a buggy/hostile guest or
 			// a stale reply from a torn-down op). Refuse to resume on it: drop the slot, count it, and
 			// FAIL the parent (no wedge, no fabricated success). pitfall #2 (ABA) + #3 (wrong corr).
+			uint32_t realUpcallNum = _duplexRealUpcallNum;
 			dserver_ring_duplex_consume_reply(cb);
 			_duplexUpcallInFlight = false;
+			_duplexRealUpcallNum = 0;
 			_duplexInFlightFast.store(false, std::memory_order_release);
 			Metrics::shared().ringDuplexReject.fetch_add(1, std::memory_order_relaxed);
 			if (_duplexSentinelSeq != 0) {
@@ -1581,10 +1639,35 @@ bool DarlingServer::Thread::_drainDuplexReply() {
 				finalResult = 0;
 				finalCode = -1; // mis-correlation -> the synthetic parent fails
 				_duplexSentinelSeq = 0;
+			} else if (realUpcallNum == (uint32_t)dserver_s2c_msgnum_munmap) {
+				// perf #18 P8 D4: a mis-correlated reply for a REAL munmap upcall. We must NOT resume the
+				// fiber on a bogus munmap result (that could tell the kernel the unmap succeeded when it
+				// didn't = corruption). Synthesize a FAILED munmap reply (return_value=-1, EINTR) so the
+				// fiber resumes, the deallocate sees the S2C failed, and the op surfaces an error rather
+				// than fabricating success. Bounded: the fiber resumes immediately (no wedge).
+				Message s2cReply(sizeof(dserver_s2c_reply_munmap_t), 0);
+				auto* r = reinterpret_cast<dserver_s2c_reply_munmap_t*>(s2cReply.data().data());
+				r->header.call_number = 0;
+				r->header.pid = 0;
+				r->header.tid = 0;
+				r->header.architecture = 0;
+				r->header.s2c_number = dserver_s2c_msgnum_munmap;
+				r->return_value = -1;
+				r->errno_result = 4 /*EINTR*/;
+				if (!_s2cReply) {
+					_s2cReply = std::move(s2cReply);
+					resumeRealFiber = true;
+				}
 			}
 		} else {
 			return false; // in flight but no reply yet
 		}
+	}
+
+	if (resumeRealFiber) {
+		// resume the parked deallocate fiber with the synthesized munmap reply (the UDS path's wakeup).
+		dtape_semaphore_up(_s2cReplySempahore);
+		return true;
 	}
 
 	if (completeSentinel && ringForReply) {
@@ -1624,6 +1707,66 @@ bool DarlingServer::Thread::duplexSelftestUpcall(uint32_t arg, uint32_t seq) {
 		_duplexSentinelSeq = 0; // guard declined -> not in flight; caller publishes the failure reply
 	}
 	return took;
+};
+
+// perf #18 P8 D4 (dar-1il.3.2.1): publish a REAL munmap S2C upcall into the duplex mailbox for a duplex-
+// parent call. The structural sibling of _s2cTryDuplexLocked, but for the MUNMAP shape + the typed
+// addr/len payload, and it ALSO requires DUPLEX_CAP_DEALLOCATE (the echo guard required only SELFTEST).
+// On success it arms the in-flight markers + publishes + wakes, and the CALLER (_s2cPerform) then parks
+// the fiber on _s2cReplySempahore exactly as the UDS S2C path does. The main-loop _drainDuplexReply
+// harvests the correlated munmap reply, synthesizes the _s2cReply Message, and ups _s2cReplySempahore.
+bool DarlingServer::Thread::_s2cTryDuplexMunmapLocked(uint32_t s2cNumber, uint64_t address, uint64_t length, std::unique_lock<std::shared_mutex>& lock) {
+	(void)lock; // documents the held-lock contract
+	auto ring = _ring;
+	// require BOTH a v5+ duplex-capable ring AND the deallocate cap (the munmap shape is only reachable
+	// from a deallocate parent, whose caller advertised it can pump munmap). SELFTEST is not enough.
+	if (!ring || !ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_DEALLOCATE)) {
+		return false;
+	}
+	dserver_ring_shm_t* cb = ring->liveControlBlock();
+	if (!cb) {
+		return false;
+	}
+	// one-outstanding invariant: nothing already in flight + a clean mailbox (no stale upcall/reply).
+	if (_duplexUpcallInFlight) {
+		return false;
+	}
+	if (dserver_ring_duplex_upcall_available(cb)) {
+		return false;
+	}
+	if (__atomic_load_n(&cb->duplex_reply_ready, __ATOMIC_ACQUIRE) != 0u) {
+		return false;
+	}
+	// nonzero, monotonic correlation ids (ABA-safe: the mailbox is clean + we bump per upcall).
+	uint32_t parentId = _duplexNextId++;
+	uint32_t upcallId = _duplexNextId++;
+	if (parentId == 0) { parentId = _duplexNextId++; }
+	if (upcallId == 0) { upcallId = _duplexNextId++; }
+
+	_duplexParentId = parentId;
+	_duplexUpcallId = upcallId;
+	_duplexReplyReady = false;
+	_duplexUpcallInFlight = true;
+	_duplexRealUpcallNum = s2cNumber; // mark this as a REAL-op upcall (drain synthesizes _s2cReply)
+	_duplexInFlightFast.store(true, std::memory_order_release);
+
+	dserver_ring_duplex_publish_munmap_upcall(cb, parentId, upcallId, address, length);
+	ring->wakeGuest();
+	return true;
+};
+
+void DarlingServer::Thread::setRingDuplexParentActive(bool active) {
+	std::unique_lock lock(_rwlock);
+	_ringDuplexParentActive = active;
+};
+
+bool DarlingServer::Thread::duplexDeallocateCapable() const {
+	std::unique_lock lock(const_cast<std::shared_mutex&>(_rwlock));
+	auto ring = _ring;
+	if (!ring) {
+		return false;
+	}
+	return ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_DEALLOCATE);
 };
 #endif // DSERVER_RING_TRANSPORT
 

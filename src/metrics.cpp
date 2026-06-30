@@ -76,6 +76,8 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"ring_fast_suspend\": " << ringFastSuspend.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_s2c\": " << ringDuplexS2c.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_reject\": " << ringDuplexReject.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_parent\": " << ringDuplexParent.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_decline\": " << ringDuplexDecline.load(std::memory_order_relaxed) << ",\n";
 #ifdef DSERVER_RING_PHASE_PROF
 	out << "  \"phase_samples\": " << phaseSamples.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"phase_drain_cycles\": " << phaseDrainCycles.load(std::memory_order_relaxed) << ",\n";

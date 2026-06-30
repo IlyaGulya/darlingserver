@@ -1515,6 +1515,67 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 			continue;
 		}
 
+		// perf #18 P8 D4 (dar-1il.3.2.1): mach_port_deallocate as a DUPLEX PARENT. deallocate is NOT on
+		// the simple ring (it is destroy-capable / caller-S2C); a duplex-deallocate-capable guest routes
+		// it here. We run it on the GENERIC fiber path (exactly like a simple-ring body op) but with
+		// _ringDuplexParentActive set, so its munmap S2C (if any) rides the duplex mailbox instead of the
+		// UDS S2C that a ring-parked caller can't service. The ROUTING decline (the pre-mutation safety
+		// boundary) is HERE: if the caller did not advertise DUPLEX_CAP_DEALLOCATE we must NOT dispatch
+		// the op (we can't safely service its possible S2C) -- publish a DECLINE reply so the guest
+		// UDS-falls-back, BEFORE any mutation (no double-effect). The decline is decidable purely from the
+		// negotiated cap, before the op runs.
+		if (callnum == (uint32_t)dserver_callnum_mach_port_deallocate) {
+			if (!thread->duplexDeallocateCapable()) {
+				// caller is not duplex-deallocate-capable: decline pre-dispatch -> guest UDS-falls-back.
+				dserver_ring_consumer_advance(c2s);
+				thread->ring()->publishReply(seq, callnum, DSERVER_RING_DUPLEX_DECLINE, nullptr, 0);
+				thread->ring()->wakeGuest();
+				Metrics::shared().ringDuplexDecline.fetch_add(1, std::memory_order_relaxed);
+				++serviced;
+				continue;
+			}
+			if (reqlen != sizeof(dserver_call_mach_port_deallocate_t)) {
+				// unexpected shape -> decline pre-dispatch (no mutation), guest UDS-falls-back.
+				// (dserver_call_mach_port_deallocate_t is the BODY only: {uint32 target; uint32 name} = 8B.)
+				dserver_ring_consumer_advance(c2s);
+				thread->ring()->publishReply(seq, callnum, DSERVER_RING_DUPLEX_DECLINE, nullptr, 0);
+				thread->ring()->wakeGuest();
+				Metrics::shared().ringDuplexDecline.fetch_add(1, std::memory_order_relaxed);
+				++serviced;
+				continue;
+			}
+			// the op is being dispatched onto the duplex lane (proof it RODE the lane, S2C or not).
+			Metrics::shared().ringDuplexParent.fetch_add(1, std::memory_order_relaxed);
+			// rebuild {callhdr, body} exactly as the simple-ring generic path, then dispatch on the fiber
+			// with the duplex-parent flag set so _s2cPerform routes the munmap S2C through the mailbox.
+			size_t totalSize = sizeof(dserver_rpc_callhdr_t) + reqlen;
+			Message reqMsg(totalSize, 0);
+			reqMsg.data().resize(totalSize);
+			auto* hdr = reinterpret_cast<dserver_rpc_callhdr_t*>(reqMsg.data().data());
+			hdr->number = static_cast<dserver_callnum_t>(callnum);
+			hdr->pid = process->nsid();
+			hdr->tid = thread->nsid();
+			hdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
+			memcpy(reqMsg.data().data() + sizeof(dserver_rpc_callhdr_t),
+			       reinterpret_cast<const char*>(req) + sizeof(dserver_ring_slot_t), reqlen);
+			reqMsg.setAddress(thread->address());
+			reqMsg.setPID(process->id());
+			dserver_ring_consumer_advance(c2s); // free the slot before running the op
+			thread->beginRingReply(seq);
+			thread->setRingDuplexParentActive(true);
+			try {
+				auto call = Call::callFromMessage(std::move(reqMsg));
+				if (call) {
+					call->thread()->doWork();
+					++serviced;
+				}
+			} catch (const std::exception& ex) {
+				callLog.error() << "ring duplex deallocate dispatch threw: " << ex.what() << callLog.endLog;
+			}
+			thread->setRingDuplexParentActive(false);
+			continue;
+		}
+
 		// perf #18 P6.1 step 2 (dar-ohp): SURGICAL direct dispatch for mach_reply_port. Skip the
 		// Message rebuild + callFromMessage registry re-lookup + Call heap-alloc that step 1 still
 		// pays. The thread is already held (shared_ptr) for this whole slot iteration, so its
