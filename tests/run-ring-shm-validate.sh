@@ -297,6 +297,44 @@ echo
 echo "ring_wake_race gate: RED->GREEN OK"
 echo
 
+# --- D16 (dar-1il.11): PER-THREAD lane table active-bit/generation gate. The dar-my8 exhaustive-
+#     interleaving lesson applied to the multi-lane case: a lane freed by a dying/forking thread and
+#     reused by a new (possibly tid-recycled) thread must never let a reader act on a half-initialized
+#     lane (publish active LAST) or false-match a stale epoch (bump the generation on every reclaim).
+#     Hermetic, pure model logic (no rpc.h needed). GREEN: zero violations across all enumerated
+#     interleavings. RED arms break each invariant so the enumeration finds violations -> nonzero. ---
+MLSRC="$HERE/ring_multilane_gate_test.c"
+if [ -f "$MLSRC" ]; then
+	echo "== multilane GREEN arm (active-bit/generation bookkeeping race-free) =="
+	if ! "$CC" -std=c11 -o "$TMP/ml_green" "$MLSRC" 2>/dev/null; then
+		echo "multilane GREEN arm failed to COMPILE"; exit 2
+	fi
+	if ! "$TMP/ml_green"; then
+		echo "multilane GREEN arm FAILED -- a lane active-bit/generation invariant does not hold"; exit 1
+	fi
+	echo
+	echo "== multilane RED arm A (-DRACE_PUBLISH_ACTIVE_BEFORE_INIT: active published before init, MUST fail) =="
+	if ! "$CC" -std=c11 -DRACE_PUBLISH_ACTIVE_BEFORE_INIT -o "$TMP/ml_redA" "$MLSRC" 2>/dev/null; then
+		echo "multilane RED arm A failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/ml_redA" >/dev/null 2>&1; then
+		echo "multilane RED arm A PASSED but must FAIL -- gate not exercising the publish-active-LAST invariant"; exit 1
+	fi
+	echo "  multilane RED arm A correctly failed."
+	echo
+	echo "== multilane RED arm B (-DRACE_REUSE_WITHOUT_GEN_BUMP: reuse without gen bump, MUST fail) =="
+	if ! "$CC" -std=c11 -DRACE_REUSE_WITHOUT_GEN_BUMP -o "$TMP/ml_redB" "$MLSRC" 2>/dev/null; then
+		echo "multilane RED arm B failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/ml_redB" >/dev/null 2>&1; then
+		echo "multilane RED arm B PASSED but must FAIL -- gate not exercising the generation-disambiguates-reuse invariant"; exit 1
+	fi
+	echo "  multilane RED arm B correctly failed."
+	echo
+	echo "ring_multilane gate: RED->GREEN OK"
+	echo
+fi
+
 # --- Phase C/D (P8, dar-1il.3 / .3.1): DUPLEX-lane wake-model gate. The hard gate the duplex lane
 #     is built on -- pure logic, hermetic. GREEN: the duplex wake model is lost-wake-free (guest park
 #     watches the S2C-upcall stream; server park watches the upcall-reply stream) + correlation-safe.
