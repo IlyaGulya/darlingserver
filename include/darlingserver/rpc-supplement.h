@@ -167,7 +167,30 @@ typedef struct dserver_kqchan_reply_proc_read {
 // compiled C2S opcode-set hash, cross-checked at attach). The struct grew, so bump the version too:
 // a v2 server reading a v3 guest's block (or vice versa) rejects on abi_version BEFORE it would ever
 // misread the new field, and a same-version pair whose opcode SETS still differ rejects on the hash.
-#define DSERVER_RING_ABI_VERSION 3u
+// ABI v4 (perf #18 P8 D1/D2, dar-1il.3.1): added the DUPLEX MAILBOX (duplex_* words below) + a
+// capability flag (duplex_caps) to the control block for the minimal duplex lane (one synthetic S2C
+// upcall + reply to a ring-parked caller). The struct grew again, so a v3<->v4 pair rejects on
+// abi_version at attach (clean all-UDS fallback) -- a v3 server never misreads the duplex words, and
+// the duplex datapath only activates when BOTH sides are v4 AND the caps bit is set. The Lane-1 c2s/
+// s2c RINGS are byte-identical; the mailbox lives in the fixed control block on its own cache lines.
+#define DSERVER_RING_ABI_VERSION 4u
+
+// perf #18 P8 D1/D2: duplex capability bits, advertised by the guest in cb.duplex_caps and confirmed
+// by the server. The minimal prototype advertises exactly DUPLEX_SELFTEST: it can pump ONE synthetic
+// S2C upcall to a ring-parked caller and reply. NO real op rides the duplex lane yet (no deallocate,
+// no mod_refs). A server that doesn't recognize a cap bit simply doesn't use that duplex path.
+#define DSERVER_RING_DUPLEX_CAP_SELFTEST 0x1u
+
+// perf #18 P8 D1/D2: the synthetic duplex parent op. A guest selftest publishes a c2s slot with this
+// reserved callnum sentinel (NOT a real dserver_callnum_*, deliberately out of the generated enum's
+// range so it can never collide) to drive ONE duplex roundtrip. The server recognizes ONLY this
+// sentinel as a duplex parent; every other callnum takes the existing Lane-1 path unchanged.
+#define DSERVER_RING_DUPLEX_SELFTEST_CALLNUM 0xD0DE0001u
+
+// perf #18 P8 D1/D2: the synthetic S2C upcall op carried in the mailbox. The minimal protocol defines
+// exactly one supported upcall shape (a no-side-effect echo: guest returns the payload transformed),
+// so the "upcall shape supported" precondition is a single equality check.
+#define DSERVER_RING_DUPLEX_UPCALL_ECHO 0x1u
 
 // perf #18 P4 wake model: the server publishes its current sleep state into server_state so a
 // producing guest can SKIP the eventfd doorbell when the server is actively polling (it will
@@ -587,6 +610,28 @@ typedef struct dserver_ring_shm {
 	// lines so the two directions don't false-share with each other or with the futex words.
 	DSERVER_RING_ALIGN64 uint32_t server_state; // server-written: DSERVER_RING_SRV_* (guest reads for conditional doorbell)
 	DSERVER_RING_ALIGN64 uint32_t s2c_waiters;  // guest-written: nonzero == a guest is parked in FUTEX_WAIT on s2c_futex
+	// --- perf #18 P8 D1/D2 (dar-1il.3.1): DUPLEX MAILBOX (ABI v4) -------------------------------
+	// The minimal duplex lane: ONE outstanding S2C upcall to a ring-parked caller + its reply, carried
+	// in two fixed mailbox slots in the control block (NOT new rings -- the Lane-1 rings stay
+	// byte-identical). Each slot has a `ready` flag the producer release-stores LAST (after the body),
+	// so a peer that observes ready==1 sees a fully written slot (torn-write-safe, same discipline as
+	// the ring tail publish). The guest reuses s2c_futex/s2c_waiters to park (it watches BOTH the s2c
+	// reply ring AND this mailbox while parked -- the duplex wake model, proven in ring_duplex_wake_
+	// gate_test.c). Correlation: an upcall reply is accepted ONLY if BOTH parent_id and upcall_id match
+	// the in-flight upcall. Own cache lines so the duplex traffic never false-shares with Lane-1.
+	DSERVER_RING_ALIGN64 uint32_t duplex_caps;          // guest-written at attach: DSERVER_RING_DUPLEX_CAP_* the guest supports
+	// S2C upcall mailbox (server -> guest). Server writes body then release-stores upcall_ready=1.
+	DSERVER_RING_ALIGN64 uint32_t duplex_upcall_ready;  // 1 == an upcall is published and unhandled (server->guest)
+	uint32_t duplex_upcall_op;                          // DSERVER_RING_DUPLEX_UPCALL_* (which S2C shape)
+	uint32_t duplex_upcall_parent;                      // parent_id this upcall belongs to (correlation)
+	uint32_t duplex_upcall_id;                          // unique upcall id (correlation)
+	uint32_t duplex_upcall_arg;                         // single inline arg for the minimal echo shape
+	// C2S upcall reply mailbox (guest -> server). Guest writes body then release-stores reply_ready=1.
+	DSERVER_RING_ALIGN64 uint32_t duplex_reply_ready;   // 1 == an upcall reply is published (guest->server)
+	uint32_t duplex_reply_parent;                       // echoes the upcall's parent_id (server checks)
+	uint32_t duplex_reply_id;                           // echoes the upcall's upcall_id (server checks)
+	int32_t  duplex_reply_status;                       // guest's upcall result (0 == ok)
+	uint32_t duplex_reply_arg;                          // the echo result the guest computed
 } dserver_ring_shm_t;
 
 // --- P4 wake-model decision predicates (shared by guest, server, and the host gate) ----------
@@ -617,6 +662,68 @@ static inline int dserver_ring_guest_should_doorbell(const dserver_ring_shm_t* c
 static inline int dserver_ring_server_should_wake(const dserver_ring_shm_t* cb) {
 	uint32_t w = __atomic_load_n(&cb->s2c_waiters, __ATOMIC_ACQUIRE);
 	return w != 0u;
+}
+
+// --- perf #18 P8 D1/D2: minimal duplex mailbox helpers (shared by guest, server, host test) -------
+//
+// These are the entire minimal duplex protocol expressed as pure functions over the mailbox words, so
+// the guest (libc-free C), the server (C++), and the live host roundtrip test all use the IDENTICAL
+// publish/observe/correlate logic. ONE upcall outstanding at a time; the `ready` flag is the
+// release-store linearization point (written LAST, after the body) so an observer of ready==1 sees a
+// fully written slot.
+
+// Server: publish ONE S2C upcall into the mailbox. Body first, then release-store ready=1.
+static inline void dserver_ring_duplex_publish_upcall(
+	dserver_ring_shm_t* cb, uint32_t op, uint32_t parent_id, uint32_t upcall_id, uint32_t arg) {
+	cb->duplex_upcall_op     = op;
+	cb->duplex_upcall_parent = parent_id;
+	cb->duplex_upcall_id     = upcall_id;
+	cb->duplex_upcall_arg    = arg;
+	__atomic_store_n(&cb->duplex_upcall_ready, 1u, __ATOMIC_RELEASE); // publish (linearization point)
+}
+
+// Guest pump: is an S2C upcall available? (acquire so the body is visible once ready is seen)
+static inline int dserver_ring_duplex_upcall_available(const dserver_ring_shm_t* cb) {
+	return __atomic_load_n(&cb->duplex_upcall_ready, __ATOMIC_ACQUIRE) != 0u;
+}
+
+// Guest pump: publish the reply to the current upcall, then clear the upcall-ready flag (consume).
+// Echoes parent_id+upcall_id for the server's correlation check. Body first, ready last.
+static inline void dserver_ring_duplex_publish_reply(
+	dserver_ring_shm_t* cb, uint32_t parent_id, uint32_t upcall_id, int32_t status, uint32_t result_arg) {
+	cb->duplex_reply_parent = parent_id;
+	cb->duplex_reply_id     = upcall_id;
+	cb->duplex_reply_status = status;
+	cb->duplex_reply_arg    = result_arg;
+	// consume the upcall slot (we've handled it) BEFORE advertising the reply, so the server never
+	// sees reply_ready while upcall_ready is still set.
+	__atomic_store_n(&cb->duplex_upcall_ready, 0u, __ATOMIC_RELEASE);
+	__atomic_store_n(&cb->duplex_reply_ready, 1u, __ATOMIC_RELEASE); // publish reply (linearization point)
+}
+
+// Server: is the upcall reply available AND correlated to the upcall we sent? Accept ONLY if BOTH
+// parent_id and upcall_id match -- a mismatch is a protocol error (the server must NOT resume on it).
+// Returns 1 (accept) only when ready && correlated; 0 otherwise. `*out_mismatch` is set if a reply is
+// ready but mis-correlated (so the caller can flag the protocol error rather than silently spin).
+static inline int dserver_ring_duplex_reply_ready(
+	const dserver_ring_shm_t* cb, uint32_t parent_id, uint32_t upcall_id, int* out_mismatch) {
+	if (out_mismatch) *out_mismatch = 0;
+	if (__atomic_load_n(&cb->duplex_reply_ready, __ATOMIC_ACQUIRE) == 0u) return 0;
+	if (cb->duplex_reply_parent == parent_id && cb->duplex_reply_id == upcall_id) return 1;
+	if (out_mismatch) *out_mismatch = 1; // ready but wrong correlation -> protocol error
+	return 0;
+}
+
+// Server: consume the reply slot after accepting it.
+static inline void dserver_ring_duplex_consume_reply(dserver_ring_shm_t* cb) {
+	__atomic_store_n(&cb->duplex_reply_ready, 0u, __ATOMIC_RELEASE);
+}
+
+// The minimal supported upcall shape: ECHO. The guest computes result = arg ^ 0x5A5A5A5A on the
+// CALLER thread (a cheap, deterministic, side-effect-free transform that proves the upcall ran in the
+// caller's context -- the guest can also assert its own tid here). Shared so server + test agree.
+static inline uint32_t dserver_ring_duplex_echo_transform(uint32_t arg) {
+	return arg ^ 0x5A5A5A5Au;
 }
 
 // Why a ring control block was rejected. Returned by dserver_ring_shm_validate(); the server
