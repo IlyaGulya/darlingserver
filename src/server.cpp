@@ -32,6 +32,7 @@
 #include <array>
 #include <sstream>
 #include <cstddef>
+#include <unordered_map>
 #include <darlingserver/registry.hpp>
 #include <sys/eventfd.h>
 #include <darlingserver/duct-tape.h>
@@ -508,6 +509,21 @@ DarlingServer::Server::Server(std::string prefix):
 		}
 	}
 
+	// perf #18 D17 (dar-1il.12): POST-D16 residual-UDS classifier arming. RECON-ONLY, default-OFF;
+	// classifies each residual UDS call by WHY it is on UDS (first-before-this-thread's-lane vs
+	// despite-a-live-lane) so we can decide if the post-D16 231-call residual is unavoidable (A) or a
+	// wrapper/coverage gap (B/D). Read residual_* via the stat socket. Pure measurement, no behavior change.
+	if (const char* env = getenv("DARLING_SERVER_RESIDUAL_CENSUS")) {
+		if (env[0] == '1') {
+			Metrics::shared().residualCensusOn.store(true, std::memory_order_relaxed);
+			static DarlingServer::Log residualLog("residualcensus");
+			residualLog.error() << "[NOTICE] perf#18 D17 post-D16 residual-UDS classifier ARMED"
+				<< " (DARLING_SERVER_RESIDUAL_CENSUS=1). Pure measurement, no behavior change."
+				<< " Read residual_* via the stat socket; reason buckets + uds-despite-lane by callnum."
+				<< residualLog.endLog;
+		}
+	}
+
 	// remove the old socket (if it exists)
 	unlink(_socketPath.c_str());
 
@@ -662,6 +678,29 @@ void DarlingServer::Server::_handleStatConnection() {
 		       << ", \"workers_available\": " << wq.threadsAvailable
 		       << ", \"clients_blocked_in_rpc\": " << (wq.depth + wq.threadsBusy);
 
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 D17 (dar-1il.12): set the max-ring-threads-per-process gauge at snapshot time (only
+		// when the residual census is armed). The server registers one ring thread per attached guest
+		// thread, so the peak count of ring threads sharing a process IS the server-side proxy for the
+		// guest's "max lanes/process". Computed off the hot path, under the ring-threads lock.
+		if (Metrics::shared().residualCensusOn.load(std::memory_order_relaxed)) {
+			std::unordered_map<Process*, uint64_t> perProc;
+			{
+				std::unique_lock lock(_ringThreadsLock);
+				for (auto& weak : _ringThreads) {
+					if (auto t = weak.lock()) {
+						if (auto p = t->process()) {
+							perProc[p.get()] += 1;
+						}
+					}
+				}
+			}
+			uint64_t mx = 0;
+			for (auto& kv : perProc) mx = std::max(mx, kv.second);
+			Metrics::shared().maxRingThreadsPerProcess.store(mx, std::memory_order_relaxed);
+		}
+#endif
+
 		std::string json = Metrics::shared().snapshotJSON(gauges.str());
 
 		// best-effort blocking-ish write; the payload is tiny (<1KB) so a single write
@@ -739,6 +778,30 @@ void DarlingServer::Server::start() {
 										static_cast<uint32_t>(call->number()), ord, attachedYet, eligible);
 								}
 							}
+						}
+						// perf #18 D17 (dar-1il.12): POST-D16 residual UDS classifier. Same UDS choke point;
+						// classifies each UDS call by WHY it is on UDS using server-observable per-(thread,
+						// process) state -- whether THIS thread has a live ring now (#ifdef'd: ring() exists
+						// only with the ring transport) and whether the process ever attached one. This is
+						// what separates reason A (first-eligible-before-this-thread's-lane) from B/D (an
+						// eligible op on UDS despite a live lane = wrapper gap / forced fallback). No-op
+						// unless DARLING_SERVER_RESIDUAL_CENSUS=1. No lane-ownership change (D17 constraint).
+						if (Metrics::shared().residualCensusOn.load(std::memory_order_relaxed)) {
+							uint32_t cn = static_cast<uint32_t>(call->number());
+							bool eligible = DarlingServer::Call::ringEligibleCallnum(cn);
+							bool controlPlane = (cn == static_cast<uint32_t>(dserver_callnum_checkin))
+							                 || (cn == static_cast<uint32_t>(dserver_callnum_ring_attach));
+							bool threadHasRing = false;
+							bool procEverAttached = false;
+							if (auto t = call->thread()) {
+#ifdef DSERVER_RING_TRANSPORT
+								threadHasRing = (t->ring() != nullptr);
+#endif
+								if (auto p = t->process()) {
+									procEverAttached = p->ringAttachedYet();
+								}
+							}
+							Metrics::shared().recordResidualReason(cn, threadHasRing, procEverAttached, eligible, controlPlane);
 						}
 						// perf #2b (dar-dar6x4-perf-5dq.8): run the call INLINE on the main
 						// event loop instead of always handing it to the worker pool. The
@@ -1066,6 +1129,9 @@ void DarlingServer::Server::registerRingThread(std::shared_ptr<Thread> thread) {
 		}
 	}
 	_ringThreads.push_back(thread);
+	// perf #18 D17 (dar-1il.12): cumulative ring-thread registrations = a server-side "lanes acquired"
+	// proxy (each successful per-thread ring_attach lands here exactly once). A plain stat counter.
+	Metrics::shared().totalRingThreadsRegistered.fetch_add(1, std::memory_order_relaxed);
 };
 
 void DarlingServer::Server::unregisterRingThread(std::shared_ptr<Thread> thread) {
