@@ -116,16 +116,18 @@ if [ -z "$GEN_RPC" ]; then
 	echo "== allowlist gate SKIPPED (generated rpc.h not found; set DSERVER_GEN_INC) =="
 	echo
 else
-	echo "== allowlist GREEN arm (current predicate: task_self_trap + mach_reply_port) =="
-	if ! "$CXX" -std=c++17 -I"$GEN_RPC" -I"$INC" -o "$TMP/al_green" "$LSRC"; then
+	echo "== allowlist GREEN arm (current set, derived from the shared DSERVER_RING_C2S_OPCODES macro) =="
+	# -DDSERVER_RING_TRANSPORT so the macro (defined inside that ifdef in rpc-supplement.h) is visible;
+	# the gate derives eligibility from the SAME macro the server uses, so it can never drift.
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -I"$GEN_RPC" -I"$INC" -o "$TMP/al_green" "$LSRC"; then
 		echo "allowlist GREEN arm failed to COMPILE"; exit 2
 	fi
 	if ! "$TMP/al_green"; then
 		echo "allowlist GREEN arm FAILED"; exit 1
 	fi
 	echo
-	echo "== allowlist RED arm (pre-migration predicate: task_self_trap only, MUST fail) =="
-	if ! "$CXX" -std=c++17 -DALLOWLIST_OLD -I"$GEN_RPC" -I"$INC" -o "$TMP/al_red" "$LSRC"; then
+	echo "== allowlist RED arm (stale pre-migration hand-list: task_self_trap only, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DALLOWLIST_OLD -I"$GEN_RPC" -I"$INC" -o "$TMP/al_red" "$LSRC"; then
 		echo "allowlist RED arm failed to COMPILE -- gate broken"; exit 2
 	fi
 	if "$TMP/al_red"; then

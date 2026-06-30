@@ -6,30 +6,39 @@
 // It must use the GENERATED rpc.h (build-dir only) for the real enum values, so it is compiled
 // with the build include dir injected by run-ring-shm-validate.sh (DSERVER_GEN_INC).
 //
-//   GREEN arm: the current allowlist predicate (task_self_trap OR mach_reply_port). Asserts both
-//              migrated ops are eligible and a representative non-migrated op (kprintf) is NOT.
-//   RED   arm (-DALLOWLIST_OLD): the pre-migration predicate (task_self_trap only). The
-//              "mach_reply_port is eligible" assertion MUST then fail -> proves the gate is
-//              actually exercising the allowlist change, not a tautology.
+//   GREEN arm: the current allowlist, derived from the AUTHORITATIVE shared macro
+//              DSERVER_RING_C2S_OPCODES (rpc-supplement.h) -- the single set the server allowlist and
+//              the guest dispatch both expand (drift-gated by ring_drift_gate_test.c). Asserts every
+//              migrated op is eligible and a representative non-migrated op (kprintf) is NOT.
+//   RED   arm (-DALLOWLIST_OLD): a stale hand-list (task_self_trap only). The "mach_reply_port is
+//              eligible" assertion MUST then fail -> proves the gate exercises the allowlist, not a
+//              tautology.
 //
 // SECURITY note: the allowlist is the trust boundary that keeps an untrusted guest from driving
-// arbitrary server calls over the ring. Only no-arg, single-uint32-port-reply traps belong here;
-// anything with a request body or pointers must stay on the audited UDS path for now.
+// arbitrary server calls over the ring. Only ops that pass the 5-rule membership canon belong here.
+//
+// perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap migrated (Tier-2 no-fiber), so they are
+// now ring-eligible -- this gate is updated to derive from the macro rather than a hand-mirror, which
+// is what made the prior "host_self_trap is NOT eligible (P3)" assertion go stale.
 
 #include <darlingserver/rpc.h>
+#include <darlingserver/rpc-supplement.h>
 
 #include <cstdint>
 #include <cstdio>
 
-// Mirror of the predicate in src/call.cpp:darRingServiceC2S(). Keep these in lockstep: if you
-// add a callnum to the allowlist there, add it here (and a GREEN assertion below).
+// Derive eligibility from the SAME macro the real code uses, so this gate can never drift from the
+// server allowlist. (The RED arm flips to the stale pre-migration hand-list to prove non-tautology.)
 static bool ringEligible(uint32_t callnum) {
 #ifdef ALLOWLIST_OLD
-	// pre-migration: task_self_trap only
+	// stale pre-migration hand-list: task_self_trap only
 	return (callnum == dserver_callnum_task_self_trap);
 #else
-	return (callnum == dserver_callnum_task_self_trap) ||
-	       (callnum == dserver_callnum_mach_reply_port);
+	bool eligible = false;
+#define DSERVER_RING_C2S_ELIGIBLE_TEST(op) || (callnum == (uint32_t)dserver_callnum_##op)
+	eligible = (false DSERVER_RING_C2S_OPCODES(DSERVER_RING_C2S_ELIGIBLE_TEST));
+#undef DSERVER_RING_C2S_ELIGIBLE_TEST
+	return eligible;
 #endif
 }
 
@@ -37,15 +46,20 @@ static int failures = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); ++failures; } } while (0)
 
 int main(void) {
-	// Both migrated ops must be eligible.
+	// Every migrated op must be eligible.
 	CHECK(ringEligible(dserver_callnum_task_self_trap), "task_self_trap is ring-eligible");
 	CHECK(ringEligible(dserver_callnum_mach_reply_port), "mach_reply_port is ring-eligible");
+	CHECK(ringEligible(dserver_callnum_mach_port_allocate), "mach_port_allocate is ring-eligible");
+	CHECK(ringEligible(dserver_callnum_mach_port_insert_right), "mach_port_insert_right is ring-eligible");
+	// perf #18 D10: the self-trap family is now fully migrated.
+	CHECK(ringEligible(dserver_callnum_thread_self_trap), "thread_self_trap is ring-eligible [D10]");
+	CHECK(ringEligible(dserver_callnum_host_self_trap), "host_self_trap is ring-eligible [D10]");
 
 	// A representative op that is NOT migrated must be rejected (stays on UDS). kprintf takes a
-	// request body, so it must NEVER be ring-eligible under the no-arg-only P3 rule.
+	// request body and is not in the macro, so it must NEVER be ring-eligible.
 	CHECK(!ringEligible(dserver_callnum_kprintf), "kprintf is NOT ring-eligible (has a body)");
-	// thread_self/host_self are caller-deallocated self ports -- not migrated in P3.
-	CHECK(!ringEligible(dserver_callnum_host_self_trap), "host_self_trap is NOT ring-eligible (P3)");
+	// destroy-capable ops stay off the simple ring (canon rules 1-2).
+	CHECK(!ringEligible(dserver_callnum_mach_port_deallocate), "mach_port_deallocate is NOT ring-eligible (destroy-capable)");
 
 	if (failures == 0) {
 		printf("ring allowlist gate: all checks passed (%s)\n",

@@ -450,6 +450,8 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // separately-proven set. Never conflate the two.
 #define DSERVER_RING_C2S_OPCODES(X) \
 	X(task_self_trap) \
+	X(thread_self_trap) \
+	X(host_self_trap) \
 	X(mach_reply_port) \
 	X(mach_port_allocate) \
 	X(mach_port_insert_right)
@@ -497,6 +499,14 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 #define DSERVER_RING_OP_CLASS(X) \
 	/* Lane 1 + Tier 2 (no-fiber): pure mint, never blocks, never an S2C. */ \
 	X(task_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
+	/* perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap join the pure-mint family. They */ \
+	/* have a BYTE-IDENTICAL shape to task_self_trap (empty request, single uint32 port_name reply; */ \
+	/* generate-rpc-wrappers.py:305-315) and the same processCall structure (dtape_*_self_trap mint + */ \
+	/* _sendReply, call.cpp:617-625) -- pure mint via current_task()/current's space, never blocks, */ \
+	/* never an S2C, never destroys. Chosen by the D9 heatmap (dar-1il.4) as the next migration: 100% */ \
+	/* UDS today, caller_s2c=0, ~12% of workload RPC. Tier-2 no-fiber-safe exactly like task_self_trap. */ \
+	X(thread_self_trap,       DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
+	X(host_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
 	X(mach_reply_port,        DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
 	/* Lane 1 Tier 1 (generic fiber): create/ref bookkeeping, no teardown, no caller S2C. */ \
 	X(mach_port_allocate,     DSERVER_RING_CLASS_SIMPLE_C2S) \
