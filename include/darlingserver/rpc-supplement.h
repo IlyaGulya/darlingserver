@@ -173,13 +173,29 @@ typedef struct dserver_kqchan_reply_proc_read {
 // abi_version at attach (clean all-UDS fallback) -- a v3 server never misreads the duplex words, and
 // the duplex datapath only activates when BOTH sides are v4 AND the caps bit is set. The Lane-1 c2s/
 // s2c RINGS are byte-identical; the mailbox lives in the fixed control block on its own cache lines.
-#define DSERVER_RING_ABI_VERSION 4u
+// ABI v5 (perf #18 P8 D4, dar-1il.3.2.1): the duplex mailbox grew a TYPED PAYLOAD so a REAL S2C upcall
+// (the vm-munmap that mach_port_deallocate of a mapped-region-backed port drives) can ride the lane,
+// not just the synthetic single-uint32 echo. The upcall slot gained an address+length u64 pair and the
+// reply slot a second int (return_value + errno) -- enough to carry dserver_s2c_call_munmap_t /
+// dserver_s2c_reply_munmap_t losslessly. v4<->v5 rejects on abi_version at attach (clean all-UDS). The
+// echo selftest still works (it uses duplex_upcall_arg / duplex_reply_arg, unchanged). Lane-1 rings stay
+// byte-identical; the new words live in the mailbox cache lines.
+#define DSERVER_RING_ABI_VERSION 5u
 
 // perf #18 P8 D1/D2: duplex capability bits, advertised by the guest in cb.duplex_caps and confirmed
 // by the server. The minimal prototype advertises exactly DUPLEX_SELFTEST: it can pump ONE synthetic
 // S2C upcall to a ring-parked caller and reply. NO real op rides the duplex lane yet (no deallocate,
 // no mod_refs). A server that doesn't recognize a cap bit simply doesn't use that duplex path.
 #define DSERVER_RING_DUPLEX_CAP_SELFTEST 0x1u
+// perf #18 P8 D4 (dar-1il.3.2.1): the guest advertises this cap iff it can pump the vm-munmap S2C upcall
+// shape AND its routing layer is allowed to send mach_port_deallocate over the duplex lane (gated behind
+// a per-command hatch, default OFF -- see __dserver_ring_dealloc_via_duplex_enabled). The server's
+// _s2cPerform duplex variant for the munmap upcall requires this bit; without it, a deallocate that
+// drives a munmap S2C takes the UDS S2C path unchanged. Negotiated like SELFTEST: guest-written into
+// duplex_caps at attach, the server reads it under the conjunction guard. (No silent drop: if the guest
+// routed a deallocate onto the duplex lane it MUST have set this cap; the server services or the parent
+// op fails closed + the guest UDS-falls-back the NEXT call at the routing layer.)
+#define DSERVER_RING_DUPLEX_CAP_DEALLOCATE 0x2u
 
 // perf #18 P8 D1/D2: the synthetic duplex parent op. A guest selftest publishes a c2s slot with this
 // reserved callnum sentinel (NOT a real dserver_callnum_*, deliberately out of the generated enum's
@@ -191,6 +207,20 @@ typedef struct dserver_kqchan_reply_proc_read {
 // exactly one supported upcall shape (a no-side-effect echo: guest returns the payload transformed),
 // so the "upcall shape supported" precondition is a single equality check.
 #define DSERVER_RING_DUPLEX_UPCALL_ECHO 0x1u
+// perf #18 P8 D4 (dar-1il.3.2.1): the REAL vm-munmap S2C upcall shape. Carried in the typed mailbox
+// payload (duplex_upcall_addr + duplex_upcall_len out; duplex_reply_status as the kernel return_value /
+// duplex_reply_errno as the errno back). This is the S2C that mach_port_deallocate of a mapped-region-
+// backed port drives; the guest pump runs the SAME munmap(2) the UDS recvmsg S2C path runs, so the side
+// effect is byte-identical to UDS -- only the transport differs.
+#define DSERVER_RING_DUPLEX_UPCALL_MUNMAP 0x2u
+
+// perf #18 P8 D4 (dar-1il.3.2.1): a reserved reply-header `code` the server uses to tell the guest it
+// DECLINED a duplex-routed op BEFORE dispatching it (pre-mutation: no v5 ring / no DEALLOCATE cap /
+// mailbox busy / unsupported shape). The guest treats this as "transport miss -> UDS-fall-back", NOT as
+// a kern_return_t. It is deliberately a large negative value that no Mach kern_return_t takes (those are
+// small non-negative codes or err_mach_ipc-range values), so it can never be confused with a real
+// result. The decline is ALWAYS pre-mutation, so the UDS fall-back re-runs the op exactly once.
+#define DSERVER_RING_DUPLEX_DECLINE ((int32_t)0x7ADEC11E)
 
 // perf #18 P4 wake model: the server publishes its current sleep state into server_state so a
 // producing guest can SKIP the eventfd doorbell when the server is actively polling (it will
@@ -626,12 +656,19 @@ typedef struct dserver_ring_shm {
 	uint32_t duplex_upcall_parent;                      // parent_id this upcall belongs to (correlation)
 	uint32_t duplex_upcall_id;                          // unique upcall id (correlation)
 	uint32_t duplex_upcall_arg;                         // single inline arg for the minimal echo shape
+	// perf #18 P8 D4: typed payload for a REAL S2C upcall (the munmap shape). For ECHO these are unused.
+	// For MUNMAP: duplex_upcall_addr = address, duplex_upcall_len = length (the munmap(2) args).
+	uint64_t duplex_upcall_addr;                        // munmap address (DSERVER_RING_DUPLEX_UPCALL_MUNMAP)
+	uint64_t duplex_upcall_len;                         // munmap length  (DSERVER_RING_DUPLEX_UPCALL_MUNMAP)
 	// C2S upcall reply mailbox (guest -> server). Guest writes body then release-stores reply_ready=1.
 	DSERVER_RING_ALIGN64 uint32_t duplex_reply_ready;   // 1 == an upcall reply is published (guest->server)
 	uint32_t duplex_reply_parent;                       // echoes the upcall's parent_id (server checks)
 	uint32_t duplex_reply_id;                           // echoes the upcall's upcall_id (server checks)
-	int32_t  duplex_reply_status;                       // guest's upcall result (0 == ok)
-	uint32_t duplex_reply_arg;                          // the echo result the guest computed
+	int32_t  duplex_reply_status;                       // guest's upcall result (0 == ok). For MUNMAP this is
+	                                                    //   the munmap return_value (0 ok / -1 error).
+	uint32_t duplex_reply_arg;                          // the echo result the guest computed (ECHO shape)
+	// perf #18 P8 D4: the errno from a real S2C upcall (MUNMAP). For ECHO this is unused (0).
+	int32_t  duplex_reply_errno;                        // munmap errno_result (0 on success)
 } dserver_ring_shm_t;
 
 // --- P4 wake-model decision predicates (shared by guest, server, and the host gate) ----------
@@ -682,6 +719,20 @@ static inline void dserver_ring_duplex_publish_upcall(
 	__atomic_store_n(&cb->duplex_upcall_ready, 1u, __ATOMIC_RELEASE); // publish (linearization point)
 }
 
+// perf #18 P8 D4: server publishes a REAL munmap S2C upcall. Same linearization discipline as the echo
+// publish (body first, ready release-stored LAST), but carries the typed addr/len payload. The op field
+// tells the guest pump to run munmap(addr,len) instead of the echo transform.
+static inline void dserver_ring_duplex_publish_munmap_upcall(
+	dserver_ring_shm_t* cb, uint32_t parent_id, uint32_t upcall_id, uint64_t address, uint64_t length) {
+	cb->duplex_upcall_op     = DSERVER_RING_DUPLEX_UPCALL_MUNMAP;
+	cb->duplex_upcall_parent = parent_id;
+	cb->duplex_upcall_id     = upcall_id;
+	cb->duplex_upcall_arg    = 0;
+	cb->duplex_upcall_addr   = address;
+	cb->duplex_upcall_len    = length;
+	__atomic_store_n(&cb->duplex_upcall_ready, 1u, __ATOMIC_RELEASE); // publish (linearization point)
+}
+
 // Guest pump: is an S2C upcall available? (acquire so the body is visible once ready is seen)
 static inline int dserver_ring_duplex_upcall_available(const dserver_ring_shm_t* cb) {
 	return __atomic_load_n(&cb->duplex_upcall_ready, __ATOMIC_ACQUIRE) != 0u;
@@ -697,6 +748,20 @@ static inline void dserver_ring_duplex_publish_reply(
 	cb->duplex_reply_arg    = result_arg;
 	// consume the upcall slot (we've handled it) BEFORE advertising the reply, so the server never
 	// sees reply_ready while upcall_ready is still set.
+	__atomic_store_n(&cb->duplex_upcall_ready, 0u, __ATOMIC_RELEASE);
+	__atomic_store_n(&cb->duplex_reply_ready, 1u, __ATOMIC_RELEASE); // publish reply (linearization point)
+}
+
+// perf #18 P8 D4: guest publishes a REAL munmap upcall reply (carries the kernel return_value as status
+// and the errno). Same ordering as the echo reply: body first, consume the upcall, then release-store
+// reply_ready LAST. return_value 0 == success; on error return_value == -1 and errno_result == -errno.
+static inline void dserver_ring_duplex_publish_munmap_reply(
+	dserver_ring_shm_t* cb, uint32_t parent_id, uint32_t upcall_id, int32_t return_value, int32_t errno_result) {
+	cb->duplex_reply_parent = parent_id;
+	cb->duplex_reply_id     = upcall_id;
+	cb->duplex_reply_status = return_value;
+	cb->duplex_reply_arg    = 0;
+	cb->duplex_reply_errno  = errno_result;
 	__atomic_store_n(&cb->duplex_upcall_ready, 0u, __ATOMIC_RELEASE);
 	__atomic_store_n(&cb->duplex_reply_ready, 1u, __ATOMIC_RELEASE); // publish reply (linearization point)
 }

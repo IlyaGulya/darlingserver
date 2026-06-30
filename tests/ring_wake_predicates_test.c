@@ -46,7 +46,7 @@ int main(void) {
 	// futex words (false-sharing them would silently reintroduce contention).
 	CHECK((char*)&cb.server_state - (char*)&cb.s2c_futex >= 64,  "server_state on its own cache line vs s2c_futex");
 	CHECK((char*)&cb.s2c_waiters - (char*)&cb.server_state >= 64, "s2c_waiters on its own cache line vs server_state");
-	CHECK(DSERVER_RING_ABI_VERSION == 4u, "ABI version is 4 (v2 wake words + v3 c2s_opcode_hash + v4 duplex mailbox, P8 D1/D2)");
+	CHECK(DSERVER_RING_ABI_VERSION == 5u, "ABI version is 5 (v4 duplex mailbox + v5 typed munmap payload, P8 D4)");
 
 	// --- guest conditional doorbell ----------------------------------------------------------
 	// Server actively polling -> the hot path -> guest must NOT doorbell.

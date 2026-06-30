@@ -168,6 +168,16 @@ namespace DarlingServer {
 		uint32_t _duplexReplyArg = 0;           // the guest's echo result
 		uint32_t _duplexSentinelSeq = 0;        // != 0: in-flight upcall is a synthetic sentinel parent;
 		                                        // its ring request seq (the drain publishes the final reply)
+		// --- perf #18 P8 D4 (dar-1il.3.2.1): REAL-op duplex parent state ----------------------------
+		// Set by ringServiceThread when it dispatches a duplex-eligible REAL op (mach_port_deallocate from
+		// a DUPLEX_CAP_DEALLOCATE-capable caller) onto the fiber: it marks that this thread's CURRENT call
+		// is a duplex parent, so _s2cPerform routes its S2C upcall (the munmap) through the duplex MAILBOX
+		// (publish + park the fiber on _s2cReplySempahore) instead of the UDS S2C send -- and so
+		// _drainDuplexReply, on harvesting the correlated munmap reply, synthesizes the _s2cReply Message +
+		// ups _s2cReplySempahore (the REAL fiber resume, vs the sentinel's publish-final-reply state
+		// machine). Cleared when the call finishes. Distinct from _duplexSentinelSeq (synthetic, no fiber).
+		bool     _ringDuplexParentActive = false; // this thread's current ring call is a duplex parent (real op)
+		uint32_t _duplexRealUpcallNum = 0;         // the in-flight real S2C upcall's dserver_s2c_msgnum_* (0 == none)
 		// Monotonic per-thread allocator for (parent_id, upcall_id) so a stale reply from a prior
 		// upcall can never be mistaken for the current one (pitfall #2 ABA). Starts at 1 (0 == "none").
 		uint32_t _duplexNextId = 1;
@@ -181,6 +191,12 @@ namespace DarlingServer {
 		// declined (caller proceeds with the verbatim UDS path). MUST hold _rwlock on entry; may
 		// unlock/relock internally exactly like the UDS branch.
 		bool _s2cTryDuplexLocked(uint32_t upcallOp, uint32_t arg, std::unique_lock<std::shared_mutex>& lock);
+		// perf #18 P8 D4: publish a REAL munmap S2C upcall into the duplex mailbox for a duplex-parent
+		// call. Same conjunction guard as _s2cTryDuplexLocked but for the MUNMAP shape + the typed
+		// addr/len payload, and it requires DUPLEX_CAP_DEALLOCATE. Returns true if the upcall is in
+		// flight (the caller then parks the fiber on _s2cReplySempahore exactly like the UDS S2C path);
+		// false if the guard declines (the caller MUST take the verbatim UDS S2C path). Hold _rwlock.
+		bool _s2cTryDuplexMunmapLocked(uint32_t s2cNumber, uint64_t address, uint64_t length, std::unique_lock<std::shared_mutex>& lock);
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6: scratch for the TSC cycles publishReply consumed during this call's
 		// doWork(), so ringServiceThread can subtract them from the body window. One-shot.
@@ -406,6 +422,16 @@ namespace DarlingServer {
 		// Called from the main-loop ring drain for every ring thread. Returns true if it harvested a
 		// reply (woke the parked fiber). No-op (returns false) when nothing is in flight.
 		bool drainDuplexReply();
+
+		// perf #18 P8 D4 (dar-1il.3.2.1): mark/unmark this thread's CURRENT ring call as a duplex parent
+		// (a real op -- mach_port_deallocate from a duplex-deallocate-capable caller). When set,
+		// _s2cPerform routes its munmap S2C through the duplex mailbox (publish + fiber-park) and the
+		// main-loop drain resumes the fiber. Set just before dispatching the op on the fiber, cleared
+		// after doWork() returns. A no-op gate when the caller isn't duplex-deallocate-capable.
+		void setRingDuplexParentActive(bool active);
+		// True iff a duplex-deallocate-capable caller's ring is attached to this thread (the routing
+		// precondition ringServiceThread checks before treating a deallocate as a duplex parent).
+		bool duplexDeallocateCapable() const;
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6: read + clear the publish-phase TSC cycles recorded during the last reply.
 		uint64_t takeRingPublishCycles();

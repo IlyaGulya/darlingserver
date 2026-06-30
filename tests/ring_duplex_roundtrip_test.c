@@ -245,6 +245,44 @@ int main(void) {
 		      "wrong upcall_id: server did NOT publish a final reply (no resume on bad correlation)");
 	}
 
+	// --- 4. perf #18 P8 D4: the REAL munmap-shape mailbox payload carries losslessly --------------
+	// The deallocate-via-duplex S2C is a munmap upcall: the server publishes (op=MUNMAP, addr, len) and
+	// the guest replies (return_value, errno). Prove the v5 typed payload words roundtrip exactly through
+	// the publish/observe/consume helpers (pure, no thread needed -- the threaded path is identical to
+	// the echo case proven above; this pins the TYPED words the echo path doesn't touch).
+	{
+		dserver_ring_shm_t cb;
+		memset(&cb, 0, sizeof(cb));
+		uint64_t addr = 0x00007f1122330000ull;
+		uint64_t len  = 0x0000000000004000ull; // 16 KiB
+		dserver_ring_duplex_publish_munmap_upcall(&cb, /*parent*/42u, /*upcall*/43u, addr, len);
+		CHECK(dserver_ring_duplex_upcall_available(&cb), "munmap upcall published + visible");
+		CHECK(cb.duplex_upcall_op == DSERVER_RING_DUPLEX_UPCALL_MUNMAP, "munmap upcall op is MUNMAP");
+		CHECK(cb.duplex_upcall_addr == addr && cb.duplex_upcall_len == len,
+		      "munmap upcall addr+len carry losslessly");
+		// guest replies with the munmap result (success: return_value 0, errno 0).
+		dserver_ring_duplex_publish_munmap_reply(&cb, 42u, 43u, /*return_value*/0, /*errno*/0);
+		int mismatch = 0;
+		CHECK(dserver_ring_duplex_reply_ready(&cb, 42u, 43u, &mismatch) && !mismatch,
+		      "munmap reply correlated + accepted");
+		CHECK(cb.duplex_reply_status == 0 && cb.duplex_reply_errno == 0,
+		      "munmap reply return_value+errno carry (success)");
+		dserver_ring_duplex_consume_reply(&cb);
+		// error case: return_value -1 + errno carry too.
+		dserver_ring_duplex_publish_munmap_upcall(&cb, 44u, 45u, addr, len);
+		dserver_ring_duplex_publish_munmap_reply(&cb, 44u, 45u, /*return_value*/-1, /*errno*/22 /*EINVAL*/);
+		CHECK(dserver_ring_duplex_reply_ready(&cb, 44u, 45u, &mismatch) && !mismatch,
+		      "munmap error reply correlated + accepted");
+		CHECK(cb.duplex_reply_status == -1 && cb.duplex_reply_errno == 22,
+		      "munmap reply return_value+errno carry (error: -1/EINVAL)");
+		// mis-correlated munmap reply is still rejected (correlation is shape-agnostic).
+		dserver_ring_duplex_consume_reply(&cb);
+		dserver_ring_duplex_publish_munmap_upcall(&cb, 46u, 47u, addr, len);
+		dserver_ring_duplex_publish_munmap_reply(&cb, 46u, 0xBADu, 0, 0);
+		CHECK(!dserver_ring_duplex_reply_ready(&cb, 46u, 47u, &mismatch) && mismatch,
+		      "munmap reply with wrong upcall_id is REJECTED");
+	}
+
 	if (failures) {
 		fprintf(stderr, "\nring_duplex_roundtrip_test: %d FAILURE(S)\n", failures);
 		return 1;
