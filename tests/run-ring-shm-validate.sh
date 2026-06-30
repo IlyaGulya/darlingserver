@@ -631,4 +631,44 @@ else
 	echo
 fi
 
+# --- perf #18 D17 (dar-1il.12): POST-D16 residual-UDS classifier gate. Links metrics.cpp. Pins the
+#     A-vs-B/D classification: an eligible UDS call on a thread with NO ring is reason A (first-before-
+#     lane); on a thread that HAS a live ring it is the B/D signal (thread_has_ring + uds_despite_lane).
+#     RED arms break the disarmed-noop and the A/B separation rules. ---
+RCSRC="$HERE/residual_census_gate_test.cpp"
+RCIMPL="$HERE/../src/metrics.cpp"
+if [ -z "$GEN_RPC" ] || [ -z "$ININC" ] || [ ! -f "$RCSRC" ] || [ ! -f "$RCIMPL" ]; then
+	echo "== residual-census gate SKIPPED (generated rpc.h / internal-include / sources not found) =="
+	echo
+else
+	echo "== residual-census GREEN arm (reason buckets + A-vs-B/D separation) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/rc_green" "$RCSRC" "$RCIMPL" 2>/dev/null; then
+		echo "residual-census GREEN arm failed to COMPILE"; exit 2
+	fi
+	if ! "$TMP/rc_green"; then
+		echo "residual-census GREEN arm FAILED -- reason classification wrong"; exit 1
+	fi
+	echo
+	echo "== residual-census RED arm 1 (-DRED_BREAK_DISARMED_NOOP: disarmed recording must change counts, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_DISARMED_NOOP -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/rc_red1" "$RCSRC" "$RCIMPL" 2>/dev/null; then
+		echo "residual-census RED arm 1 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/rc_red1" >/dev/null 2>&1; then
+		echo "residual-census RED arm 1 PASSED but must FAIL -- default-OFF no-op invariant not exercised"; exit 1
+	fi
+	echo "  residual-census RED arm 1 correctly failed."
+	echo
+	echo "== residual-census RED arm 2 (-DRED_BREAK_AB_SEPARATION: B/D call counted as reason A, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_AB_SEPARATION -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/rc_red2" "$RCSRC" "$RCIMPL" 2>/dev/null; then
+		echo "residual-census RED arm 2 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/rc_red2" >/dev/null 2>&1; then
+		echo "residual-census RED arm 2 PASSED but must FAIL -- A-vs-B/D separation not exercised"; exit 1
+	fi
+	echo "  residual-census RED arm 2 correctly failed."
+	echo
+	echo "residual-census gate: RED->GREEN OK"
+	echo
+fi
+
 echo "all perf#18 ring gates: OK"
