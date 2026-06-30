@@ -466,7 +466,16 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 	X(set_thread_handles) \
 	X(started_suspended) \
 	X(get_tracer) \
-	X(task_is_64_bit)
+	X(task_is_64_bit) \
+	/* perf #18 D13 (dar-1il.8): Lane-1.5 "string/path" ops -- but NOT variable-payload. The path */ \
+	/* bytes travel out-of-band via the server's process_vm_readv/writev on the guest's /proc/mem */ \
+	/* (writeMemory/readMemory), so the RPC body is FIXED+tiny ({u64 buffer, u64 buffer_size} = 16B */ \
+	/* request; {u64 length} or header-only reply) -- byte-identical shape class to the D11 batch, */ \
+	/* NO arena needed. /proc/mem access is NOT a caller-S2C (the parked guest doesn't participate), */ \
+	/* the ops are pure reads of server config written into the guest (no destroy) -> all 5 canon */ \
+	/* rules hold. set_executable_path is deliberately NOT here (pre-attach mldr-only + NO_REPLY). */ \
+	X(mldr_path) \
+	X(vchroot_path)
 
 // === perf #18 Phase A (dar-dar6x4-perf-5dq.30.1): THREE-LANE hybrid IPC taxonomy + guardrail ======
 //
@@ -532,6 +541,11 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 	X(started_suspended,      DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(get_tracer,             DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(task_is_64_bit,         DSERVER_RING_CLASS_SIMPLE_C2S) \
+	/* perf #18 D13 (dar-1il.8): path ops -- SIMPLE_C2S Tier-1 (generic fiber). Fixed 16B request / */ \
+	/* 8B-or-header reply; the path itself rides /proc/mem (process_vm_readv/writev), not the payload, */ \
+	/* so no arena and no caller-S2C. Pure read of server config -> not destroy-capable. */ \
+	X(mldr_path,              DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(vchroot_path,           DSERVER_RING_CLASS_SIMPLE_C2S) \
 	/* UDS-only today: destroy-capable -> caller-S2C deadlock on the simple ring. The right home is */ \
 	/* the future duplex lane (dar-1il.3) -- "wrong lane, not bad op". They are DuplexRingEligible */ \
 	/* CANDIDATES but NOT yet proven, so they carry UDS_ONLY until Phase D/E lands. */ \
