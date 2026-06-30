@@ -339,6 +339,42 @@ if [ -f "$DXSRC" ] && [ -n "$GEN_RPC" ]; then
 	echo "ring_duplex_wake gate: RED->GREEN OK"
 	echo
 
+	# --- Phase D4 (P8, dar-1il.3.2.1): the DEALLOCATE-via-duplex shape gate. Adds the two properties
+	#     SPECIFIC to migrating a real DESTROY-CAPABLE op: (4) the destroy side effect is applied EXACTLY
+	#     ONCE -- no partial-mutation-then-UDS double-effect; (5) a dropped/lost upcall reply FAILS CLOSED
+	#     + BOUNDED -- never a fabricated success, never a wedge. GREEN before any real wiring. ---
+	DDSRC="$HERE/ring_duplex_dealloc_gate_test.c"
+	if [ -f "$DDSRC" ]; then
+		echo "== duplex-dealloc GREEN arm (once-only + fail-closed-bounded) =="
+		if ! "$CC" -std=c11 -I"$GEN_RPC" -I"$INC" -o "$TMP/dd_green" "$DDSRC" 2>/dev/null; then
+			echo "duplex-dealloc GREEN arm failed to COMPILE"; exit 2
+		fi
+		if ! "$TMP/dd_green"; then
+			echo "duplex-dealloc GREEN arm FAILED -- deallocate-via-duplex is not once-only/fail-closed"; exit 1
+		fi
+		echo
+		echo "== duplex-dealloc RED arm A (-DDUPLEX_PARTIAL_THEN_UDS: mutate then UDS re-run, MUST fail) =="
+		if ! "$CC" -std=c11 -DDUPLEX_PARTIAL_THEN_UDS -I"$GEN_RPC" -I"$INC" -o "$TMP/dd_redA" "$DDSRC" 2>/dev/null; then
+			echo "duplex-dealloc RED arm A failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/dd_redA" >/dev/null 2>&1; then
+			echo "duplex-dealloc RED arm A PASSED but must FAIL -- gate not exercising the double-effect guard"; exit 1
+		fi
+		echo "  duplex-dealloc RED arm A correctly failed."
+		echo
+		echo "== duplex-dealloc RED arm B (-DDUPLEX_FABRICATE_ON_DROP: fake success on dropped reply, MUST fail) =="
+		if ! "$CC" -std=c11 -DDUPLEX_FABRICATE_ON_DROP -I"$GEN_RPC" -I"$INC" -o "$TMP/dd_redB" "$DDSRC" 2>/dev/null; then
+			echo "duplex-dealloc RED arm B failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/dd_redB" >/dev/null 2>&1; then
+			echo "duplex-dealloc RED arm B PASSED but must FAIL -- gate not exercising the fail-closed guard"; exit 1
+		fi
+		echo "  duplex-dealloc RED arm B correctly failed."
+		echo
+		echo "ring_duplex_dealloc gate: RED->GREEN OK"
+		echo
+	fi
+
 	# --- P8 D1/D2 (dar-1il.3.1): LIVE synthetic duplex roundtrip over the REAL mailbox helpers.
 	#     Two real threads (server publishes upcall + scope-waits; guest pumps + replies) on a real
 	#     mailbox. Proves the transport (not just the model): roundtrip completes, caller-thread
