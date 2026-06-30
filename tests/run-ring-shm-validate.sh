@@ -295,4 +295,49 @@ echo
 echo "ring_wake_race gate: RED->GREEN OK"
 echo
 
+# --- Phase C/D (P8, dar-1il.3 / .3.1): DUPLEX-lane wake-model gate. The hard gate the duplex lane
+#     is built on -- pure logic, hermetic. GREEN: the duplex wake model is lost-wake-free (guest park
+#     watches the S2C-upcall stream; server park watches the upcall-reply stream) + correlation-safe.
+#     RED arms break each mechanism so the binary exits nonzero. Needs rpc.h (callnum hash). ---
+DXSRC="$HERE/ring_duplex_wake_gate_test.c"
+if [ -f "$DXSRC" ] && [ -n "$GEN_RPC" ]; then
+	echo "== duplex-wake GREEN arm (lost-wake-free + correlation-safe) =="
+	if ! "$CC" -std=c11 -I"$GEN_RPC" -I"$INC" -o "$TMP/dx_green" "$DXSRC" 2>/dev/null; then
+		echo "duplex-wake GREEN arm failed to COMPILE"; exit 2
+	fi
+	if ! "$TMP/dx_green"; then
+		echo "duplex-wake GREEN arm FAILED -- the duplex wake model is not lost-wake-free"; exit 1
+	fi
+	echo
+	echo "== duplex-wake RED arm A (-DDUPLEX_NO_GUEST_PUMP: pump drains one not all, MUST fail) =="
+	if ! "$CC" -std=c11 -DDUPLEX_NO_GUEST_PUMP -I"$GEN_RPC" -I"$INC" -o "$TMP/dx_redA" "$DXSRC" 2>/dev/null; then
+		echo "duplex-wake RED arm A failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/dx_redA" >/dev/null 2>&1; then
+		echo "duplex-wake RED arm A PASSED but must FAIL -- gate not exercising the drain-all pump"; exit 1
+	fi
+	echo "  duplex-wake RED arm A correctly failed."
+	echo
+	echo "== duplex-wake RED arm B (-DDUPLEX_WAITERBIT_AFTER_RECHECK: bit set too late, MUST fail) =="
+	if ! "$CC" -std=c11 -DDUPLEX_WAITERBIT_AFTER_RECHECK -I"$GEN_RPC" -I"$INC" -o "$TMP/dx_redB" "$DXSRC" 2>/dev/null; then
+		echo "duplex-wake RED arm B failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/dx_redB" >/dev/null 2>&1; then
+		echo "duplex-wake RED arm B PASSED but must FAIL -- gate not exercising the waiter-bit ordering"; exit 1
+	fi
+	echo "  duplex-wake RED arm B correctly failed."
+	echo
+	echo "== duplex-wake RED arm C (-DDUPLEX_WRONG_CORRELATION: accepts mismatched id, MUST fail) =="
+	if ! "$CC" -std=c11 -DDUPLEX_WRONG_CORRELATION -I"$GEN_RPC" -I"$INC" -o "$TMP/dx_redC" "$DXSRC" 2>/dev/null; then
+		echo "duplex-wake RED arm C failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/dx_redC" >/dev/null 2>&1; then
+		echo "duplex-wake RED arm C PASSED but must FAIL -- gate not exercising correlation"; exit 1
+	fi
+	echo "  duplex-wake RED arm C correctly failed."
+	echo
+	echo "ring_duplex_wake gate: RED->GREEN OK"
+	echo
+fi
+
 echo "all perf#18 ring gates: OK"
