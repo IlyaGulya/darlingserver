@@ -454,7 +454,19 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 	X(host_self_trap) \
 	X(mach_reply_port) \
 	X(mach_port_allocate) \
-	X(mach_port_insert_right)
+	X(mach_port_insert_right) \
+	/* perf #18 D11 (dar-1il.6): bulk closed-fast Lane-1 batch, generic-fiber Tier-1 (NOT no-fiber). */ \
+	/* Each is a CLOSED request->single-reply transaction with a FIXED inline request body and a FIXED */ \
+	/* inline reply body (or header-only), no fd-passing, no caller-S2C, no destroy -- it passes all 5 */ \
+	/* canon rules. The reply body (uidgid's old_uid/old_gid; started_suspended's bool; etc.) travels */ \
+	/* over the ring verbatim via _publishReplyToRingLocked (everything after the reply hdr), so the */ \
+	/* server needs NO per-op code: the generic eligible-op path rebuilds {callhdr,body}, dispatches via */ \
+	/* callFromMessage -> doWork (the same dtape primitive as UDS), and the reply rides the ring. */ \
+	X(uidgid) \
+	X(set_thread_handles) \
+	X(started_suspended) \
+	X(get_tracer) \
+	X(task_is_64_bit)
 
 // === perf #18 Phase A (dar-dar6x4-perf-5dq.30.1): THREE-LANE hybrid IPC taxonomy + guardrail ======
 //
@@ -511,6 +523,15 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 	/* Lane 1 Tier 1 (generic fiber): create/ref bookkeeping, no teardown, no caller S2C. */ \
 	X(mach_port_allocate,     DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(mach_port_insert_right, DSERVER_RING_CLASS_SIMPLE_C2S) \
+	/* perf #18 D11 (dar-1il.6): bulk closed-fast Lane-1 batch -- SIMPLE_C2S ONLY (Tier-1 generic fiber, */ \
+	/* NOT NoFiberFast). These read/mutate process or thread state (creds, pthread handles, suspend/tracer */ \
+	/* flags, 64-bitness) via the generic Call path, NOT pure mint, so they are NOT no-fiber-safe like the */ \
+	/* self-trap family -- they stay Tier 1. None is destroy-capable or caller-S2C, so the canon holds. */ \
+	X(uidgid,                 DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(set_thread_handles,     DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(started_suspended,      DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(get_tracer,             DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(task_is_64_bit,         DSERVER_RING_CLASS_SIMPLE_C2S) \
 	/* UDS-only today: destroy-capable -> caller-S2C deadlock on the simple ring. The right home is */ \
 	/* the future duplex lane (dar-1il.3) -- "wrong lane, not bad op". They are DuplexRingEligible */ \
 	/* CANDIDATES but NOT yet proven, so they carry UDS_ONLY until Phase D/E lands. */ \
