@@ -338,6 +338,34 @@ if [ -f "$DXSRC" ] && [ -n "$GEN_RPC" ]; then
 	echo
 	echo "ring_duplex_wake gate: RED->GREEN OK"
 	echo
+
+	# --- P8 D1/D2 (dar-1il.3.1): LIVE synthetic duplex roundtrip over the REAL mailbox helpers.
+	#     Two real threads (server publishes upcall + scope-waits; guest pumps + replies) on a real
+	#     mailbox. Proves the transport (not just the model): roundtrip completes, caller-thread
+	#     context, mismatch rejected. RED -DDUPLEX_RT_IGNORE_CORRELATION drops the correlation check
+	#     -> the mismatch case is wrongly accepted -> nonzero. ---
+	RTSRC="$HERE/ring_duplex_roundtrip_test.c"
+	if [ -f "$RTSRC" ]; then
+		echo "== duplex-roundtrip GREEN arm (live synthetic S2C roundtrip) =="
+		if ! "$CC" -std=c11 -D_GNU_SOURCE -pthread -O2 -I"$GEN_RPC" -I"$INC" -o "$TMP/rt_green" "$RTSRC" 2>/dev/null; then
+			echo "duplex-roundtrip GREEN arm failed to COMPILE"; exit 2
+		fi
+		if ! "$TMP/rt_green"; then
+			echo "duplex-roundtrip GREEN arm FAILED -- the live duplex transport does not complete"; exit 1
+		fi
+		echo
+		echo "== duplex-roundtrip RED arm (-DDUPLEX_RT_IGNORE_CORRELATION: accepts mismatched id, MUST fail) =="
+		if ! "$CC" -std=c11 -D_GNU_SOURCE -pthread -O2 -DDUPLEX_RT_IGNORE_CORRELATION -I"$GEN_RPC" -I"$INC" -o "$TMP/rt_red" "$RTSRC" 2>/dev/null; then
+			echo "duplex-roundtrip RED arm failed to COMPILE -- gate broken"; exit 2
+		fi
+		if "$TMP/rt_red" >/dev/null 2>&1; then
+			echo "duplex-roundtrip RED arm PASSED but must FAIL -- gate not exercising correlation"; exit 1
+		fi
+		echo "  duplex-roundtrip RED arm correctly failed."
+		echo
+		echo "ring_duplex_roundtrip gate: RED->GREEN OK"
+		echo
+	fi
 fi
 
 echo "all perf#18 ring gates: OK"
