@@ -177,7 +177,17 @@ namespace DarlingServer {
 		// ups _s2cReplySempahore (the REAL fiber resume, vs the sentinel's publish-final-reply state
 		// machine). Cleared when the call finishes. Distinct from _duplexSentinelSeq (synthetic, no fiber).
 		bool     _ringDuplexParentActive = false; // this thread's current ring call is a duplex parent (real op)
+		// perf #18 P8 D5 (dar-1il.3.2.2) boot-scoped proof: the current duplex parent is a vm_deallocate
+		// proof op (drives the vmdealloc-specific counters); and a sticky flag recording whether its real
+		// caller-S2C actually fired (read+cleared by the auto-disarm after the dispatch).
+		bool     _ringDuplexVmdeallocProof = false;
+		bool     _ringDuplexVmdeallocS2cFired = false;
 		uint32_t _duplexRealUpcallNum = 0;         // the in-flight real S2C upcall's dserver_s2c_msgnum_* (0 == none)
+		// perf #18 P8 D6 (caller-S2C sideband): CLOCK_MONOTONIC ns deadline for the in-flight duplex upcall.
+		// Set when an upcall is published; the main-loop drain fails it closed (synthesize FAILED reply +
+		// resume fiber + count timeout + clear + disarm) if no correlated reply arrives by the deadline.
+		// Only read when an upcall is actually in flight (off the hot path). 0 == no deadline armed.
+		uint64_t _duplexUpcallDeadlineNs = 0;
 		// Monotonic per-thread allocator for (parent_id, upcall_id) so a stale reply from a prior
 		// upcall can never be mistaken for the current one (pitfall #2 ABA). Starts at 1 (0 == "none").
 		uint32_t _duplexNextId = 1;
@@ -432,6 +442,17 @@ namespace DarlingServer {
 		// True iff a duplex-deallocate-capable caller's ring is attached to this thread (the routing
 		// precondition ringServiceThread checks before treating a deallocate as a duplex parent).
 		bool duplexDeallocateCapable() const;
+		// perf #18 P8 D5 (dar-1il.3.2.2): True iff a vm_deallocate-capable caller's ring is attached
+		// (the per-op routing precondition for treating a vm_deallocate as a duplex parent). Keyed on
+		// the specific VM_DEALLOCATE cap bit, distinct from the D4 deallocate bit.
+		bool duplexVmDeallocateCapable() const;
+		// perf #18 P8 D5 (dar-1il.3.2.2) boot-scoped proof: tag this thread's in-flight duplex parent as a
+		// vm_deallocate proof op so _drainDuplexReply bumps the vmdealloc-specific counters (and records
+		// whether a real caller-S2C fired, for the auto-disarm). Set/cleared around the proof dispatch.
+		void setRingDuplexVmdeallocProof(bool active);
+		// One-shot read+clear: did a real caller-S2C (UPCALL_MUNMAP) complete for the last vm_deallocate
+		// proof dispatch? Drives the auto-disarm (spend a budget unit only on a proven cure).
+		bool takeRingDuplexVmdeallocS2cFired();
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6: read + clear the publish-phase TSC cycles recorded during the last reply.
 		uint64_t takeRingPublishCycles();

@@ -196,6 +196,22 @@ typedef struct dserver_kqchan_reply_proc_read {
 // routed a deallocate onto the duplex lane it MUST have set this cap; the server services or the parent
 // op fails closed + the guest UDS-falls-back the NEXT call at the routing layer.)
 #define DSERVER_RING_DUPLEX_CAP_DEALLOCATE 0x2u
+// perf #18 P8 D5 (dar-1il.3.2.2): the guest advertises this cap iff its routing layer is allowed to send
+// mach_vm_deallocate over the duplex lane (gated behind a per-command hatch, default OFF -- see
+// __dserver_ring_vm_dealloc_via_duplex_enabled). vm_deallocate is the op that ACTUALLY drives a real
+// caller munmap S2C in Darling (mach_vm_deallocate -> vm_map_remove -> dtape_hook_task_free_pages ->
+// _munmap -> _s2cPerform); mach_port_deallocate (D4) does NOT, because mach_make_memory_entry_64 is a
+// stub. D5 routes vm_deallocate onto the SAME D4 duplex munmap transport (no new wire format): the munmap
+// S2C uses DSERVER_RING_DUPLEX_UPCALL_MUNMAP + the v5 typed mailbox payload unchanged. The server's
+// munmap publish guard (_s2cTryDuplexMunmapLocked) accepts EITHER the DEALLOCATE or the VM_DEALLOCATE cap
+// (both mean "this caller can pump a munmap S2C"); the per-op ROUTING decline in ringServiceThread keys on
+// THIS bit specifically so a vm_deallocate from a non-VM-capable guest declines pre-dispatch -> UDS. A new
+// forward-compatible cap bit needs no ABI bump (the v5 mailbox wire layout is unchanged); an old server
+// that doesn't know 0x4 simply never sets it, so the guest never routes vm_deallocate onto the lane.
+#define DSERVER_RING_DUPLEX_CAP_VM_DEALLOCATE 0x4u
+// Convenience: either cap means "this caller can pump a vm-munmap S2C upcall" (the shape both D4 and D5
+// deliver). The munmap publish guard requires this; the per-op routing decline requires the specific bit.
+#define DSERVER_RING_DUPLEX_CAP_MUNMAP_PUMP (DSERVER_RING_DUPLEX_CAP_DEALLOCATE | DSERVER_RING_DUPLEX_CAP_VM_DEALLOCATE)
 
 // perf #18 P8 D1/D2: the synthetic duplex parent op. A guest selftest publishes a c2s slot with this
 // reserved callnum sentinel (NOT a real dserver_callnum_*, deliberately out of the generated enum's

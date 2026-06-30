@@ -196,6 +196,33 @@ namespace DarlingServer {
 		// 0 -- the deallocate rode the lane but never needed the caller-S2C the lane exists to service.
 		std::atomic<uint64_t> ringDuplexParent {0};
 		std::atomic<uint64_t> ringDuplexDecline {0};
+		// perf #18 P8 D5/D6: the vm_deallocate-via-duplex proof harness
+		// counters (option 1, gist 3e928115). The proof is armed by a MARKER FILE (never inherited env) and
+		// AUTO-DISARMS after the first successful caller-S2C. A GREEN proof is:
+		//   s2cMunmapToCaller>=1 AND ringDuplexVmdeallocParent>=1 AND _s2c>=1 AND _final>=1 AND _timeout==0
+		//   AND boot reaches shellspawn.
+		// vmdeallocParent  = a launchd vm_deallocate was DISPATCHED onto the duplex lane (rode the lane).
+		// vmdeallocDecline = a vm_deallocate routing was DECLINED pre-dispatch (not armed / bad shape / budget 0).
+		// vmdeallocS2c     = a real UPCALL_MUNMAP for a vm_deallocate parent completed over the duplex mailbox.
+		// vmdeallocFinal   = the parent vm_deallocate op's final ring reply was published (op finished on lane).
+		// vmdeallocTimeout = a duplex munmap upcall reply was NOT harvested in the bound -> failed closed.
+		// vmdeallocDisarmed= the proof auto-disarmed (budget hit 0 after a success) -> no further routing.
+		std::atomic<uint64_t> ringDuplexVmdeallocParent {0};
+		std::atomic<uint64_t> ringDuplexVmdeallocDecline {0};
+		std::atomic<uint64_t> ringDuplexVmdeallocS2c {0};
+		std::atomic<uint64_t> ringDuplexVmdeallocFinal {0};
+		std::atomic<uint64_t> ringDuplexVmdeallocTimeout {0};
+		std::atomic<uint64_t> ringDuplexVmdeallocDisarmed {0};
+		// perf #18 P8 D6 (caller-S2C sideband) ATTRIBUTION: for every caller-S2C munmap upcall (_s2cPerform
+		// munmap to the CURRENT thread), classify the active PARENT op's lane. munmapRingParent = the caller
+		// has an active ring-originated parent (_ringReplyPending) -> the direct cure target for the duplex
+		// sideband. munmapUdsParent = an active UDS-originated call (today serviced via recvmsg = NOT a
+		// ring-deadlock, but a FUTURE hazard if that op is ring-migrated). munmapNoParent = no active managed
+		// call (pure server-internal teardown). The measured Darling boot: ALL caller-S2C munmaps go under a
+		// UDS parent (mach_msg_overwrite OOL teardown) -> the hazard is reachable but UDS-only today.
+		std::atomic<uint64_t> s2cMunmapRingParent {0};
+		std::atomic<uint64_t> s2cMunmapUdsParent {0};
+		std::atomic<uint64_t> s2cMunmapNoParent {0};
 
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in
