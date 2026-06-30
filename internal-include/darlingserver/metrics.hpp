@@ -224,6 +224,37 @@ namespace DarlingServer {
 		std::atomic<uint64_t> s2cMunmapUdsParent {0};
 		std::atomic<uint64_t> s2cMunmapNoParent {0};
 
+#endif // DSERVER_RING_TRANSPORT
+
+		// perf #18 P8 D8 (dar-1il.3.2.x): mach_msg_overwrite SHAPE CENSUS. A pure measurement to
+		// answer "what fraction of the ~19% msg_overwrite hotness is actually reclaimable by a ring
+		// migration?" -- NOT a behavior change and NOT gated on DSERVER_RING_TRANSPORT (msg_overwrite
+		// rides UDS today, so the census must count on the UDS path too). It is OFF by default and only
+		// classifies when armed by env DARLING_SERVER_MSG_CENSUS=1 on a warm server (Metrics::msgCensusOn);
+		// when off, the classification (incl. the cheap header readMemory for the COMPLEX bit/descriptors)
+		// is skipped entirely so the hot path is byte-identical to today. Buckets are NOT mutually
+		// exclusive across axes -- a single call bumps msgTotal plus the axis bits that apply, so the
+		// reader cross-tabulates. The decision fork (see PERF18-MSG-OVERWRITE-RECON.md / the D8 brief):
+		//   high msgSendOnlySimple share  -> worth a future Lane-2/simple-send subset build
+		//   high msgSendOnlyOol share     -> must extend the D6 sideband to mmap FIRST (the stopper)
+		//   high msgReceive/blocking share-> STOP, receive stays UDS/generic, look elsewhere
+		std::atomic<bool> msgCensusOn {false};      // armed by DARLING_SERVER_MSG_CENSUS=1 (warm-server hatch)
+		std::atomic<uint64_t> msgTotal {0};         // every mach_msg_overwrite seen by the census
+		std::atomic<uint64_t> msgSendMsg {0};       // option & MACH_SEND_MSG
+		std::atomic<uint64_t> msgRcvMsg {0};        // option & MACH_RCV_MSG
+		std::atomic<uint64_t> msgSendOnly {0};      // SEND_MSG && !RCV_MSG
+		std::atomic<uint64_t> msgReceiveOnly {0};   // RCV_MSG && !SEND_MSG
+		std::atomic<uint64_t> msgSendReceive {0};   // SEND_MSG && RCV_MSG
+		std::atomic<uint64_t> msgRcvSizeNonzero {0};// rcv_size != 0
+		std::atomic<uint64_t> msgBlockingReceive {0};// RCV_MSG && NOT (RCV_TIMEOUT with finite timeout) -> can park unbounded
+		// send-only sub-classification (the candidate Lane-2 subset lives in msgSendOnlySimple):
+		std::atomic<uint64_t> msgSendOnlySimple {0};// SEND_MSG && !RCV_MSG && !COMPLEX (no descriptors)
+		std::atomic<uint64_t> msgSendOnlyComplex {0};// SEND_MSG && !RCV_MSG && COMPLEX (has descriptors)
+		std::atomic<uint64_t> msgSendOnlyOol {0};   // ... COMPLEX && >=1 OOL (memory) descriptor -> drives mmap/munmap S2C
+		std::atomic<uint64_t> msgSendOnlyPortDesc {0};// ... COMPLEX && >=1 port / ool-ports descriptor -> namespace/refcount
+		std::atomic<uint64_t> msgCensusHdrReadFail {0};// header readMemory failed (classified as complex-unknown, counted here)
+
+#ifdef DSERVER_RING_TRANSPORT
 #ifdef DSERVER_RING_PHASE_PROF
 		// perf #18 P6 (dar-aw2): cycle-decompose the hot ring RPC. rdtsc brackets in
 		// ringServiceThread/publishReply accumulate per-phase TSC cycles + a sample count, so we
@@ -275,6 +306,41 @@ namespace DarlingServer {
 			}
 			perCallCount[idx].fetch_add(1, std::memory_order_relaxed);
 			perCallLatency[idx].record(microseconds);
+		}
+
+		// perf #18 P8 D8: how the caller classified the message body's descriptor shape (resolved by
+		// the caller, which holds the Process needed to readMemory the message header -- keeps Metrics
+		// free of Process coupling). Unknown = census off or header read failed.
+		enum class MsgComplexClass { Unknown, Simple, ComplexOol, ComplexPort, ComplexOther };
+
+		// Record one mach_msg_overwrite for the shape census. Cheap, lock-free; no-op unless armed.
+		// `option`/`send_size`/`rcv_size`/`timeout` are the inline RPC args; `cclass` is the body
+		// classification (only meaningful for the send path). NOT mutually exclusive across axes.
+		void recordMsgOverwriteCensus(int32_t option, uint32_t send_size, uint32_t rcv_size, uint32_t timeout, MsgComplexClass cclass) {
+			// MACH_SEND_MSG = 0x1, MACH_RCV_MSG = 0x2, MACH_RCV_TIMEOUT = 0x100 (mach/message.h).
+			const bool send = (option & 0x1) != 0;
+			const bool recv = (option & 0x2) != 0;
+			const bool rcvTimeout = (option & 0x100) != 0;
+			msgTotal.fetch_add(1, std::memory_order_relaxed);
+			if (send) msgSendMsg.fetch_add(1, std::memory_order_relaxed);
+			if (recv) msgRcvMsg.fetch_add(1, std::memory_order_relaxed);
+			if (send && !recv) msgSendOnly.fetch_add(1, std::memory_order_relaxed);
+			if (recv && !send) msgReceiveOnly.fetch_add(1, std::memory_order_relaxed);
+			if (send && recv) msgSendReceive.fetch_add(1, std::memory_order_relaxed);
+			if (rcv_size != 0) msgRcvSizeNonzero.fetch_add(1, std::memory_order_relaxed);
+			// "blocking receive" = a receive that can park unbounded: RCV_MSG with no finite timeout
+			// (either RCV_TIMEOUT unset, or set but timeout==0 which XNU treats as a poll -- so a true
+			// unbounded park is RCV_MSG && !(RCV_TIMEOUT && timeout>0)).
+			if (recv && !(rcvTimeout && timeout > 0)) msgBlockingReceive.fetch_add(1, std::memory_order_relaxed);
+			if (send && !recv) {
+				switch (cclass) {
+					case MsgComplexClass::Simple:       msgSendOnlySimple.fetch_add(1, std::memory_order_relaxed); break;
+					case MsgComplexClass::ComplexOol:   msgSendOnlyComplex.fetch_add(1, std::memory_order_relaxed); msgSendOnlyOol.fetch_add(1, std::memory_order_relaxed); break;
+					case MsgComplexClass::ComplexPort:  msgSendOnlyComplex.fetch_add(1, std::memory_order_relaxed); msgSendOnlyPortDesc.fetch_add(1, std::memory_order_relaxed); break;
+					case MsgComplexClass::ComplexOther: msgSendOnlyComplex.fetch_add(1, std::memory_order_relaxed); break;
+					case MsgComplexClass::Unknown:      msgCensusHdrReadFail.fetch_add(1, std::memory_order_relaxed); break;
+				}
+			}
 		}
 
 		// last reply timestamp (CLOCK_MONOTONIC microseconds), for last_reply_age_ms

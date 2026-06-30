@@ -1,6 +1,6 @@
 # perf#18 D7 — mach_msg_overwrite RECON / DESIGN (the future OOL carrier)
 
-**Bead:** dar-1il.3.2.3 · **Status:** RECON COMPLETE — recommendation below · **No production change.**
+**Bead:** dar-1il.3.2.3 · **Status:** RECON + D8 CENSUS COMPLETE — **verdict: STOP, do not migrate** (§9) · **No production change.**
 **HEADs:** darlingserver `perf/shmem-ring-abi-validator` @24f222b · xnu `perf/shmem-ring-guest` @b412c28.
 **Reads:** PERF18-DUPLEX-LANE-DESIGN.md (the duplex/Lane-2 model), the C2S membership canon
 (rpc-supplement.h `DSERVER_RING_C2S_OPCODES`), the D6 caller-S2C sideband brief.
@@ -226,3 +226,46 @@ sideband superset exists.
 - D6 sideband (munmap-only): thread.cpp `_s2cTryDuplexMunmapLocked` / `_drainDuplexReply`; mailbox/caps in
   rpc-supplement.h; attribution counters `s2c_munmap_{ring,uds,no}_parent`.
 - Hotness 19%: dserver-rpc-defs.h:95 + generalize-recv-spin-guest.patch + per_call_metrics_test.cpp.
+
+---
+
+## 9. D8 — shape census MEASURED (the decisive number)
+
+The §4.3 "cheap next measurement" was BUILT and RUN. A diagnostic, default-OFF shape census
+(`Metrics::recordMsgOverwriteCensus`, armed by `DARLING_SERVER_MSG_CENSUS=1`, classified in
+`Call::callFromMessage` — one chokepoint catching every msg_overwrite, ring or UDS) was deployed to a
+warm homebrew-test server and a representative boot + shell workload was run. **No behavior change**
+(off by default; when off the classification + its header readMemory are skipped entirely). Gate:
+`tests/msg_overwrite_census_test.cpp` (GREEN + 2 RED arms), wired into `run-ring-shm-validate.sh`;
+compiles + passes in BOTH ring-ON and ring-OFF builds.
+
+**Measured (msg_total = 362, one warm boot + `true`/`ls`/`uname` workload):**
+
+| shape | count | % of msg_overwrite |
+|-------|------:|-------------------:|
+| send+receive (MIG round-trip) | 276 | **76.2%** |
+| **blocking receive** (RCV, no finite timeout) | 317 | **87.6%** |
+| rcv_size != 0 | 317 | 87.6% |
+| receive-only | 41 | 11.3% |
+| send-only (total) | 45 | 12.4% |
+| **send-only SIMPLE** (no descriptors — the Lane-2 candidate) | 30 | **8.3%** |
+| send-only complex | 15 | 4.1% |
+| send-only OOL (the stopper hazard) | 2 | 0.6% |
+| send-only port descriptors | 13 | 3.6% |
+| header-read failures | 0 | 0.0% |
+
+**Verdict (data-confirmed): the reclaimable fraction is small.** The dominant shape (76% send+receive,
+88% blocking receive) is a *real* wait — a thread blocked in `ipc_mqueue_receive` waiting for a peer's
+reply — NOT reclaimable round-trip overhead the way the Lane-1 self-trap wins were. The only Lane-2
+candidate, simple send-only, is **8.3% of msg_overwrite** ≈ **8.3% × 19% ≈ 1.6% of all RPC**. The OOL
+hazard that would force the mmap-sideband prerequisite is real but rare (0.6%).
+
+**Roadmap decision (per the §6 fork): STOP — do NOT build a msg_overwrite Lane-2 subset.** Chasing
+~1.6% of total RPC is not worth a duplex-subset build + the mmap-sideband prerequisite. The receive
+shape stays UDS/generic (correct — its wait is real work). The architectural STOPPER stands (no OOL
+ring migration until the sideband does mmap), but it is now moot for msg_overwrite specifically. **Look
+elsewhere for hot CLOSED ops** — the next perf lever is NOT this op. (Caveat: one warm sample; the
+shares are stable enough to decide, but a longer real-build workload would refine the absolute counts.
+The per_call histogram showed 0 msg_overwrite in this same warm window because per_call records only
+UDS-serviced calls in a different sampling window; the census's 362 is the authoritative count for the
+shape question.)
