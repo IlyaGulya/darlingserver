@@ -541,6 +541,15 @@ else
 	fi
 	echo "  heatmap RED arm 2 correctly failed."
 	echo
+	echo "== heatmap RED arm 3 (-DRED_BREAK_PERCALL_LEAK: D14 per-call attribution must NOT leak S2C onto bystander, MUST fail) =="
+	if ! "$CXX" -std=c++17 -DDSERVER_RING_TRANSPORT -DRED_BREAK_PERCALL_LEAK -I"$GEN_RPC" -I"$INC" -I"$ININC" -o "$TMP/hm_red3" "$HMSRC" "$HMIMPL" 2>/dev/null; then
+		echo "heatmap RED arm 3 failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/hm_red3" >/dev/null 2>&1; then
+		echo "heatmap RED arm 3 PASSED but must FAIL -- per-call S2C attribution (no cross-op leak) not exercised"; exit 1
+	fi
+	echo "  heatmap RED arm 3 correctly failed."
+	echo
 	echo "RPC heatmap gate: RED->GREEN OK"
 	echo
 fi

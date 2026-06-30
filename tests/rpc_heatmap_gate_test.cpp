@@ -140,12 +140,39 @@ int main() {
 	CHECK(heatStr(json, OP_VMALLOC, "verdict") == "tier2-candidate", "vm_allocate -> tier2-candidate");
 
 	// --- a measured caller-S2C must FORCE duplex-only even for an unclassified op -----------------
-	for (int i = 0; i < 5; ++i) m.recordCallHeatmap((uint32_t)dserver_callnum_mach_vm_deallocate, 15, T::Uds, true, true);
+	// D14 (dar-1il.9): caller-S2C is now attributed PER-CALL via recordCallerS2cFor() at the S2C site,
+	// NOT a sticky bool threaded through recordCallHeatmap (the didCallerS2c param is now always false
+	// from the live sites). Drive the S2C bucket directly, as _s2cPerform does.
+	for (int i = 0; i < 5; ++i) {
+		m.recordCallHeatmap((uint32_t)dserver_callnum_mach_vm_deallocate, 15, T::Uds, true, false);
+		m.recordCallerS2cFor((uint32_t)dserver_callnum_mach_vm_deallocate);
+	}
 	{
 		std::string j2 = m.snapshotJSON("");
 		CHECK(heatStr(j2, "dserver_callnum_mach_vm_deallocate", "verdict") == "duplex-only",
 		      "measured caller-S2C forces duplex-only (vm_deallocate)");
 		CHECK(heatVal(j2, "dserver_callnum_mach_vm_deallocate", "caller_s2c") == 5, "vm_deallocate caller_s2c=5");
+	}
+
+	// --- INVARIANT 5 (D14): per-call-scoped attribution -- NO CROSS-OP LEAK -----------------------
+	// The D13 false-latch bug: an S2C driven while op A executes must charge A, and must NOT bleed
+	// onto op B even if B is the very next op recorded on the same thread. Model that exact sequence:
+	// op A (mldr_path) executes and drives an S2C (recordCallerS2cFor(A)); then op B (vchroot_path) is
+	// recorded next with NO S2C of its own. B's caller_s2c MUST stay 0; A's MUST be exactly 1.
+	const char* OP_A = "dserver_callnum_mldr_path";
+	const char* OP_B = "dserver_callnum_vchroot_path";
+	m.recordCallerS2cFor((uint32_t)dserver_callnum_mldr_path);               // S2C fires while A is active
+	m.recordCallHeatmap((uint32_t)dserver_callnum_mldr_path, 4, T::Ring, true, false);   // A completes
+	m.recordCallHeatmap((uint32_t)dserver_callnum_vchroot_path, 4, T::Ring, true, false); // B completes next, no S2C
+	{
+		std::string j3 = m.snapshotJSON("");
+		CHECK(heatVal(j3, OP_A, "caller_s2c") == 1, "D14: S2C charged to the active op A (mldr_path)");
+		CHECK(heatVal(j3, OP_B, "caller_s2c") == 0, "D14: NO cross-op leak onto B (vchroot_path) recorded next");
+		// and with no caller-S2C of its own + canon-simple, A must read already-on-ring once attributed
+		// correctly... but A DID drive an S2C here, so its verdict is duplex-only by the measured fact.
+		// That is the POINT of the fix: the S2C lands on the op that actually drove it, not a bystander.
+		CHECK(heatStr(j3, OP_B, "verdict") == "already-on-ring",
+		      "D14: bystander op B keeps its true verdict (no leaked S2C flips it to duplex-only)");
 	}
 
 #ifdef RED_BREAK_DISARMED_NOOP
@@ -168,6 +195,16 @@ int main() {
 	{
 		std::string j3 = Metrics::shared().snapshotJSON("");
 		CHECK(heatStr(j3, "dserver_callnum_mach_vm_deallocate", "verdict") == "tier2-candidate", "RED arm");
+	}
+#endif
+#ifdef RED_BREAK_PERCALL_LEAK
+	// RED (D14): assert the OLD sticky-latch behavior -- that the S2C driven by op A LEAKED onto the
+	// bystander op B recorded next on the same thread. With the per-call-scoped fix, B's caller_s2c is
+	// 0, so this assertion (expecting the leak) MUST fail -- proving the cross-op leak is gone.
+	{
+		std::string j4 = Metrics::shared().snapshotJSON("");
+		CHECK(heatVal(j4, "dserver_callnum_vchroot_path", "caller_s2c") == 1,
+		      "RED arm: expects the leak onto B (must NOT happen under per-call attribution)");
 	}
 #endif
 
