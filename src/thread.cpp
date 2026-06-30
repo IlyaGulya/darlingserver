@@ -409,15 +409,16 @@ void DarlingServer::Thread::microthreadWorker() {
 		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
 		// perf #18 D9 (dar-1il.4): heatmap. This is the GENERIC fiber worker, so used_fiber=true (the
 		// call ran on a suspendable microthread -- a blocking/fiber op, NOT Tier-2-no-fiber-eligible).
-		// transport + caller-S2C come from the sticky latches set during dispatch/servicing.
+		// transport comes from the sticky latch set during dispatch/servicing. perf #18 D14 (dar-1il.9):
+		// caller-S2C is no longer a sticky per-thread bool consumed here -- it is attributed per-call at
+		// _s2cPerform via Metrics::recordCallerS2cFor(activeCall), so there is no cross-op leak.
 		_metrics.recordCallHeatmap(
 			static_cast<uint32_t>(_callNumber), serviceUs,
 			currentThreadVar->_heatmapCallWasRing ? DarlingServer::Metrics::CallTransport::Ring
 			                                      : DarlingServer::Metrics::CallTransport::Uds,
 			/* usedFiber */ true,
-			currentThreadVar->_heatmapCallDidS2c);
+			/* didCallerS2c */ false);
 		currentThreadVar->_heatmapCallWasRing = false;
-		currentThreadVar->_heatmapCallDidS2c = false;
 		if (_callNumber == DarlingServer::Call::Number::Checkin) {
 			_metrics.checkinLatency.record(serviceUs);
 		}
@@ -741,14 +742,14 @@ bool DarlingServer::Thread::doWorkInline() {
 		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
 		// perf #18 D9 (dar-1il.4): heatmap. This is doWorkInline -- the Tier-2 NO-FIBER ring path. By
 		// construction it ran a ring-originated allowlisted op without suspending (used_fiber=false); a
-		// real suspend here is a contract violation handled below. transport=ring.
+		// real suspend here is a contract violation handled below. transport=ring. perf #18 D14
+		// (dar-1il.9): caller-S2C attributed per-call at _s2cPerform, not via a sticky latch here.
 		_metrics.recordCallHeatmap(
 			static_cast<uint32_t>(_callNumber), serviceUs,
 			DarlingServer::Metrics::CallTransport::Ring,
 			/* usedFiber */ false,
-			_heatmapCallDidS2c);
+			/* didCallerS2c */ false);
 		_heatmapCallWasRing = false;
-		_heatmapCallDidS2c = false;
 	}
 
 	// processCall() on a non-blocking op must have run to completion. If somehow it suspended
@@ -1436,12 +1437,17 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 		}
 #endif
 
-		// perf #18 D9 (dar-1il.4): latch that the active call drove a CALLER-S2C upcall (an S2C to THIS
-		// thread, i.e. while it is the caller waiting for a reply). Any caller-S2C means the op is NOT a
-		// simple closed req->reply -- it needs the duplex lane (Lane 2), not the simple ring (Lane 1) --
-		// so the heatmap must flag it regardless of S2C type or ring build. Cheap unconditional store.
-		if (currentThread().get() == this) {
-			_heatmapCallDidS2c = true;
+		// perf #18 D9 (dar-1il.4) + D14 (dar-1il.9): record that the active call drove a CALLER-S2C
+		// upcall (an S2C to THIS thread, i.e. while it is the caller waiting for a reply). Any caller-S2C
+		// means the op is NOT a simple closed req->reply -- it needs the duplex lane (Lane 2), not the
+		// simple ring (Lane 1) -- so the heatmap must flag it regardless of S2C type or ring build. D14
+		// replaces the old sticky per-thread _heatmapCallDidS2c bool (consumed at the NEXT recordCall,
+		// which over-attributed an exec/teardown munmap to the wrong op -- D13's mldr_path false latch)
+		// with PER-CALL-SCOPED attribution: bump the bucket for the op ACTUALLY executing right now
+		// (_activeCall), at the moment the S2C fires. _activeCall is null for a server-internal S2C (no
+		// managed parent) -- already counted by s2cMunmapNoParent, no per-op bucket to charge.
+		if (currentThread().get() == this && _activeCall) {
+			Metrics::shared().recordCallerS2cFor(static_cast<uint32_t>(_activeCall->number()));
 		}
 
 		call.setAddress(_address);
