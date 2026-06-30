@@ -115,6 +115,22 @@ int main(void) {
 	CHECK((dserver_ring_op_class(dserver_callnum_mach_port_allocate) & DSERVER_RING_CLASS_NOFIBER_FAST) == 0u,
 	      "mach_port_allocate is NOT NoFiberFastEligible (Tier 1 only)");
 
+	// perf #18 D11 (dar-1il.6): the bulk closed-fast Lane-1 batch. Each must be SimpleRingC2SEligible
+	// (Lane 1), Tier-1 ONLY (NOT NoFiberFast -- they read/mutate process/thread state via the generic
+	// Call path, not pure mint), and carry NEITHER destroy nor caller-S2C (so the canon-safe fold holds).
+#define D11_OP_CHECK(op) do { \
+		uint32_t _c = dserver_ring_op_class((uint32_t)dserver_callnum_##op); \
+		CHECK((_c & DSERVER_RING_CLASS_SIMPLE_C2S) != 0u, #op " is SimpleRingC2SEligible [D11]"); \
+		CHECK((_c & DSERVER_RING_CLASS_NOFIBER_FAST) == 0u, #op " is NOT NoFiberFastEligible (Tier 1 only) [D11]"); \
+		CHECK((_c & (DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C)) == 0u, #op " is NEITHER destroy nor caller-S2C [D11]"); \
+	} while (0);
+	D11_OP_CHECK(uidgid);
+	D11_OP_CHECK(set_thread_handles);
+	D11_OP_CHECK(started_suspended);
+	D11_OP_CHECK(get_tracer);
+	D11_OP_CHECK(task_is_64_bit);
+#undef D11_OP_CHECK
+
 	// --- the UDS-only ops are tagged destroy-capable + caller-S2C, and are NOT SimpleRingC2SEligible
 	//     (the canon's whole point: "wrong lane, not bad op") ------------------------------------
 	uint32_t dealloc = dserver_ring_op_class(dserver_callnum_mach_port_deallocate);

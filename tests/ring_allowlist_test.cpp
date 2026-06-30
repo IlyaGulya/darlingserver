@@ -54,6 +54,12 @@ int main(void) {
 	// perf #18 D10: the self-trap family is now fully migrated.
 	CHECK(ringEligible(dserver_callnum_thread_self_trap), "thread_self_trap is ring-eligible [D10]");
 	CHECK(ringEligible(dserver_callnum_host_self_trap), "host_self_trap is ring-eligible [D10]");
+	// perf #18 D11 (dar-1il.6): the bulk closed-fast Lane-1 batch (Tier-1 generic fiber).
+	CHECK(ringEligible(dserver_callnum_uidgid), "uidgid is ring-eligible [D11]");
+	CHECK(ringEligible(dserver_callnum_set_thread_handles), "set_thread_handles is ring-eligible [D11]");
+	CHECK(ringEligible(dserver_callnum_started_suspended), "started_suspended is ring-eligible [D11]");
+	CHECK(ringEligible(dserver_callnum_get_tracer), "get_tracer is ring-eligible [D11]");
+	CHECK(ringEligible(dserver_callnum_task_is_64_bit), "task_is_64_bit is ring-eligible [D11]");
 
 	// A representative op that is NOT migrated must be rejected (stays on UDS). kprintf takes a
 	// request body and is not in the macro, so it must NEVER be ring-eligible.
