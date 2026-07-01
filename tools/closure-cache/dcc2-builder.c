@@ -143,8 +143,11 @@ static int trie_find(const uint8_t*trieStart,const uint8_t*trieEnd,const char*sy
     return 0;
 }
 
-static int parse_image(const char*path, struct src_img*im){
-    strncpy(im->path,path,sizeof im->path-1);
+static int parse_image(const char*hostpath, const char*guestpath, struct src_img*im){
+    /* perf#24c2e: store the GUEST path (vchroot-relative, e.g. /usr/lib/system/foo.dylib) — that is
+     * what the dyld2 reader stats/opens inside the guest. Open the HOST path for build-time I/O. */
+    strncpy(im->path,guestpath,sizeof im->path-1);
+    const char*path=hostpath;
     int fd=open(path,O_RDONLY); if(fd<0){fprintf(stderr,"open %s: %s\n",path,strerror(errno));return -1;}
     struct stat st; if(fstat(fd,&st)){close(fd);return -1;}
     im->inode=st.st_ino; im->mtime=st.st_mtime; im->size=st.st_size;
@@ -326,7 +329,7 @@ int main(int argc,char**argv){
     struct src_img*imgs=calloc(np,sizeof *imgs); g_imgs=imgs; g_np=np;
     uint64_t chash=1469598103934665603ULL;
     for(int i=0;i<np;i++){ char full[600]; snprintf(full,sizeof full,"%s%s",root,paths[i]);
-        if(parse_image(full,&imgs[i])){fprintf(stderr,"ABORT parse %s\n",full);return 1;}
+        if(parse_image(full,paths[i],&imgs[i])){fprintf(stderr,"ABORT parse %s\n",full);return 1;}
         chash=fnv1a(paths[i],strlen(paths[i]),chash); chash=fnv1a(&imgs[i].inode,8,chash); chash=fnv1a(&imgs[i].mtime,8,chash); chash=fnv1a(&imgs[i].size,8,chash);
     }
 

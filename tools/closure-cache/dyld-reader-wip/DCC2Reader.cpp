@@ -60,6 +60,19 @@ DCC2Reader* DCC2Reader::init(const char* envp[], LogFunc log)
     return &reader;
 }
 
+// perf#24c2e: process-wide singleton for the dyld2 classic path.
+static DCC2Reader* sSharedDCC2 = nullptr;
+
+void DCC2Reader::initShared(const char* envp[], LogFunc log)
+{
+    sSharedDCC2 = DCC2Reader::init(envp, log);   // nullptr if flag absent / cache invalid (soft)
+}
+
+DCC2Reader* DCC2Reader::shared()
+{
+    return sSharedDCC2;
+}
+
 bool DCC2Reader::validate(int fd)
 {
     struct stat st;
@@ -134,6 +147,73 @@ bool DCC2Reader::isDCCImage(const MachOLoaded* mh) const
 {
     for ( int i = 0; i < _nDccAddrs; ++i ) if ( _dccAddrs[i] == mh ) return true;
     return false;
+}
+
+// perf#24c2e: cheap+exact — a mach_header is DCC-owned iff it sits at _arena + image_vmbase for one
+// of the cached images. (Exact pointer identity, not a range test.)
+bool DCC2Reader::isDCC2Image(const struct mach_header* mh, uint32_t* outIndex) const
+{
+    if ( !enabled() || mh == nullptr ) return false;
+    const uint64_t addr = (uint64_t)mh;
+    for ( uint32_t i = 0; i < _hdr->image_count; ++i ) {
+        if ( addr == (_arena + _images[i].image_vmbase) ) {
+            if ( outIndex ) *outIndex = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// perf#24c2e: apply EVERY cached image's fixups, once, for the whole cache. Bind targets are
+// cross-image (BIND_INTERNAL references another cached image's region), so this must run after all
+// DCC2 images are registered — hence once-per-cache, not per-image. Idempotent: a second call is a
+// no-op returning true.
+bool DCC2Reader::applyAllFixupsOnce(LogFunc logFixups,
+                                    uintptr_t (^resolveExtern)(const char* symbolName, bool& found))
+{
+    if ( !enabled() ) return false;
+    if ( _allApplied ) return true;                  // already applied for this cache
+    const uint64_t slide = _arena;
+    uint32_t applied = 0;
+    for ( uint32_t fi = 0; fi < _hdr->fixup_count; ++fi ) {
+        DCC2Fixup* f = &_fixups[fi];
+        if ( f->loc_region != 1 ) { if(_log)_log("dyld[DCC2]: fixup %u loc not in RW (region=%d) hard fail\n", fi, f->loc_region); return false; }
+        uintptr_t* loc = (uintptr_t*)(_rmap[1] + f->loc_off);
+        switch ( f->kind ) {
+            case DCC2_FIX_REBASE:
+                *loc += (uintptr_t)slide;
+                break;
+            case DCC2_FIX_BIND_INTERNAL:
+                *loc = (uintptr_t)(_hdr->regions[f->tgt_region].vm_base + f->tgt_off + slide + f->addend);
+                break;
+            case DCC2_FIX_BIND_EXTERN: {
+                const char* sym = _externStr + f->extern_sym;
+                bool found = false;
+                uintptr_t v = resolveExtern ? resolveExtern(sym, found) : 0;
+                if ( !found ) { if(_log)_log("dyld[DCC2]: extern symbol '%s' unresolved (hard fail)\n", sym); return false; }
+                *loc = v + (uintptr_t)f->addend;
+                break;
+            }
+            default:
+                if(_log)_log("dyld[DCC2]: unknown fixup kind %d (hard fail)\n", f->kind); return false;
+        }
+        ++applied;
+        if ( logFixups ) logFixups("dyld[DCC2]: fixup #%u kind=%d loc=%p\n", fi, f->kind, (void*)loc);
+    }
+    _allApplied = true;
+    _cFixupsApplied = applied;
+    if ( _log ) _log("dyld[DCC2]: applied %u fixups once for whole cache (slide=0x%llx)\n",
+                     applied, (unsigned long long)slide);
+    return true;
+}
+
+void DCC2Reader::dumpCounters(LogFunc log) const
+{
+    if ( !log ) return;
+    log("dyld[DCC2]: counters: reader_init=1 regions_mapped=3 images_registered=%u "
+        "normal_rebase_skipped=%u normal_bind_skipped=%u fixups_applied_once=%d fixup_count=%u\n",
+        _cImagesRegistered, _cNormalRebaseSkipped, _cNormalBindSkipped,
+        _allApplied ? 1 : 0, _cFixupsApplied);
 }
 
 bool DCC2Reader::applyFixups(uint32_t imageIndex, LogFunc logFixups,

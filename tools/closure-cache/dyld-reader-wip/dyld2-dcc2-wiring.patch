@@ -155,11 +155,134 @@ index 8baece4..e4414b4 100644
  };
  
  
+diff --git a/src/ImageLoaderMachOCompressed.cpp b/src/ImageLoaderMachOCompressed.cpp
+index 54fb8dc..04f13cc 100644
+--- a/src/ImageLoaderMachOCompressed.cpp
++++ b/src/ImageLoaderMachOCompressed.cpp
+@@ -44,6 +44,7 @@
+ #include "ImageLoaderMachOCompressed.h"
+ #include "Closure.h"
+ #include "Array.h"
++#include "DCC2Reader.h"   // perf#24c2e: DCC2 packed-cache guarded hook (flag-gated)
+ 
+ #ifndef BIND_SUBOPCODE_THREADED_SET_JOP
+    #define BIND_SUBOPCODE_THREADED_SET_JOP								0x0F
+@@ -363,6 +364,35 @@ void ImageLoaderMachOCompressed::throwBadRebaseAddress(uintptr_t address, uintpt
+ 
+ void ImageLoaderMachOCompressed::rebase(const LinkContext& context, uintptr_t slide)
+ {
++	// perf#24c2e: DCC2 packed-cache image => the cache-native fixup table replaces BOTH normal rebase
++	// AND bind (rebase+bind+extern in one table). Apply it HERE, in the rebase phase, so the image's
++	// DATA (GOT / bind pointers) is valid before ANYTHING reads it — recursiveRebase runs after
++	// recursiveLoadLibraries has loaded every image, so all cache images are already registered and
++	// cross-image binds resolve. Applied ONCE for the whole cache; the normal opcode rebase (and bind,
++	// below in doBind) are skipped for DCC images. Running the opcode engine on a region-scattered
++	// image is known-wrong (perf#24c2a).
++	{
++		dyld3::DCC2Reader* dcc = dyld3::DCC2Reader::shared();
++		if ( (dcc != nullptr) && dcc->enabled() && dcc->isDCC2Image(this->machHeader()) ) {
++			dcc->noteNormalRebaseSkipped();
++			const LinkContext& ctx = context;
++			bool ok = dcc->applyAllFixupsOnce((dyld3::DCC2Reader::LogFunc)0,
++				^uintptr_t(const char* symbolName, bool& found) {
++					const ImageLoader::Symbol* sym = nullptr;
++					const ImageLoader* image = nullptr;
++					if ( ctx.flatExportFinder(symbolName, &sym, &image) && (image != nullptr) ) {
++						found = true;
++						return image->getExportedSymbolAddress(sym, ctx, nullptr, false);
++					}
++					found = false;
++					return (uintptr_t)0;
++				});
++			if ( !ok )
++				dyld::halt("DCC2: applyAllFixupsOnce failed (hard fail) during rebase");
++			return;
++		}
++	}
++
+ 	// binary uses chained fixups where are applied during binding
+ 	if ( fDyldInfo == NULL )
+ 		return;
+@@ -892,6 +922,21 @@ void ImageLoaderMachOCompressed::doBind(const LinkContext& context, bool forceLa
+ {
+ 	CRSetCrashLogMessage2(this->getPath());
+ 
++	// perf#24c2e: DCC2 packed-cache image => bind (and rebase) were already applied by the cache-native
++	// fixup table in rebase() (the rebase phase). The normal opcode bind is SKIPPED — running it on a
++	// region-scattered image is known-wrong (perf#24c2a). Invariant: a DCC image must never reach the
++	// opcode engine; the applyAllFixupsOnce guard is idempotent so this is a clean skip.
++	{
++		dyld3::DCC2Reader* dcc = dyld3::DCC2Reader::shared();
++		if ( (dcc != nullptr) && dcc->enabled() && dcc->isDCC2Image(this->machHeader()) ) {
++			dcc->noteNormalBindSkipped();
++			if ( !dcc->allFixupsApplied() )
++				dyld::halt("DCC2: doBind reached for a DCC image before fixups were applied (invariant violation)");
++			CRSetCrashLogMessage2(NULL);
++			return;
++		}
++	}
++
+ 	// if prebound and loaded at prebound address, and all libraries are same as when this was prebound, then no need to bind
+ 	// note: flat-namespace binaries need to have imports rebound (even if correctly prebound)
+ 	if ( this->usablePrebinding(context) ) {
 diff --git a/src/dyld2.cpp b/src/dyld2.cpp
-index 3710870..d421c9e 100644
+index 3710870..dc98d32 100644
 --- a/src/dyld2.cpp
 +++ b/src/dyld2.cpp
-@@ -6108,6 +6108,10 @@ static bool launchWithClosure(const dyld3::closure::LaunchClosure* mainClosure,
+@@ -4107,9 +4107,52 @@ static ImageLoader* loadPhase0(const char* path, const char* orgPath, const Load
+ // the path.  Either time, if an image is found, the phases all unwind without checking
+ // for other paths.
+ //
++// perf#24c2e: DCC2 packed-cache substitution for the dyld2 classic path (flag-gated).
++// If 'path' names a DCC2-cached dylib, instantiate an ImageLoader over the already-mapped cache
++// regions (no open/mmap) and register it, instead of loading from disk. Returns the (possibly
++// pre-existing) ImageLoader for a cached image, or nullptr if 'path' is not cached / reader off.
++static ImageLoader* dccTryLoad(const char* path, const LoadContext& context)
++{
++	dyld3::DCC2Reader* dcc = dyld3::DCC2Reader::shared();
++	if ( (dcc == nullptr) || !dcc->enabled() )
++		return nullptr;
++	uint32_t imageIndex = 0;
++	const dyld3::MachOLoaded* ml = dcc->loadedAddressFor(path, &imageIndex);
++	if ( ml == nullptr )
++		return nullptr;                         // not a cached image => normal disk load
++	const macho_header* mh = (const macho_header*)ml;
++
++	// dedup: if this cached header is already registered, return the existing ImageLoader.
++	for (ImageLoader* existing : sAllImages) {
++		if ( (const void*)existing->machHeader() == (const void*)mh )
++			return existing;
++	}
++
++	// synthesize a stat from the recorded source metadata (dyld records dev/ino/mtime for the image)
++	struct stat info;
++	memset(&info, 0, sizeof(info));
++	if ( dyld3::stat(path, &info) != 0 )
++		memset(&info, 0, sizeof(info));         // best-effort; staleness already validated at init
++
++	// instantiate over the pre-mapped cache regions. slide == arena base (single-slide model):
++	// segActualLoadAddress(i) = seg.vmaddr + slide reproduces each scattered region address.
++	ImageLoader* image = ImageLoaderMachO::instantiateFromCache(mh, path, (long)dcc->slide(), info, gLinkContext);
++	addImage(image);
++	dcc->noteImageRegistered();
++	if ( gLinkContext.verboseMapping )
++		dyld::log("dyld[DCC2]: substituted cached image %s @ %p (index %u)\n", path, (void*)mh, imageIndex);
++	return image;
++}
++
+ ImageLoader* load(const char* path, const LoadContext& context, unsigned& cacheIndex)
+ {
+ 	CRSetCrashLogMessage2(path);
++	// perf#24c2e: flag-gated DCC2 packed-cache substitution (no-op when the flag is absent).
++	if ( ImageLoader* dccImage = dccTryLoad(path, context) ) {
++		cacheIndex = UINT32_MAX;
++		CRSetCrashLogMessage2(NULL);
++		return dccImage;
++	}
+ 	const char* orgPath = path;
+ 	cacheIndex = UINT32_MAX;
+ 	
+@@ -6108,6 +6151,10 @@ static bool launchWithClosure(const dyld3::closure::LaunchClosure* mainClosure,
  		}
  	});
  
@@ -170,3 +293,16 @@ index 3710870..d421c9e 100644
  	// recursively load all dependents and fill in allImages array
  	bool someCacheImageOverridden = false;
  	loader.completeAllDependents(diag, someCacheImageOverridden);
+@@ -7132,6 +7179,12 @@ reloadAllImages:
+ 		gLinkContext.mainExecutable = sMainExecutable;
+ 		gLinkContext.mainExecutableCodeSigned = hasCodeSignatureLoadCommand(mainExecutableMH);
+ 
++		// perf#24c2e: flag-gated DCC2 packed-cache reader for the dyld2 CLASSIC path.
++		// DARLING_DYLD_DCC2=1 + DARLING_DYLD_DCC2_PATH. Absent => shared()==nullptr => exact old
++		// behavior. Init here, before dependent libraries are loaded/linked, so loadPhase5load can
++		// substitute cached images and doRebase/doBind can route them to the DCC2 fixup table.
++		dyld3::DCC2Reader::initShared(envp, (gLinkContext.verboseMapping ? &dolog : &nolog));
++
+ #if TARGET_OS_SIMULATOR
+ 		// check main executable is not too new for this OS
+ 		{
