@@ -1,0 +1,29 @@
+closure dylibs found: 26
+  libSystem.B.dylib                  textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_asl.dylib                textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_blocks.dylib             textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_c.dylib                  textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_configuration.dylib      textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_coreservices.dylib       textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_coretls.dylib            textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_darwin.dylib             textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_dnssd.dylib              textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_duct.dylib               textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_info.dylib               textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_kernel.dylib             textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_malloc.dylib             textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_m.dylib                  textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_networkextension.dylib   textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_notify.dylib             textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_platform.dylib           textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_pthread.dylib            textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_sandbox.dylib            textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libsystem_trace.dylib              textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libdispatch.dylib                  textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libxpc.dylib                       textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libcorecrypto.dylib                textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libcommonCrypto.dylib              textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libunwind.dylib                    textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+  libkeymgr.dylib                    textreloc=0 dataconst=0 unwind_in_text=Y dylib=Y => OK
+
+SUMMARY: 26 dylibs; text-reloc-free+dataconst-free checks: pass=52 fail=0 warn(dataconst)=0
