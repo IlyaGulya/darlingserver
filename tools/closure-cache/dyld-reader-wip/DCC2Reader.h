@@ -65,6 +65,12 @@ public:
     // invalid: on hardFail it halts; otherwise returns nullptr (clean fallback to normal dyld).
     static DCC2Reader*  init(const char* envp[], LogFunc log);
 
+    // perf#24c2e: process-wide singleton for the dyld2 classic path. initShared() is called once,
+    // early in dyld2 _main; shared() returns it (or nullptr if the flag was absent / cache invalid).
+    // This lets ImageLoaderMachO* reach the reader without threading a pointer through the loader.
+    static void         initShared(const char* envp[], LogFunc log);
+    static DCC2Reader*  shared();
+
     bool                enabled() const { return _arena != 0; }
 
     // If 'path' is a DCC2-cached image, returns its runtime loaded address (arena + image_vmbase)
@@ -73,6 +79,26 @@ public:
 
     // True if the image at this loadedAddress is DCC-owned (used to enforce the invariant).
     bool                isDCCImage(const MachOLoaded* mh) const;
+
+    // perf#24c2e (dyld2 classic path): cheap+exact test used by the guarded hook in
+    // ImageLoaderMachOCompressed::doRebase/doBind. A mach_header* is DCC-owned iff it points inside
+    // the RX region at one of the registered image_vmbase offsets. Also returns the image index.
+    bool                isDCC2Image(const struct mach_header* mh, uint32_t* outIndex = nullptr) const;
+
+    // perf#24c2e: apply ALL cached images' fixups exactly once for the whole cache (bind targets are
+    // cross-image, so this must run once after all DCC2 images are registered, not per-image).
+    // resolveExtern resolves a flat/extern symbol; a required symbol returning found=false is a hard
+    // fail. Returns false on any hard-fail condition. Idempotent-guarded: a second call is a no-op
+    // that returns true (already applied).
+    bool                applyAllFixupsOnce(LogFunc logFixups,
+                                           uintptr_t (^resolveExtern)(const char* symbolName, bool& found));
+    bool                allFixupsApplied() const { return _allApplied; }
+
+    // perf#24c2e counters (for the smoke gate; logged via dumpCounters()).
+    void                noteNormalRebaseSkipped() { ++_cNormalRebaseSkipped; }
+    void                noteNormalBindSkipped()   { ++_cNormalBindSkipped; }
+    void                noteImageRegistered()     { ++_cImagesRegistered; }
+    void                dumpCounters(LogFunc log) const;
 
     // Apply this image's cache-native fixups to the (COW) RW region. 'resolveExtern' resolves a
     // flat/extern symbol name to a runtime address (the normal dyld symbol resolver); if it returns
@@ -105,7 +131,14 @@ private:
     static const int    kMaxDCC = 128;
     const MachOLoaded*  _dccAddrs[kMaxDCC] = { nullptr };
     int                 _nDccAddrs = 0;
-    bool                _appliedOnce[kMaxDCC] = { false };  // enforce "applied exactly once"
+    bool                _appliedOnce[kMaxDCC] = { false };  // enforce "applied exactly once" (per-image path)
+
+    // perf#24c2e: whole-cache single-apply guard + counters for the dyld2 classic path
+    bool                _allApplied = false;
+    uint32_t            _cImagesRegistered   = 0;
+    uint32_t            _cNormalRebaseSkipped = 0;
+    uint32_t            _cNormalBindSkipped   = 0;
+    uint32_t            _cFixupsApplied       = 0;
 };
 
 } // namespace dyld3
