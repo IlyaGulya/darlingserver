@@ -1,0 +1,60 @@
+// perf#20a spawn/exec lifecycle census (v2 -- per-binary wall-time attribution).
+// Guest procs run as host 'mldr'; the REAL binary is mldr argv[1] (mldr!<path>). We attribute per-real-
+// binary wall time (exec->exit), plus global spawn/exec/wait counts, on-CPU vs wall split, and fs churn.
+// No behavior change; pure observation.
+//
+// argv[1] of the mldr loader is the guest binary path. We stash its basename by pid at execve, then at
+// sched_process_exit bucket the lifetime (and on-CPU) by that basename => "top binaries by cumulative wall".
+
+tracepoint:syscalls:sys_enter_execve {
+    // Only mldr-loaded guest execs matter. args->filename is the loader (mldr); argv[1] is the guest binary.
+    // To stay under the BPF stack limit, str() ONLY argv[1] (a short 64B slice) and stash it keyed by pid;
+    // we confirm it's a guest exec at sched_process_exec time via comm=="mldr".
+    @binpath[pid] = str(args->argv[1], 64);
+}
+tracepoint:sched:sched_process_exec /comm == "mldr"/ {
+    @start[pid] = nsecs;
+    @oncpu_acc[pid] = 0;
+    @spawns = count();
+}
+tracepoint:sched:sched_switch {
+    if (@last_on[args->prev_pid]) {
+        if (@start[args->prev_pid]) { @oncpu_acc[args->prev_pid] += nsecs - @last_on[args->prev_pid]; }
+        delete(@last_on[args->prev_pid]);
+    }
+    if (@start[args->next_pid]) { @last_on[args->next_pid] = nsecs; }
+}
+tracepoint:sched:sched_process_exit /@start[pid]/ {
+    $life = nsecs - @start[pid];
+    $cpu  = @oncpu_acc[pid];
+    $bin  = @binpath[pid];
+    @proc_count = count();
+    @wall_ns_total = sum($life);
+    @cpu_ns_total = sum($cpu);
+    @life_hist_us = hist($life / 1000);
+    @cpu_pct = hist($life > 0 ? (100 * $cpu / $life) : 0);
+    // per-binary attribution
+    @wall_by_bin[$bin] = sum($life / 1000);   // us
+    @cpu_by_bin[$bin]  = sum($cpu / 1000);     // us
+    @cnt_by_bin[$bin]  = count();
+    delete(@start[pid]); delete(@oncpu_acc[pid]); delete(@last_on[pid]); delete(@binpath[pid]);
+}
+tracepoint:syscalls:sys_enter_openat  /comm=="mldr"/ { @fs_open = count(); }
+tracepoint:syscalls:sys_enter_newfstatat /comm=="mldr"/ { @fs_stat = count(); }
+tracepoint:syscalls:sys_enter_readlinkat /comm=="mldr"/ { @fs_readlink = count(); }
+tracepoint:syscalls:sys_enter_wait4 /comm=="mldr"/ { @wait4 = count(); }
+tracepoint:syscalls:sys_enter_clone /comm=="mldr"/ { @clone = count(); }
+
+END {
+    clear(@start); clear(@oncpu_acc); clear(@last_on); clear(@binpath);
+    printf("\n=== guest process count (mldr exec->exit) ===\n"); print(@proc_count);
+    printf("=== total WALL us (sum of guest proc lifetimes) ===\n"); print(@wall_ns_total);
+    printf("=== total on-CPU us (sum) ===\n"); print(@cpu_ns_total);
+    printf("=== per-proc lifetime histogram (us) ===\n"); print(@life_hist_us);
+    printf("=== per-proc on-CPU %% histogram (0-100) ===\n"); print(@cpu_pct);
+    printf("=== spawn / clone / wait4 counts (mldr) ===\n"); print(@spawns); print(@clone); print(@wait4);
+    printf("=== fs churn: openat / newfstatat / readlinkat (mldr) ===\n"); print(@fs_open); print(@fs_stat); print(@fs_readlink);
+    printf("=== WALL us by guest binary (argv[1]) -- ranked ===\n"); print(@wall_by_bin);
+    printf("=== on-CPU us by guest binary ===\n"); print(@cpu_by_bin);
+    printf("=== count by guest binary ===\n"); print(@cnt_by_bin);
+}
