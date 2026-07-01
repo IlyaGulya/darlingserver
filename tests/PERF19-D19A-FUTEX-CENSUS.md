@@ -72,6 +72,16 @@ the ring) and that the remaining UDS traffic is control-plane / blocking-wait / 
 bottleneck after perf#18 is not synchronization.** If perf#19 continues, it should look at process
 spawn/exec cost or the compiler-CPU/emulation overhead, not futex.
 
+## Addendum — real `brew install wget` attempt
+Tried the genuine canonical Homebrew build for completeness. **Not practically runnable under a bounded
+census here:** `brew` (a large Ruby program) did not complete even `brew --version` in a 200 s guest
+window — it is pathologically slow to *start* under emulation. This does not change the verdict; it
+reinforces it: brew's cost is Ruby-interpreter CPU + spawning hundreds of configure/make subprocesses
+(process/exec + compiler-CPU overhead), i.e. exactly the non-sync bottleneck D19a points to. The
+sync-relevant portion of a brew build is the same `clang`/`make -j` parallel compilation already censused
+here at 0.067% futex WAIT — a bigger build would only be a slower version of the same signal, not a
+different futex verdict. The 240-file `clang -j8` build stands as the real-parallel-compilation datapoint.
+
 ## Method / reproduce
 `d19a-futex.bt` (mldr+darlingserver-filtered futex WAIT time, op split, per-TID, duration hist) run under
 `sudo bpftrace` around each workload; guest workloads launched via the setuid `darling shell`; a warm
