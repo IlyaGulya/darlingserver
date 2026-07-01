@@ -1,0 +1,29 @@
+// perf#20a: clang-only wall vs on-CPU. Single str()+single strcontains at execve to stay under BPF stack.
+// Tag pids whose argv[1] is clang; accrue their on-CPU via sched_switch; at exit sum wall & cpu for clang.
+tracepoint:syscalls:sys_enter_execve {
+    if (strcontains(str(args->argv[1], 56), "clang")) { @isclang[pid] = 1; }
+}
+tracepoint:sched:sched_process_exec /comm == "mldr"/ {
+    if (@isclang[pid]) { @start[pid] = nsecs; @acc[pid] = 0; }
+}
+tracepoint:sched:sched_switch {
+    if (@last[args->prev_pid]) {
+        if (@start[args->prev_pid]) { @acc[args->prev_pid] += nsecs - @last[args->prev_pid]; }
+        delete(@last[args->prev_pid]);
+    }
+    if (@start[args->next_pid]) { @last[args->next_pid] = nsecs; }
+}
+tracepoint:sched:sched_process_exit /@start[pid]/ {
+    $life = (uint64)(nsecs - @start[pid]);
+    @clang_cnt = count();
+    @clang_wall_us = sum($life / 1000);
+    @clang_cpu_us = sum(@acc[pid] / 1000);
+    @clang_cpupct = hist($life > 0 ? (uint64)(100 * @acc[pid] / $life) : 0);
+    delete(@start[pid]); delete(@acc[pid]); delete(@last[pid]); delete(@isclang[pid]);
+}
+END {
+    clear(@start); clear(@acc); clear(@last); clear(@isclang);
+    printf("\n=== clang: count / wall us / on-CPU us ===\n");
+    print(@clang_cnt); print(@clang_wall_us); print(@clang_cpu_us);
+    printf("=== clang per-proc on-CPU %% ===\n"); print(@clang_cpupct);
+}
