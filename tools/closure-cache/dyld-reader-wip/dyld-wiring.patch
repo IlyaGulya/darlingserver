@@ -1,0 +1,160 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0cac88e..b48bc8d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -108,6 +108,7 @@ add_executable(system_loader
+ 	dyld3/ClosureWriter.cpp
+ 	dyld3/Tracing.cpp
+ 	dyld3/Loading.cpp
++	dyld3/DCC2Reader.cpp
+ 	dyld3/Diagnostics.cpp
+ 	dyld3/SharedCacheRuntime.cpp
+ 	dyld3/shared-cache/DyldSharedCache.cpp
+diff --git a/dyld3/Loading.cpp b/dyld3/Loading.cpp
+index e2a9720..dec66c8 100644
+--- a/dyld3/Loading.cpp
++++ b/dyld3/Loading.cpp
+@@ -311,6 +311,25 @@ void Loader::mapAndFixupAllImages(Diagnostics& diag, bool processDOFs, bool from
+                 }
+             }
+         }
++        else if ( (_dcc2 != nullptr) && _dcc2->enabled() && (info.loadedAddress() == nullptr)
++                  && !info.image()->isExecutable() ) {
++            // perf#24c2c: flag-gated DCC2 path. If this image is in the packed cache, take it over:
++            // set its loadedAddress into the cache arena and mark it fixedUp so the normal Mach-O
++            // fixup engine is SKIPPED (that path is known-wrong for region-packed layout). The
++            // cache-native fixup table is applied below.
++            uint32_t dccIdx = 0;
++            const MachOLoaded* dccAddr = _dcc2->loadedAddressFor(info.image()->path(), &dccIdx);
++            if ( dccAddr != nullptr ) {
++                info.setLoadedAddress(dccAddr);
++                info.setState(LoadedImage::State::mapped);   // fixups applied by DCC2 table below
++                _logSegments("dyld[DCC2]: using cached image %s @ %p\n", info.image()->path(), dccAddr);
++            }
++            else {
++                mapImage(diag, info, fromOFI, closureOutOfDate);
++                if ( diag.hasError() )
++                    break;
++            }
++        }
+         else {
+             mapImage(diag, info, fromOFI, closureOutOfDate);
+             if ( diag.hasError() )
+@@ -334,6 +353,28 @@ void Loader::mapAndFixupAllImages(Diagnostics& diag, bool processDOFs, bool from
+             mainInfo = &info;
+             continue;
+         }
++        // perf#24c2c: DCC2-owned images use the cache-native fixup table, NEVER the normal Mach-O
++        // fixup engine (known-wrong for region-packed layout). Enforce that as a hard invariant.
++        if ( (_dcc2 != nullptr) && _dcc2->enabled() && _dcc2->isDCCImage(info.loadedAddress()) ) {
++            if ( info.state() < LoadedImage::State::fixedUp ) {
++                uint32_t dccIdx = 0;
++                if ( _dcc2->loadedAddressFor(info.image()->path(), &dccIdx) == nullptr ) {
++                    diag.error("DCC2: image %s marked DCC but not found in cache", info.image()->path());
++                    break;
++                }
++                Loader* self = this;
++                bool ok = _dcc2->applyFixups(dccIdx, _logFixups,
++                    ^(const char* symbolName, bool& found) {
++                        return self->dcc2ResolveExtern(symbolName, found);
++                    });
++                if ( !ok ) {
++                    diag.error("DCC2: fixup application failed (hard fail) for %s", info.image()->path());
++                    break;
++                }
++                info.setState(LoadedImage::State::fixedUp);
++            }
++            continue;
++        }
+         // previously loaded images were previously fixed up
+         if ( info.state() < LoadedImage::State::fixedUp ) {
+             applyFixupsToImage(diag, info);
+@@ -788,8 +829,37 @@ static const char* targetString(const MachOAnalyzerSet::FixupTarget& target)
+     return "";
+ }
+ 
++uintptr_t Loader::dcc2ResolveExtern(const char* symbolName, bool& found) const
++{
++    // perf#24c2c: resolve a DCC2 flat/extern symbol via the normal dyld exported-symbol lookup over
++    // the already-loaded images. No silent NULL: 'found' stays false if not resolved.
++    found = false;
++    MachOLoaded::DependentToMachOLoaded finder = ^(const MachOLoaded*, uint32_t) { return (const MachOLoaded*)nullptr; };
++    for (const LoadedImage& li : _newImages) {
++        if ( li.loadedAddress() == nullptr )
++            continue;
++        Diagnostics d2;
++        const MachOAnalyzer* ma = (const MachOAnalyzer*)li.loadedAddress();
++        MachOAnalyzer::FoundSymbol fs;
++        if ( ma->findExportedSymbol(d2, symbolName, false, fs, finder) ) {
++            uintptr_t base = (uintptr_t)fs.foundInDylib;
++            switch ( fs.kind ) {
++                case MachOAnalyzer::FoundSymbol::Kind::headerOffset:   found = true; return base + (uintptr_t)fs.value;
++                case MachOAnalyzer::FoundSymbol::Kind::absolute:       found = true; return (uintptr_t)fs.value;
++                case MachOAnalyzer::FoundSymbol::Kind::resolverOffset: found = true; return base + (uintptr_t)fs.resolverFuncOffset;
++            }
++        }
++    }
++    return 0;
++}
++
+ void Loader::applyFixupsToImage(Diagnostics& diag, LoadedImage& info)
+ {
++    // perf#24c2c INVARIANT: a DCC2-owned image must NEVER reach the normal Mach-O fixup engine —
++    // that path assumes contiguous file layout and is known-wrong for region-packed images.
++    if ( (_dcc2 != nullptr) && _dcc2->enabled() && _dcc2->isDCCImage(info.loadedAddress()) )
++        dyld::halt("DCC2: region-packed image entered normal Mach-O fixup path (invariant violation)");
++
+     dyld3::ScopedTimer timer(DBG_DYLD_TIMING_APPLY_FIXUPS, (uint64_t)info.loadedAddress(), 0, 0);
+     closure::ImageNum       cacheImageNum;
+     const char*             leafName         = info.image()->leafName();
+diff --git a/dyld3/Loading.h b/dyld3/Loading.h
+index 8baece4..df48ef4 100644
+--- a/dyld3/Loading.h
++++ b/dyld3/Loading.h
+@@ -34,6 +34,7 @@
+ #include "Closure.h"
+ #include "MachOLoaded.h"
+ #include "MachOAnalyzerSet.h"
++#include "DCC2Reader.h"
+ 
+ namespace objc_opt {
+ struct objc_clsopt_t;
+@@ -111,6 +112,7 @@ public:
+                                bool allowMissingLazies=false, dyld3::LaunchErrorInfo* launchErrorInfo=nullptr);
+ 
+     void                addImage(const LoadedImage&);
++    void                setDCC2Reader(DCC2Reader* r) { _dcc2 = r; }   // perf#24c2c (flag-gated)
+     void                completeAllDependents(Diagnostics& diag, bool& someCacheImageOverridden);
+     void                mapAndFixupAllImages(Diagnostics& diag, bool processDOFs, bool fromOFI, bool* closureOutOfDate, bool* recoverable);
+     uintptr_t           resolveTarget(closure::Image::ResolvedSymbolTarget target);
+@@ -154,6 +156,7 @@ private:
+ 
+     void                mapImage(Diagnostics& diag, LoadedImage& info, bool fromOFI, bool* closureOutOfDate);
+     void                applyFixupsToImage(Diagnostics& diag, LoadedImage& info);
++    uintptr_t           dcc2ResolveExtern(const char* symbolName, bool& found) const;   // perf#24c2c
+     void                registerDOFs(const Array<DOFInfo>& dofs);
+     void                setSegmentProtects(const LoadedImage& info, bool write);
+ 	bool                sandboxBlockedMmap(const char* path);
+@@ -189,6 +192,7 @@ private:
+     LogFunc                                         _logFixups;
+     LogFunc                                         _logDofs;
+     dyld3::LaunchErrorInfo*                         _launchErrorInfo;
++    DCC2Reader*                                     _dcc2 = nullptr;   // perf#24c2c (flag-gated; null=off)
+ };
+ 
+ 
+diff --git a/src/dyld2.cpp b/src/dyld2.cpp
+index 3710870..d421c9e 100644
+--- a/src/dyld2.cpp
++++ b/src/dyld2.cpp
+@@ -6108,6 +6108,10 @@ static bool launchWithClosure(const dyld3::closure::LaunchClosure* mainClosure,
+ 		}
+ 	});
+ 
++	// perf#24c2c: flag-gated DCC2 packed-cache reader (DARLING_DYLD_DCC2=1 + DARLING_DYLD_DCC2_PATH).
++	// Absent => nullptr => exact old behavior. Present+broken => halt (or clean fallback if _SOFT=1).
++	loader.setDCC2Reader(dyld3::DCC2Reader::init(envp, (gLinkContext.verboseMapping ? &dolog : &nolog)));
++
+ 	// recursively load all dependents and fill in allImages array
+ 	bool someCacheImageOverridden = false;
+ 	loader.completeAllDependents(diag, someCacheImageOverridden);
