@@ -25,7 +25,11 @@
 /* fixup kinds */
 #define DCC_FIX_REBASE        0   /* *loc += slide (target is same image) */
 #define DCC_FIX_BIND_INTERNAL 1   /* *loc = region[tgt_region].vm_base + tgt_off + slide */
-#define DCC_FIX_BIND_EXTERN   2   /* *loc = resolver(extern_sym) + addend  (runtime symbol lookup) */
+#define DCC_FIX_BIND_EXTERN   2   /* *loc = resolver(extern_sym) + addend  (runtime symbol lookup; hard-fail if unresolved) */
+#define DCC_FIX_BIND_EXTERN_LAZY 3 /* like EXTERN but from a LAZY bind: resolver may legitimately not find it
+                                    * (Darling stub gap). If unresolved, DO NOT hard-fail — write a sentinel
+                                    * (0) preserving lazy "resolve/trap on first call" semantics; the symbol
+                                    * is never called during the paths we care about. */
 
 /* pointer type for a fixup location (all are 8-byte pointers in x86_64 __DATA here) */
 struct dcc_region { uint64_t file_off; uint64_t size; uint64_t vm_base; uint32_t prot; uint32_t _pad; };
