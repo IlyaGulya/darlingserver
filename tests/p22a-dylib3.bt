@@ -1,0 +1,6 @@
+tracepoint:syscalls:sys_enter_openat /comm=="mldr"/ {
+  @o = count();  // total opens
+}
+tracepoint:syscalls:sys_enter_execve /comm=="mldr"/ { @execs=count(); }
+kprobe:vm_mmap_pgoff /comm=="mldr"/ { @vmmap=count(); }  // actual file mmaps into AS
+END { printf("execs / total-opens / vm_mmap:\n"); print(@execs); print(@o); print(@vmmap); }
