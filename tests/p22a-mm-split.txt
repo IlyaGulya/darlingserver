@@ -1,0 +1,5 @@
+perf#22a mm-split (guest mldr, 3x 200-file clang -j8 builds):
+exit_mmap    1.488s  88%  2508 calls @593us  (AS teardown - DOMINANT)
+copy_page_range 0.203s 12% 237935 calls @853ns (fork COW PTE-copy - cheap, NOT lever)
+faults 2.69M (minor 2.63M, major 155~0 = warm cache); mmap ~206/proc; vm_mmap ~212/exec
+VERDICT E: process reuse / teardown avoidance

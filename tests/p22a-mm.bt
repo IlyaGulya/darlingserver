@@ -1,0 +1,22 @@
+// perf#22a: split guest (mldr) mm/startup kernel cost into fork-copy vs exec-teardown vs fault vs exit.
+// kprobes on the key kernel functions; count + time each.
+kprobe:copy_page_range { @t_forkcopy[tid]=nsecs; }          // fork COW PTE copy (dup_mmap->copy_page_range)
+kretprobe:copy_page_range /@t_forkcopy[tid]/ { @forkcopy_ns=sum(nsecs-@t_forkcopy[tid]); @forkcopy=count(); delete(@t_forkcopy[tid]); }
+kprobe:exit_mmap /comm=="mldr"/ { @t_exitmmap[tid]=nsecs; }  // full AS teardown (exec's old-AS free + process exit)
+kretprobe:exit_mmap /@t_exitmmap[tid]/ { @exitmmap_ns=sum(nsecs-@t_exitmmap[tid]); @exitmmap=count(); delete(@t_exitmmap[tid]); }
+kprobe:__handle_mm_fault /comm=="mldr"/ { @t_fault[tid]=nsecs; }
+kretprobe:__handle_mm_fault /@t_fault[tid]/ { @fault_ns=sum(nsecs-@t_fault[tid]); @fault=count(); delete(@t_fault[tid]); }
+// minor vs major fault
+software:page-faults:1 /comm=="mldr"/ { @minorfault=count(); }
+software:major-faults:1 /comm=="mldr"/ { @majorfault=count(); }
+// mmap syscalls (dylib mapping)
+tracepoint:syscalls:sys_enter_mmap /comm=="mldr"/ { @mmap=count(); }
+tracepoint:syscalls:sys_enter_munmap /comm=="mldr"/ { @munmap=count(); }
+END {
+  clear(@t_forkcopy); clear(@t_exitmmap); clear(@t_fault);
+  printf("\n=== FORK PTE-copy (copy_page_range): count + total_ns ===\n"); print(@forkcopy); print(@forkcopy_ns);
+  printf("=== EXEC/EXIT teardown (exit_mmap): count + total_ns ===\n"); print(@exitmmap); print(@exitmmap_ns);
+  printf("=== page fault handler (__handle_mm_fault): count + total_ns ===\n"); print(@fault); print(@fault_ns);
+  printf("=== minor / major faults ===\n"); print(@minorfault); print(@majorfault);
+  printf("=== mmap / munmap syscalls ===\n"); print(@mmap); print(@munmap);
+}
