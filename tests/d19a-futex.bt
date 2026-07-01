@@ -1,0 +1,26 @@
+// D19a host futex census (v3): FILTERED to Darling guest (comm=="mldr") + darlingserver. Removes host
+// noise (Bun/docker/tailscale/etc). Futex op split + WAIT blocking-time total + duration histogram + top TIDs.
+tracepoint:syscalls:sys_enter_futex /comm == "mldr" || comm == "darlingserver"/ {
+    $op = args->op & 0x7f;
+    @op_cnt[comm, $op] = count();
+    if ($op == 0 || $op == 9) { @wstart[tid] = nsecs; }
+    if ($op == 1) { @wake_cnt[comm] = count(); }
+}
+tracepoint:syscalls:sys_exit_futex /@wstart[tid]/ {
+    $dur = nsecs - @wstart[tid];
+    @wait_ns_total[comm] = sum($dur);
+    @wait_cnt[comm] = count();
+    @wait_hist_us[comm] = hist($dur / 1000);
+    @wait_ns_by_tid[comm, tid] = sum($dur);
+    delete(@wstart[tid]);
+}
+END {
+    clear(@wstart);
+    printf("\n=== [mldr/darlingserver] futex op counts (0=WAIT 1=WAKE 3=REQ 4=CMPREQ 5/9=WAKEOP/WAITBIT 6/7=PI) ===\n");
+    print(@op_cnt);
+    printf("\n=== WAIT total blocking-ns (Darling only) ===\n"); print(@wait_ns_total);
+    printf("\n=== WAIT count ===\n"); print(@wait_cnt);
+    printf("\n=== WAKE count ===\n"); print(@wake_cnt);
+    printf("\n=== WAIT duration histogram (us) ===\n"); print(@wait_hist_us);
+    printf("\n=== top TIDs by WAIT ns ===\n"); print(@wait_ns_by_tid, 12);
+}
