@@ -252,7 +252,8 @@ static void emit_rebase(struct src_img*im,int imgIdx,int segIndex,uint64_t segOf
     struct dcc_fixup*f=fix_new(); f->kind=DCC_FIX_REBASE; f->loc_region=reg; f->loc_off=roff; f->image_index=imgIdx;
     c_rebase++;
 }
-static void emit_bind(struct src_img*im,int imgIdx,int segIndex,uint64_t segOff,const char*sym,int ord,int64_t addend){
+static int c_lazy_rebase=0;
+static void emit_bind(struct src_img*im,int imgIdx,int segIndex,uint64_t segOff,const char*sym,int ord,int64_t addend,int isLazy){
     int reg; uint64_t roff;
     if(seg_to_cache(im,segIndex,segOff,&reg,&roff)){ fprintf(stderr,"ABORT bind seg map %s\n",im->path); exit(1);}
     struct dcc_fixup*f=fix_new(); f->loc_region=reg; f->loc_off=roff; f->addend=addend; f->image_index=imgIdx;
@@ -264,7 +265,15 @@ static void emit_bind(struct src_img*im,int imgIdx,int segIndex,uint64_t segOff,
     } else if(ord==-2){ /* flat */
         int w; if(resolve_flat(sym,&tr,&troff,&w)){ f->kind=DCC_FIX_BIND_INTERNAL; f->tgt_region=tr; f->tgt_off=troff; c_bind_flat_resolved++; done=1; }
     }
-    if(!done){ /* extern: leave for runtime dyld resolver, record symbol */
+    if(!done){
+        /* perf#24c2d fix: an UNRESOLVED LAZY bind must preserve lazy semantics. Under normal dyld the
+         * __la_symbol_ptr slot is resolved only on FIRST CALL via the stub helper; if the symbol is
+         * genuinely absent (a Darling stub gap, e.g. libcorecrypto's _ccchacha20) and never called, boot
+         * never fails. DCC2 resolves eagerly, so a hard EXTERN here would abort a whole process for a
+         * symbol it never calls. Emit BIND_EXTERN_LAZY: the reader tries to resolve it and, if not found,
+         * writes a sentinel instead of hard-failing. A REGULAR (non-lazy) unresolved bind still becomes
+         * EXTERN (must resolve). */
+        if(isLazy){ f->kind=DCC_FIX_BIND_EXTERN_LAZY; f->extern_sym=extern_add(sym); c_lazy_rebase++; return; }
         f->kind=DCC_FIX_BIND_EXTERN; f->extern_sym=extern_add(sym); c_bind_extern++;
         if(ord>=1 || ord==0){ c_unresolved++;  /* two-level/self that we FAILED to resolve = suspicious */
             if(getenv("DCC2_DEBUG")){ const char*dep=(ord>=1&&ord<=im->ndeps)?im->deps[ord-1]:"<self>";
@@ -293,13 +302,16 @@ static void walk_rebases(struct src_img*im,int imgIdx){
     }
 }
 /* walk bind opcode stream */
-static void walk_binds(struct src_img*im,int imgIdx){
-    if(!im->di||!im->di->bind_size)return;
-    const uint8_t*p=im->map+im->sliceOff+im->di->bind_off, *e=p+im->di->bind_size;
+/* walk a bind opcode stream (regular/lazy/weak share the encoding). isLazy: the LAZY stream resets
+ * ordinal/symbol per DO_BIND but the SET_* ops precede each; treat identically — emit_bind resolves. */
+static void walk_bind_stream(struct src_img*im,int imgIdx,const uint8_t*p,const uint8_t*e,int isLazy){
     int segIndex=0; uint64_t segOff=0; int ord=0; const char*sym=""; int64_t addend=0;
     while(p<e){ uint8_t op=*p++; uint8_t im4=op&0x0f; op&=0xf0;
         switch(op){
-            case BIND_OP_DONE: return;
+            case BIND_OP_DONE:
+                /* regular/weak: DONE ends the stream. lazy: DONE just separates per-symbol records. */
+                if(!isLazy) return;
+                break;
             case BIND_OP_SET_DYLIB_ORDINAL_IMM: ord=im4; break;
             case BIND_OP_SET_DYLIB_ORDINAL_ULEB: ord=(int)uleb(&p,e); break;
             case BIND_OP_SET_DYLIB_SPECIAL_IMM: ord=(im4==0)?0:(int8_t)(im4|0xf0); break;
@@ -308,13 +320,24 @@ static void walk_binds(struct src_img*im,int imgIdx){
             case BIND_OP_SET_ADDEND_SLEB: addend=sleb(&p,e); break;
             case BIND_OP_SET_SEGMENT_AND_OFFSET_ULEB: segIndex=im4; segOff=uleb(&p,e); break;
             case BIND_OP_ADD_ADDR_ULEB: segOff+=uleb(&p,e); break;
-            case BIND_OP_DO_BIND: emit_bind(im,imgIdx,segIndex,segOff,sym,ord,addend); segOff+=PTR; break;
-            case BIND_OP_DO_BIND_ADD_ADDR_ULEB: emit_bind(im,imgIdx,segIndex,segOff,sym,ord,addend); segOff+=PTR+uleb(&p,e); break;
-            case BIND_OP_DO_BIND_ADD_ADDR_IMM_SCALED: emit_bind(im,imgIdx,segIndex,segOff,sym,ord,addend); segOff+=PTR+(uint64_t)im4*PTR; break;
-            case BIND_OP_DO_BIND_ULEB_TIMES_SKIPPING_ULEB: { uint64_t cnt=uleb(&p,e); uint64_t skip=uleb(&p,e); for(uint64_t i=0;i<cnt;i++){ emit_bind(im,imgIdx,segIndex,segOff,sym,ord,addend); segOff+=PTR+skip; } } break;
+            case BIND_OP_DO_BIND: emit_bind(im,imgIdx,segIndex,segOff,sym,ord,addend,isLazy); segOff+=PTR; break;
+            case BIND_OP_DO_BIND_ADD_ADDR_ULEB: emit_bind(im,imgIdx,segIndex,segOff,sym,ord,addend,isLazy); segOff+=PTR+uleb(&p,e); break;
+            case BIND_OP_DO_BIND_ADD_ADDR_IMM_SCALED: emit_bind(im,imgIdx,segIndex,segOff,sym,ord,addend,isLazy); segOff+=PTR+(uint64_t)im4*PTR; break;
+            case BIND_OP_DO_BIND_ULEB_TIMES_SKIPPING_ULEB: { uint64_t cnt=uleb(&p,e); uint64_t skip=uleb(&p,e); for(uint64_t i=0;i<cnt;i++){ emit_bind(im,imgIdx,segIndex,segOff,sym,ord,addend,isLazy); segOff+=PTR+skip; } } break;
             default: fprintf(stderr,"ABORT unknown bind op 0x%x in %s\n",op,im->path); exit(1);
         }
     }
+}
+/* perf#24c2d fix: DCC2 skips the normal fixup engine entirely, so EVERY pointer slot must be fixed at
+ * build time — including LAZY binds (__la_symbol_ptr, normally resolved on first call via the stub helper)
+ * and WEAK binds. Walking only the regular bind stream left __la_symbol_ptr slots holding raw file bytes
+ * (a stale __stub_helper vmaddr) => deref lands on header/section-table bytes (fault addr == "__text"
+ * sectname). The 2-dylib smoke passed only because leaf dylibs have no lazy binds. */
+static void walk_binds(struct src_img*im,int imgIdx){
+    if(!im->di) return;
+    if(im->di->bind_size)      walk_bind_stream(im,imgIdx, im->map+im->sliceOff+im->di->bind_off,      im->map+im->sliceOff+im->di->bind_off+im->di->bind_size, 0);
+    if(im->di->lazy_bind_size) walk_bind_stream(im,imgIdx, im->map+im->sliceOff+im->di->lazy_bind_off, im->map+im->sliceOff+im->di->lazy_bind_off+im->di->lazy_bind_size, 1);
+    if(im->di->weak_bind_size) walk_bind_stream(im,imgIdx, im->map+im->sliceOff+im->di->weak_bind_off, im->map+im->sliceOff+im->di->weak_bind_off+im->di->weak_bind_size, 0);
 }
 
 int main(int argc,char**argv){
@@ -400,6 +423,25 @@ int main(int argc,char**argv){
         /* seg-in-region invariant */
         for(int s=0;s<im->nsegs;s++){ struct dcc_seg*ds=&di->segs[s]; uint64_t rb=hdr.regions[ds->region_idx].vm_base,rs=hdr.regions[ds->region_idx].size;
             if(ds->vmaddr<rb||ds->vmaddr+ds->vmsize>rb+roundup(rs,DCC2_REGION_ALIGN)){fprintf(stderr,"ABORT seg outside region %s %.16s\n",im->path,ds->name);return 1;} }
+
+        /* perf#24c2d fix: rewrite the stored REBASE pointer VALUES in DATA.
+         * A rebase slot holds an ORIGINAL same-image vmaddr; the reader applies *loc += slide (slide=arena).
+         * That yields orig_vmaddr+arena, but after region-repacking the target lives at
+         * region_relative_vmaddr+arena. So each stored value must be translated from its original vmaddr to
+         * the region-relative vmaddr of whichever source segment contains it, BEFORE the slide is added.
+         * Without this, non-zero-repacked images (everything after image 0) rebase to garbage and crash at
+         * first deref (early launchd SIGSEGV, ObjC section-pointer walk). */
+        for(uint32_t fi=0;fi<g_nfix;fi++){ struct dcc_fixup*f=&g_fix[fi];
+            if(f->image_index!=(uint32_t)i || f->kind!=DCC_FIX_REBASE) continue;
+            uint64_t rfile = (f->loc_region==0)?rx_file : (f->loc_region==1)?rw_file : ro_file;
+            uint64_t*loc=(uint64_t*)(out+rfile+f->loc_off);
+            uint64_t orig=*loc; int found=0;
+            for(int s=0;s<im->nsegs;s++){ struct src_seg*sg=&im->segs[s];
+                if(orig>=sg->vmaddr && orig<sg->vmaddr+sg->vmsize){
+                    *loc = di->segs[s].vmaddr + (orig - sg->vmaddr); found=1; break; } }
+            if(!found){ fprintf(stderr,"ABORT rebase value 0x%llx in %s not within any segment\n",
+                (unsigned long long)orig, im->path); return 1; }
+        }
     }
 
     /* assign per-image fixup ranges (fixups were emitted grouped per image, in order) */
@@ -418,6 +460,6 @@ int main(int argc,char**argv){
     fprintf(stderr,"  fixups=%u  rebases=%d  binds=%d  [internal(ord)=%d self=%d flat-resolved=%d extern=%d]  extern-strtab=%uB\n",
         g_nfix,c_rebase,c_bind_internal+c_bind_self+c_bind_flat_resolved+c_bind_extern,
         c_bind_internal,c_bind_self,c_bind_flat_resolved,c_bind_extern,g_extlen);
-    fprintf(stderr,"  UNRESOLVED (two-level/self that fell back to extern = suspicious)=%d\n",c_unresolved);
+    fprintf(stderr,"  UNRESOLVED (two-level/self that fell back to extern = suspicious)=%d  lazy-unresolved-kept-as-rebase=%d\n",c_unresolved,c_lazy_rebase);
     return 0;
 }

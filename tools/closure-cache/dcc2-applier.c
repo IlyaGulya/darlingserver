@@ -80,7 +80,7 @@ int main(int argc,char**argv){
     /* --- ACCEPTANCE 2: table counts & classification --- */
     int n_rebase=0,n_bind_int=0,n_extern=0,n_bad_kind=0;
     for(uint32_t i=0;i<h->fixup_count;i++){
-        switch(fix[i].kind){ case DCC_FIX_REBASE:n_rebase++;break; case DCC_FIX_BIND_INTERNAL:n_bind_int++;break; case DCC_FIX_BIND_EXTERN:n_extern++;break; default:n_bad_kind++; }
+        switch(fix[i].kind){ case DCC_FIX_REBASE:n_rebase++;break; case DCC_FIX_BIND_INTERNAL:n_bind_int++;break; case DCC_FIX_BIND_EXTERN:case DCC_FIX_BIND_EXTERN_LAZY:n_extern++;break; default:n_bad_kind++; }
     }
     printf("  table: rebases=%d bind_internal=%d bind_extern=%d bad=%d\n",n_rebase,n_bind_int,n_extern,n_bad_kind);
     CHECK(n_bad_kind==0,"no unknown fixup kinds");
@@ -109,7 +109,7 @@ int main(int argc,char**argv){
         /* location must be in RW (region 1) — DATA fixups only */
         if(!(f->loc_region==1 && IN_REGION(1,f->loc_off,8))) loc_out++;
         if(f->kind==DCC_FIX_BIND_INTERNAL){ if(!IN_REGION(f->tgt_region,f->tgt_off,1)) tgt_out++; }
-        else if(f->kind==DCC_FIX_BIND_EXTERN){ if(!(f->extern_sym<h->extern_size)) extern_unbucketed++; }
+        else if(f->kind==DCC_FIX_BIND_EXTERN||f->kind==DCC_FIX_BIND_EXTERN_LAZY){ if(!(f->extern_sym<h->extern_size)) extern_unbucketed++; }
     }
 
     if(redArm){
