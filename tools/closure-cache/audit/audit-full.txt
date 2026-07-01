@@ -1,0 +1,79 @@
+dylib                              enc     rebases  binds  | bind-classes
+                                   ------  -------  -----  | --------------------------------------
+libSystem.B.dylib                  opcode       216    153  | ord=0 self=153 flat=0 main=0 weak=0 other=0
+libc++.1.dylib                     opcode      1776    187  | ord=187 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libc++abi.dylib libSystem.B.dylib
+libc++abi.dylib                    opcode      1454      6  | ord=6 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libSystem.B.dylib
+libncurses.5.4.dylib               opcode      1631      6  | ord=6 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libSystem.B.dylib
+libobjc.A.dylib                    opcode       926      9  | ord=8 self=1 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdyld.dylib libsystem_blocks.dylib libsystem_kernel.dylib libc++abi.dylib
+libresolv.9.dylib                  opcode       274      6  | ord=6 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdyld.dylib libsystem_info.dylib
+libz.1.dylib                       opcode        41      2  | ord=2 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libSystem.B.dylib
+libcache.dylib                     opcode         2      1  | ord=1 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib
+libcommonCrypto.dylib              opcode       358     89  | ord=89 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib libsystem_kernel.dylib libsystem_c.dylib libcorecrypto.dylib libsystem_trace.dylib
+libcompiler_rt.dylib               opcode        30      3  | ord=3 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdyld.dylib
+libcopyfile.dylib                  opcode       162     13  | ord=13 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_kernel.dylib libsystem_blocks.dylib libquarantine.dylib libsystem_c.dylib libdyld.dylib
+libcorecrypto.dylib                opcode        92      2  | ord=2 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib libsystem_c.dylib
+libdispatch.dylib                  opcode      5699    102  | ord=102 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libsystem_kernel.dylib libsystem_blocks.dylib libdyld.dylib libobjc.A.dylib
+libdyld.dylib                      opcode      1124     39  | ord=39 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libsystem_kernel.dylib libsystem_malloc.dylib libsystem_blocks.dylib libsystem_pthread.dylib libsystem_sandbox.dylib libdispatch.dylib
+libkeymgr.dylib                    opcode        13      3  | ord=3 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdyld.dylib libsystem_kernel.dylib
+liblaunch.dylib                    opcode        78      8  | ord=8 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libsystem_kernel.dylib libdyld.dylib
+libmacho.dylib                     opcode       128     16  | ord=16 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_kernel.dylib libdyld.dylib libsystem_c.dylib libsystem_malloc.dylib
+libquarantine.dylib                opcode         6      1  | ord=1 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib
+libremovefile.dylib                opcode        42      3  | ord=3 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdyld.dylib
+libsystem_asl.dylib                opcode       392     49  | ord=49 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libsystem_kernel.dylib libdispatch.dylib libsystem_blocks.dylib libsystem_duct.dylib libdyld.dylib libxpc.dylib libsystem_trace.dylib
+libsystem_blocks.dylib             opcode        10      2  | ord=0 self=0 flat=2 main=0 weak=0 other=0
+libsystem_c.dylib                  opcode       997    317  | ord=317 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_kernel.dylib libdyld.dylib libsystem_malloc.dylib libsystem_pthread.dylib libsystem_blocks.dylib libsystem_m.dylib libsystem_platform.dylib liblaunch.dylib libsystem_notify.dylib libdispatch.dylib libsystem_info.dylib libmacho.dylib libsystem_duct.dylib libsystem_asl.dylib libcorecrypto.dylib libsystem_trace.dylib
+libsystem_configuration.dylib      opcode        68     17  | ord=17 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_trace.dylib libxpc.dylib libdyld.dylib libsystem_blocks.dylib libsystem_c.dylib
+libsystem_coreservices.dylib       opcode       106      1  | ord=1 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib
+libsystem_coretls.dylib            opcode       217      5  | ord=5 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib libsystem_c.dylib libsystem_blocks.dylib libxpc.dylib
+libsystem_darwin.dylib             opcode       453     95  | ord=95 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libmacho.dylib libdyld.dylib libsystem_kernel.dylib libsystem_malloc.dylib libsystem_c.dylib libdispatch.dylib libxpc.dylib libsystem_trace.dylib libsystem_blocks.dylib libsystem_platform.dylib
+libsystem_dnssd.dylib              opcode         1      1  | ord=1 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib
+libsystem_duct.dylib               opcode         1      2  | ord=2 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_kernel.dylib libdyld.dylib
+libsystem_info.dylib               opcode       577     27  | ord=27 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdyld.dylib libsystem_blocks.dylib libsystem_kernel.dylib libsystem_duct.dylib libxpc.dylib libsystem_trace.dylib
+libsystem_kernel.dylib             opcode      1240     14  | ord=14 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdyld.dylib
+libsystem_m.dylib                  opcode         1      2  | ord=2 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdyld.dylib
+libsystem_malloc.dylib             opcode       197      9  | ord=9 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_kernel.dylib libdyld.dylib libsystem_c.dylib
+libsystem_networkextension.dylib   opcode         1      1  | ord=1 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib
+libsystem_notify.dylib             opcode        86     16  | ord=16 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libsystem_kernel.dylib libsystem_blocks.dylib libdyld.dylib libxpc.dylib libdispatch.dylib
+libsystem_platform.dylib           opcode        63     36  | ord=36 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_kernel.dylib libsystem_c.dylib libdyld.dylib
+libsystem_pthread.dylib            opcode        74     10  | ord=10 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_kernel.dylib libdyld.dylib libsystem_c.dylib libsystem_platform.dylib
+libsystem_sandbox.dylib            opcode         7      1  | ord=1 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libdyld.dylib
+libsystem_trace.dylib              opcode       152     15  | ord=15 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libdispatch.dylib libdyld.dylib libsystem_blocks.dylib libobjc.A.dylib
+libunwind.dylib                    opcode        40      3  | ord=0 self=0 flat=3 main=0 weak=0 other=0
+libxpc.dylib                       opcode      4672    123  | ord=123 self=0 flat=0 main=0 weak=0 other=0
+                                     -> deps bound: libsystem_c.dylib libsystem_kernel.dylib libsystem_blocks.dylib libdispatch.dylib libdyld.dylib libobjc.A.dylib
