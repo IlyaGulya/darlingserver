@@ -1,0 +1,429 @@
+dyld: Main executable mapped /Library/Developer/CommandLineTools/usr/bin/clang
+        __PAGEZERO at 0x00000000->0x100000000
+            __TEXT at 0x100000000->0x1037EC000
+            __DATA at 0x1037EC000->0x103A7B000
+        __LINKEDIT at 0x103A7B000->0x10418E000
+dyld: Mapping /usr/lib/libncurses.5.4.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00047FE4, path=/usr/lib/libncurses.5.4.dylib
+            __TEXT at 0x77CE4B4B4000->0x77CE4B4EDFFF with permissions r.x
+            __DATA at 0x77CE4B4EE000->0x77CE4B4F1FFF with permissions rw.
+        __LINKEDIT at 0x77CE4B4F2000->0x77CE4B4FBFE3 with permissions r..
+dyld: Mapping /usr/lib/libz.1.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00019C14, path=/usr/lib/libz.1.dylib
+            __TEXT at 0x77CE4B49A000->0x77CE4B4B0FFF with permissions r.x
+            __DATA at 0x77CE4B4B1000->0x77CE4B4B1FFF with permissions rw.
+        __LINKEDIT at 0x77CE4B4B2000->0x77CE4B4B3C13 with permissions r..
+dyld: Mapping /usr/lib/libSystem.B.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000129D4, path=/usr/lib/libSystem.B.dylib
+            __TEXT at 0x77CE4B487000->0x77CE4B48EFFF with permissions r.x
+            __DATA at 0x77CE4B48F000->0x77CE4B490FFF with permissions rw.
+        __LINKEDIT at 0x77CE4B491000->0x77CE4B4999D3 with permissions r..
+dyld: Mapping /usr/lib/libc++.1.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000B0D2C, path=/usr/lib/libc++.1.dylib
+            __TEXT at 0x77CE49E86000->0x77CE49EEDFFF with permissions r.x
+            __DATA at 0x77CE49EEE000->0x77CE49EF3FFF with permissions rw.
+        __LINKEDIT at 0x77CE49EFA000->0x77CE49F3CD2B with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_sandbox.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00002CB0, path=/usr/lib/system/libsystem_sandbox.dylib
+            __TEXT at 0x77CE4B5F3000->0x77CE4B5F3FFF with permissions r.x
+            __DATA at 0x77CE4B5F4000->0x77CE4B5F4FFF with permissions rw.
+        __LINKEDIT at 0x77CE4B5F5000->0x77CE4B5F5CAF with permissions r..
+dyld: Mapping /usr/lib/system/libquarantine.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00002FC0, path=/usr/lib/system/libquarantine.dylib
+            __TEXT at 0x77CE4B5F0000->0x77CE4B5F0FFF with permissions r.x
+            __DATA at 0x77CE4B5F1000->0x77CE4B5F1FFF with permissions rw.
+        __LINKEDIT at 0x77CE4B5F2000->0x77CE4B5F2FBF with permissions r..
+dyld: Mapping /usr/lib/system/libremovefile.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00004D18, path=/usr/lib/system/libremovefile.dylib
+            __TEXT at 0x77CE4B5EB000->0x77CE4B5EDFFF with permissions r.x
+            __DATA at 0x77CE4B5EE000->0x77CE4B5EEFFF with permissions rw.
+        __LINKEDIT at 0x77CE4B5EF000->0x77CE4B5EFD17 with permissions r..
+dyld: Mapping /usr/lib/system/libcopyfile.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000E360, path=/usr/lib/system/libcopyfile.dylib
+            __TEXT at 0x77CE4B478000->0x77CE4B482FFF with permissions r.x
+            __DATA at 0x77CE4B483000->0x77CE4B483FFF with permissions rw.
+        __LINKEDIT at 0x77CE4B484000->0x77CE4B48635F with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_coreservices.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00002838, path=/usr/lib/system/libsystem_coreservices.dylib
+            __TEXT at 0x77CE4B5E8000->0x77CE4B5E8FFF with permissions r.x
+            __DATA at 0x77CE4B5E9000->0x77CE4B5E9FFF with permissions rw.
+        __LINKEDIT at 0x77CE4B5EA000->0x77CE4B5EA837 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_coretls.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000232C8, path=/usr/lib/system/libsystem_coretls.dylib
+            __TEXT at 0x77CE4B454000->0x77CE4B46EFFF with permissions r.x
+            __DATA at 0x77CE4B46F000->0x77CE4B46FFFF with permissions rw.
+        __LINKEDIT at 0x77CE4B470000->0x77CE4B4772C7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_malloc.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0003FF38, path=/usr/lib/system/libsystem_malloc.dylib
+            __TEXT at 0x77CE4B413000->0x77CE4B444FFF with permissions r.x
+            __DATA at 0x77CE4B445000->0x77CE4B44AFFF with permissions rw.
+        __LINKEDIT at 0x77CE4B44C000->0x77CE4B453F37 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_c.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0012CC00, path=/usr/lib/system/libsystem_c.dylib
+            __TEXT at 0x77CE49D56000->0x77CE49E1AFFF with permissions r.x
+            __DATA at 0x77CE49E1B000->0x77CE49E21FFF with permissions rw.
+        __LINKEDIT at 0x77CE49E25000->0x77CE49E85BFF with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_kernel.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000AACCC, path=/usr/lib/system/libsystem_kernel.dylib
+            __TEXT at 0x77CE49C9A000->0x77CE49CFBFFF with permissions r.x
+            __DATA at 0x77CE49CFC000->0x77CE49D04FFF with permissions rw.
+        __LINKEDIT at 0x77CE49D17000->0x77CE49D55CCB with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_trace.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000A104, path=/usr/lib/system/libsystem_trace.dylib
+            __TEXT at 0x77CE49C8F000->0x77CE49C94FFF with permissions r.x
+            __DATA at 0x77CE49C95000->0x77CE49C95FFF with permissions rw.
+        __LINKEDIT at 0x77CE49C96000->0x77CE49C99103 with permissions r..
+dyld: Mapping /usr/lib/system/libkeymgr.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000027D8, path=/usr/lib/system/libkeymgr.dylib
+            __TEXT at 0x77CE49C8C000->0x77CE49C8CFFF with permissions r.x
+            __DATA at 0x77CE49C8D000->0x77CE49C8DFFF with permissions rw.
+        __LINKEDIT at 0x77CE49C8E000->0x77CE49C8E7D7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_m.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000422CC, path=/usr/lib/system/libsystem_m.dylib
+            __TEXT at 0x77CE49C49000->0x77CE49C78FFF with permissions r.x
+            __DATA at 0x77CE49C79000->0x77CE49C79FFF with permissions rw.
+        __LINKEDIT at 0x77CE49C7A000->0x77CE49C8B2CB with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_info.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00061518, path=/usr/lib/system/libsystem_info.dylib
+            __TEXT at 0x77CE49BE6000->0x77CE49C1DFFF with permissions r.x
+            __DATA at 0x77CE49C1E000->0x77CE49C1FFFF with permissions rw.
+        __LINKEDIT at 0x77CE49C21000->0x77CE49C48517 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_notify.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00010694, path=/usr/lib/system/libsystem_notify.dylib
+            __TEXT at 0x77CE49BD5000->0x77CE49BE0FFF with permissions r.x
+            __DATA at 0x77CE49BE1000->0x77CE49BE1FFF with permissions rw.
+        __LINKEDIT at 0x77CE49BE2000->0x77CE49BE5693 with permissions r..
+dyld: Mapping /usr/lib/system/libdispatch.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000D74C0, path=/usr/lib/system/libdispatch.dylib
+            __TEXT at 0x77CE49AFB000->0x77CE49B7EFFF with permissions r.x
+            __DATA at 0x77CE49B7F000->0x77CE49B95FFF with permissions rw.
+        __LINKEDIT at 0x77CE49B98000->0x77CE49BD44BF with permissions r..
+dyld: Mapping /usr/lib/system/liblaunch.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00011454, path=/usr/lib/system/liblaunch.dylib
+            __TEXT at 0x77CE49AE9000->0x77CE49AF1FFF with permissions r.x
+            __DATA at 0x77CE49AF2000->0x77CE49AF2FFF with permissions rw.
+        __LINKEDIT at 0x77CE49AF3000->0x77CE49AFA453 with permissions r..
+dyld: Mapping /usr/lib/system/libcompiler_rt.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000F0A8, path=/usr/lib/system/libcompiler_rt.dylib
+            __TEXT at 0x77CE49AD9000->0x77CE49ADFFFF with permissions r.x
+            __DATA at 0x77CE49AE0000->0x77CE49AE0FFF with permissions rw.
+        __LINKEDIT at 0x77CE49AE1000->0x77CE49AE80A7 with permissions r..
+dyld: Mapping /usr/lib/system/libdyld.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0008BE38, path=/usr/lib/system/libdyld.dylib
+            __TEXT at 0x77CE49A4D000->0x77CE49AAAFFF with permissions r.x
+            __DATA at 0x77CE49AAB000->0x77CE49AAFFFF with permissions rw.
+        __LINKEDIT at 0x77CE49AB0000->0x77CE49AD8E37 with permissions r..
+dyld: Mapping /usr/lib/system/libmacho.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00009E9C, path=/usr/lib/system/libmacho.dylib
+            __TEXT at 0x77CE49A43000->0x77CE49A49FFF with permissions r.x
+            __DATA at 0x77CE49A4A000->0x77CE49A4AFFF with permissions rw.
+        __LINKEDIT at 0x77CE49A4B000->0x77CE49A4CE9B with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_pthread.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00011A80, path=/usr/lib/system/libsystem_pthread.dylib
+            __TEXT at 0x77CE49A30000->0x77CE49A3AFFF with permissions r.x
+            __DATA at 0x77CE49A3B000->0x77CE49A3BFFF with permissions rw.
+        __LINKEDIT at 0x77CE49A3D000->0x77CE49A42A7F with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_platform.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000B300, path=/usr/lib/system/libsystem_platform.dylib
+            __TEXT at 0x77CE49A24000->0x77CE49A2AFFF with permissions r.x
+            __DATA at 0x77CE49A2B000->0x77CE49A2BFFF with permissions rw.
+        __LINKEDIT at 0x77CE49A2C000->0x77CE49A2F2FF with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_asl.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000325B8, path=/usr/lib/system/libsystem_asl.dylib
+            __TEXT at 0x77CE499F1000->0x77CE49A17FFF with permissions r.x
+            __DATA at 0x77CE49A18000->0x77CE49A19FFF with permissions rw.
+        __LINKEDIT at 0x77CE49A1A000->0x77CE49A235B7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_duct.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000024F8, path=/usr/lib/system/libsystem_duct.dylib
+            __TEXT at 0x77CE499EE000->0x77CE499EEFFF with permissions r.x
+            __DATA at 0x77CE499EF000->0x77CE499EFFFF with permissions rw.
+        __LINKEDIT at 0x77CE499F0000->0x77CE499F04F7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_blocks.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000027CC, path=/usr/lib/system/libsystem_blocks.dylib
+            __TEXT at 0x77CE499EB000->0x77CE499EBFFF with permissions r.x
+            __DATA at 0x77CE499EC000->0x77CE499ECFFF with permissions rw.
+        __LINKEDIT at 0x77CE499ED000->0x77CE499ED7CB with permissions r..
+dyld: Mapping /usr/lib/system/libxpc.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00045904, path=/usr/lib/system/libxpc.dylib
+            __TEXT at 0x77CE499A5000->0x77CE499C2FFF with permissions r.x
+            __DATA at 0x77CE499C3000->0x77CE499CFFFF with permissions rw.
+        __LINKEDIT at 0x77CE499D0000->0x77CE499EA903 with permissions r..
+dyld: Mapping /usr/lib/system/libcorecrypto.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00025F3C, path=/usr/lib/system/libcorecrypto.dylib
+            __TEXT at 0x77CE4997E000->0x77CE4999AFFF with permissions r.x
+            __DATA at 0x77CE4999B000->0x77CE4999BFFF with permissions rw.
+        __LINKEDIT at 0x77CE4999D000->0x77CE499A4F3B with permissions r..
+dyld: Mapping /usr/lib/system/libcommonCrypto.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0001A0AC, path=/usr/lib/system/libcommonCrypto.dylib
+            __TEXT at 0x77CE49963000->0x77CE49971FFF with permissions r.x
+            __DATA at 0x77CE49972000->0x77CE49973FFF with permissions rw.
+        __LINKEDIT at 0x77CE49974000->0x77CE4997D0AB with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_dnssd.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00003A20, path=/usr/lib/system/libsystem_dnssd.dylib
+            __TEXT at 0x77CE4995F000->0x77CE49960FFF with permissions r.x
+            __DATA at 0x77CE49961000->0x77CE49961FFF with permissions rw.
+        __LINKEDIT at 0x77CE49962000->0x77CE49962A1F with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_networkextension.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000021A0, path=/usr/lib/system/libsystem_networkextension.dylib
+            __TEXT at 0x77CE4995C000->0x77CE4995CFFF with permissions r.x
+            __DATA at 0x77CE4995D000->0x77CE4995DFFF with permissions rw.
+        __LINKEDIT at 0x77CE4995E000->0x77CE4995E19F with permissions r..
+dyld: Mapping /usr/lib/system/libunwind.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000F160, path=/usr/lib/system/libunwind.dylib
+            __TEXT at 0x77CE4994C000->0x77CE49952FFF with permissions r.x
+            __DATA at 0x77CE49953000->0x77CE49953FFF with permissions rw.
+        __LINKEDIT at 0x77CE49954000->0x77CE4995B15F with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_darwin.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00013E84, path=/usr/lib/system/libsystem_darwin.dylib
+            __TEXT at 0x77CE49938000->0x77CE49942FFF with permissions r.x
+            __DATA at 0x77CE49943000->0x77CE49945FFF with permissions rw.
+        __LINKEDIT at 0x77CE49946000->0x77CE4994BE83 with permissions r..
+dyld: Mapping /usr/lib/system/libcache.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000038E8, path=/usr/lib/system/libcache.dylib
+            __TEXT at 0x77CE49934000->0x77CE49935FFF with permissions r.x
+            __DATA at 0x77CE49936000->0x77CE49936FFF with permissions rw.
+        __LINKEDIT at 0x77CE49937000->0x77CE499378E7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_configuration.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00006264, path=/usr/lib/system/libsystem_configuration.dylib
+            __TEXT at 0x77CE4992D000->0x77CE4992FFFF with permissions r.x
+            __DATA at 0x77CE49930000->0x77CE49930FFF with permissions rw.
+        __LINKEDIT at 0x77CE49931000->0x77CE49933263 with permissions r..
+dyld: Mapping /usr/lib/libobjc.A.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00072350, path=/usr/lib/libobjc.A.dylib
+            __TEXT at 0x77CE498B4000->0x77CE49905FFF with permissions r.x
+            __DATA at 0x77CE49906000->0x77CE49909FFF with permissions rw.
+        __LINKEDIT at 0x77CE49910000->0x77CE4992C34F with permissions r..
+dyld: Mapping /usr/lib/libc++abi.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0003ACA8, path=/usr/lib/libc++abi.dylib
+            __TEXT at 0x77CE49879000->0x77CE49898FFF with permissions r.x
+            __DATA at 0x77CE49899000->0x77CE4989CFFF with permissions rw.
+        __LINKEDIT at 0x77CE4989D000->0x77CE498B3CA7 with permissions r..
+dyld: Mapping /usr/lib/libresolv.9.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0002708C, path=/usr/lib/libresolv.9.dylib
+            __TEXT at 0x77CE49850000->0x77CE49870FFF with permissions r.x
+            __DATA at 0x77CE49871000->0x77CE49871FFF with permissions rw.
+        __LINKEDIT at 0x77CE49873000->0x77CE4987808B with permissions r..
+Total pre-main time:   3.70 milliseconds (100.0%)
+         dylib loading time:   1.13 milliseconds (30.7%)
+        rebase/binding time:   0.28 milliseconds (7.6%)
+            ObjC setup time:   0.11 milliseconds (3.2%)
+           initializer time:   2.16 milliseconds (58.3%)
+           slowest intializers :
+             libSystem.B.dylib :   1.07 milliseconds (29.1%)
+                         clang :   0.62 milliseconds (16.9%)
+
+dyld: Main executable mapped /Library/Developer/CommandLineTools/usr/bin/clang
+        __PAGEZERO at 0x00000000->0x100000000
+            __TEXT at 0x100000000->0x1037EC000
+            __DATA at 0x1037EC000->0x103A7B000
+        __LINKEDIT at 0x103A7B000->0x10418E000
+dyld: Mapping /usr/lib/libncurses.5.4.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00047FE4, path=/usr/lib/libncurses.5.4.dylib
+            __TEXT at 0x71D144C6E000->0x71D144CA7FFF with permissions r.x
+            __DATA at 0x71D144CA8000->0x71D144CABFFF with permissions rw.
+        __LINKEDIT at 0x71D144CAC000->0x71D144CB5FE3 with permissions r..
+dyld: Mapping /usr/lib/libz.1.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00019C14, path=/usr/lib/libz.1.dylib
+            __TEXT at 0x71D144C54000->0x71D144C6AFFF with permissions r.x
+            __DATA at 0x71D144C6B000->0x71D144C6BFFF with permissions rw.
+        __LINKEDIT at 0x71D144C6C000->0x71D144C6DC13 with permissions r..
+dyld: Mapping /usr/lib/libSystem.B.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000129D4, path=/usr/lib/libSystem.B.dylib
+            __TEXT at 0x71D144C41000->0x71D144C48FFF with permissions r.x
+            __DATA at 0x71D144C49000->0x71D144C4AFFF with permissions rw.
+        __LINKEDIT at 0x71D144C4B000->0x71D144C539D3 with permissions r..
+dyld: Mapping /usr/lib/libc++.1.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000B0D2C, path=/usr/lib/libc++.1.dylib
+            __TEXT at 0x71D143686000->0x71D1436EDFFF with permissions r.x
+            __DATA at 0x71D1436EE000->0x71D1436F3FFF with permissions rw.
+        __LINKEDIT at 0x71D1436FA000->0x71D14373CD2B with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_sandbox.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00002CB0, path=/usr/lib/system/libsystem_sandbox.dylib
+            __TEXT at 0x71D144DAD000->0x71D144DADFFF with permissions r.x
+            __DATA at 0x71D144DAE000->0x71D144DAEFFF with permissions rw.
+        __LINKEDIT at 0x71D144DAF000->0x71D144DAFCAF with permissions r..
+dyld: Mapping /usr/lib/system/libquarantine.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00002FC0, path=/usr/lib/system/libquarantine.dylib
+            __TEXT at 0x71D144DAA000->0x71D144DAAFFF with permissions r.x
+            __DATA at 0x71D144DAB000->0x71D144DABFFF with permissions rw.
+        __LINKEDIT at 0x71D144DAC000->0x71D144DACFBF with permissions r..
+dyld: Mapping /usr/lib/system/libremovefile.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00004D18, path=/usr/lib/system/libremovefile.dylib
+            __TEXT at 0x71D144DA5000->0x71D144DA7FFF with permissions r.x
+            __DATA at 0x71D144DA8000->0x71D144DA8FFF with permissions rw.
+        __LINKEDIT at 0x71D144DA9000->0x71D144DA9D17 with permissions r..
+dyld: Mapping /usr/lib/system/libcopyfile.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000E360, path=/usr/lib/system/libcopyfile.dylib
+            __TEXT at 0x71D144C32000->0x71D144C3CFFF with permissions r.x
+            __DATA at 0x71D144C3D000->0x71D144C3DFFF with permissions rw.
+        __LINKEDIT at 0x71D144C3E000->0x71D144C4035F with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_coreservices.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00002838, path=/usr/lib/system/libsystem_coreservices.dylib
+            __TEXT at 0x71D144DA2000->0x71D144DA2FFF with permissions r.x
+            __DATA at 0x71D144DA3000->0x71D144DA3FFF with permissions rw.
+        __LINKEDIT at 0x71D144DA4000->0x71D144DA4837 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_coretls.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000232C8, path=/usr/lib/system/libsystem_coretls.dylib
+            __TEXT at 0x71D143662000->0x71D14367CFFF with permissions r.x
+            __DATA at 0x71D14367D000->0x71D14367DFFF with permissions rw.
+        __LINKEDIT at 0x71D14367E000->0x71D1436852C7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_malloc.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0003FF38, path=/usr/lib/system/libsystem_malloc.dylib
+            __TEXT at 0x71D143621000->0x71D143652FFF with permissions r.x
+            __DATA at 0x71D143653000->0x71D143658FFF with permissions rw.
+        __LINKEDIT at 0x71D14365A000->0x71D143661F37 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_c.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0012CC00, path=/usr/lib/system/libsystem_c.dylib
+            __TEXT at 0x71D1434F1000->0x71D1435B5FFF with permissions r.x
+            __DATA at 0x71D1435B6000->0x71D1435BCFFF with permissions rw.
+        __LINKEDIT at 0x71D1435C0000->0x71D143620BFF with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_kernel.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000AACCC, path=/usr/lib/system/libsystem_kernel.dylib
+            __TEXT at 0x71D143435000->0x71D143496FFF with permissions r.x
+            __DATA at 0x71D143497000->0x71D14349FFFF with permissions rw.
+        __LINKEDIT at 0x71D1434B2000->0x71D1434F0CCB with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_trace.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000A104, path=/usr/lib/system/libsystem_trace.dylib
+            __TEXT at 0x71D144C27000->0x71D144C2CFFF with permissions r.x
+            __DATA at 0x71D144C2D000->0x71D144C2DFFF with permissions rw.
+        __LINKEDIT at 0x71D144C2E000->0x71D144C31103 with permissions r..
+dyld: Mapping /usr/lib/system/libkeymgr.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000027D8, path=/usr/lib/system/libkeymgr.dylib
+            __TEXT at 0x71D144C24000->0x71D144C24FFF with permissions r.x
+            __DATA at 0x71D144C25000->0x71D144C25FFF with permissions rw.
+        __LINKEDIT at 0x71D144C26000->0x71D144C267D7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_m.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000422CC, path=/usr/lib/system/libsystem_m.dylib
+            __TEXT at 0x71D1433F2000->0x71D143421FFF with permissions r.x
+            __DATA at 0x71D143422000->0x71D143422FFF with permissions rw.
+        __LINKEDIT at 0x71D143423000->0x71D1434342CB with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_info.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00061518, path=/usr/lib/system/libsystem_info.dylib
+            __TEXT at 0x71D14338F000->0x71D1433C6FFF with permissions r.x
+            __DATA at 0x71D1433C7000->0x71D1433C8FFF with permissions rw.
+        __LINKEDIT at 0x71D1433CA000->0x71D1433F1517 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_notify.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00010694, path=/usr/lib/system/libsystem_notify.dylib
+            __TEXT at 0x71D144C13000->0x71D144C1EFFF with permissions r.x
+            __DATA at 0x71D144C1F000->0x71D144C1FFFF with permissions rw.
+        __LINKEDIT at 0x71D144C20000->0x71D144C23693 with permissions r..
+dyld: Mapping /usr/lib/system/libdispatch.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000D74C0, path=/usr/lib/system/libdispatch.dylib
+            __TEXT at 0x71D1432B5000->0x71D143338FFF with permissions r.x
+            __DATA at 0x71D143339000->0x71D14334FFFF with permissions rw.
+        __LINKEDIT at 0x71D143352000->0x71D14338E4BF with permissions r..
+dyld: Mapping /usr/lib/system/liblaunch.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00011454, path=/usr/lib/system/liblaunch.dylib
+            __TEXT at 0x71D1432A3000->0x71D1432ABFFF with permissions r.x
+            __DATA at 0x71D1432AC000->0x71D1432ACFFF with permissions rw.
+        __LINKEDIT at 0x71D1432AD000->0x71D1432B4453 with permissions r..
+dyld: Mapping /usr/lib/system/libcompiler_rt.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000F0A8, path=/usr/lib/system/libcompiler_rt.dylib
+            __TEXT at 0x71D143293000->0x71D143299FFF with permissions r.x
+            __DATA at 0x71D14329A000->0x71D14329AFFF with permissions rw.
+        __LINKEDIT at 0x71D14329B000->0x71D1432A20A7 with permissions r..
+dyld: Mapping /usr/lib/system/libdyld.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0008BE38, path=/usr/lib/system/libdyld.dylib
+            __TEXT at 0x71D143207000->0x71D143264FFF with permissions r.x
+            __DATA at 0x71D143265000->0x71D143269FFF with permissions rw.
+        __LINKEDIT at 0x71D14326A000->0x71D143292E37 with permissions r..
+dyld: Mapping /usr/lib/system/libmacho.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00009E9C, path=/usr/lib/system/libmacho.dylib
+            __TEXT at 0x71D1431FD000->0x71D143203FFF with permissions r.x
+            __DATA at 0x71D143204000->0x71D143204FFF with permissions rw.
+        __LINKEDIT at 0x71D143205000->0x71D143206E9B with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_pthread.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00011A80, path=/usr/lib/system/libsystem_pthread.dylib
+            __TEXT at 0x71D1431EA000->0x71D1431F4FFF with permissions r.x
+            __DATA at 0x71D1431F5000->0x71D1431F5FFF with permissions rw.
+        __LINKEDIT at 0x71D1431F7000->0x71D1431FCA7F with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_platform.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000B300, path=/usr/lib/system/libsystem_platform.dylib
+            __TEXT at 0x71D1431DE000->0x71D1431E4FFF with permissions r.x
+            __DATA at 0x71D1431E5000->0x71D1431E5FFF with permissions rw.
+        __LINKEDIT at 0x71D1431E6000->0x71D1431E92FF with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_asl.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000325B8, path=/usr/lib/system/libsystem_asl.dylib
+            __TEXT at 0x71D1431AB000->0x71D1431D1FFF with permissions r.x
+            __DATA at 0x71D1431D2000->0x71D1431D3FFF with permissions rw.
+        __LINKEDIT at 0x71D1431D4000->0x71D1431DD5B7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_duct.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000024F8, path=/usr/lib/system/libsystem_duct.dylib
+            __TEXT at 0x71D1431A8000->0x71D1431A8FFF with permissions r.x
+            __DATA at 0x71D1431A9000->0x71D1431A9FFF with permissions rw.
+        __LINKEDIT at 0x71D1431AA000->0x71D1431AA4F7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_blocks.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000027CC, path=/usr/lib/system/libsystem_blocks.dylib
+            __TEXT at 0x71D1431A5000->0x71D1431A5FFF with permissions r.x
+            __DATA at 0x71D1431A6000->0x71D1431A6FFF with permissions rw.
+        __LINKEDIT at 0x71D1431A7000->0x71D1431A77CB with permissions r..
+dyld: Mapping /usr/lib/system/libxpc.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00045904, path=/usr/lib/system/libxpc.dylib
+            __TEXT at 0x71D14315F000->0x71D14317CFFF with permissions r.x
+            __DATA at 0x71D14317D000->0x71D143189FFF with permissions rw.
+        __LINKEDIT at 0x71D14318A000->0x71D1431A4903 with permissions r..
+dyld: Mapping /usr/lib/system/libcorecrypto.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00025F3C, path=/usr/lib/system/libcorecrypto.dylib
+            __TEXT at 0x71D143138000->0x71D143154FFF with permissions r.x
+            __DATA at 0x71D143155000->0x71D143155FFF with permissions rw.
+        __LINKEDIT at 0x71D143157000->0x71D14315EF3B with permissions r..
+dyld: Mapping /usr/lib/system/libcommonCrypto.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0001A0AC, path=/usr/lib/system/libcommonCrypto.dylib
+            __TEXT at 0x71D14311D000->0x71D14312BFFF with permissions r.x
+            __DATA at 0x71D14312C000->0x71D14312DFFF with permissions rw.
+        __LINKEDIT at 0x71D14312E000->0x71D1431370AB with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_dnssd.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00003A20, path=/usr/lib/system/libsystem_dnssd.dylib
+            __TEXT at 0x71D143119000->0x71D14311AFFF with permissions r.x
+            __DATA at 0x71D14311B000->0x71D14311BFFF with permissions rw.
+        __LINKEDIT at 0x71D14311C000->0x71D14311CA1F with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_networkextension.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000021A0, path=/usr/lib/system/libsystem_networkextension.dylib
+            __TEXT at 0x71D143116000->0x71D143116FFF with permissions r.x
+            __DATA at 0x71D143117000->0x71D143117FFF with permissions rw.
+        __LINKEDIT at 0x71D143118000->0x71D14311819F with permissions r..
+dyld: Mapping /usr/lib/system/libunwind.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0000F160, path=/usr/lib/system/libunwind.dylib
+            __TEXT at 0x71D143106000->0x71D14310CFFF with permissions r.x
+            __DATA at 0x71D14310D000->0x71D14310DFFF with permissions rw.
+        __LINKEDIT at 0x71D14310E000->0x71D14311515F with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_darwin.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00013E84, path=/usr/lib/system/libsystem_darwin.dylib
+            __TEXT at 0x71D1430F2000->0x71D1430FCFFF with permissions r.x
+            __DATA at 0x71D1430FD000->0x71D1430FFFFF with permissions rw.
+        __LINKEDIT at 0x71D143100000->0x71D143105E83 with permissions r..
+dyld: Mapping /usr/lib/system/libcache.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x000038E8, path=/usr/lib/system/libcache.dylib
+            __TEXT at 0x71D1430EE000->0x71D1430EFFFF with permissions r.x
+            __DATA at 0x71D1430F0000->0x71D1430F0FFF with permissions rw.
+        __LINKEDIT at 0x71D1430F1000->0x71D1430F18E7 with permissions r..
+dyld: Mapping /usr/lib/system/libsystem_configuration.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00006264, path=/usr/lib/system/libsystem_configuration.dylib
+            __TEXT at 0x71D1430E7000->0x71D1430E9FFF with permissions r.x
+            __DATA at 0x71D1430EA000->0x71D1430EAFFF with permissions rw.
+        __LINKEDIT at 0x71D1430EB000->0x71D1430ED263 with permissions r..
+dyld: Mapping /usr/lib/libobjc.A.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x00072350, path=/usr/lib/libobjc.A.dylib
+            __TEXT at 0x71D14306E000->0x71D1430BFFFF with permissions r.x
+            __DATA at 0x71D1430C0000->0x71D1430C3FFF with permissions rw.
+        __LINKEDIT at 0x71D1430CA000->0x71D1430E634F with permissions r..
+dyld: Mapping /usr/lib/libc++abi.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0003ACA8, path=/usr/lib/libc++abi.dylib
+            __TEXT at 0x71D143033000->0x71D143052FFF with permissions r.x
+            __DATA at 0x71D143053000->0x71D143056FFF with permissions rw.
+        __LINKEDIT at 0x71D143057000->0x71D14306DCA7 with permissions r..
+dyld: Mapping /usr/lib/libresolv.9.dylib (slice offset=4096)
+dyld: Speculatively read offset=0x00001000, len=0x0002708C, path=/usr/lib/libresolv.9.dylib
+            __TEXT at 0x71D14300A000->0x71D14302AFFF with permissions r.x
+            __DATA at 0x71D14302B000->0x71D14302BFFF with permissions rw.
+        __LINKEDIT at 0x71D14302D000->0x71D14303208B with permissions r..
+Total pre-main time:   3.67 milliseconds (100.0%)
+         dylib loading time:   1.11 milliseconds (30.4%)
+        rebase/binding time:   0.29 milliseconds (7.9%)
+            ObjC setup time:   0.13 milliseconds (3.7%)
+           initializer time:   2.12 milliseconds (57.8%)
+           slowest intializers :
+             libSystem.B.dylib :   1.10 milliseconds (30.1%)
+                libc++.1.dylib :   0.08 milliseconds (2.3%)
+                         clang :   0.52 milliseconds (14.2%)
+
