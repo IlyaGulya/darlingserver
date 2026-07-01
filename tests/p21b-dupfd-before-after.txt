@@ -1,0 +1,24 @@
+before (perf#21a): [k] dup_fd 13.30% #1
+after  (perf#21b): [k] dup_fd 0.09%
+
+=== perf#21b top guest on-CPU symbols (comm=mldr, relative) ===
+     9.27%  [k] _raw_spin_unlock_irqrestore                -      -            
+     3.07%  [k] zap_pte_range                              -      -            
+     2.44%  [k] do_syscall_64                              -      -            
+     2.40%  [k] next_uptodate_folio                        -      -            
+     2.25%  [.] 0x0000000000043136                         -      -            
+     1.75%  [.] 0x000000000002f245                         -      -            
+     1.57%  [k] do_user_addr_fault                         -      -            
+     1.12%  [k] ____sys_recvmsg                            -      -            
+     1.06%  [k] __raw_callee_save___pv_queued_spin_unlock  -      -            
+     1.05%  [k] clear_page_erms                            -      -            
+     1.00%  [k] filemap_map_pages                          -      -            
+     0.98%  [k] _copy_from_user                            -      -            
+     0.64%  [k] ___sys_recvmsg                             -      -            
+     0.61%  [k] __fdget                                    -      -            
+     0.61%  [k] unix_dgram_recvmsg                         -      -            
+     0.60%  [k] __d_lookup_rcu                             -      -            
+     0.58%  [k] flush_tlb_mm_range                         -      -            
+     0.57%  [k] apparmor_socket_recvmsg                    -      -            
+     0.56%  [k] __memcg_slab_free_hook                     -      -            
+     0.54%  [k] copy_mc_enhanced_fast_string               -      -            
