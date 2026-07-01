@@ -32,6 +32,7 @@ struct fat_arch   { uint32_t cputype, cpusubtype, offset, size, align; };
 struct mh64 { uint32_t magic,cputype,cpusubtype,filetype,ncmds,sizeofcmds,flags,reserved; };
 struct lc   { uint32_t cmd, cmdsize; };
 struct seg64 { uint32_t cmd,cmdsize; char segname[16]; uint64_t vmaddr,vmsize,fileoff,filesize; uint32_t maxprot,initprot,nsects,flags; };
+struct sect64 { char sectname[16]; char segname[16]; uint64_t addr,size; uint32_t offset,align,reloff,nreloc,flags,reserved1,reserved2,reserved3; };
 struct dylib_command { uint32_t cmd,cmdsize,name_off,timestamp,cur,compat; };
 struct dyld_info { uint32_t cmd,cmdsize,rebase_off,rebase_size,bind_off,bind_size,weak_bind_off,weak_bind_size,lazy_bind_off,lazy_bind_size,export_off,export_size; };
 struct uuid_cmd { uint32_t cmd,cmdsize; uint8_t uuid[16]; };
@@ -384,7 +385,16 @@ int main(int argc,char**argv){
         if(mh->magic!=MH_MAGIC_64){fprintf(stderr,"ABORT packed header %s\n",im->path);return 1;}
         struct lc*hc=(void*)((char*)mh+sizeof *mh);
         for(uint32_t ci=0;ci<mh->ncmds;ci++){ if(hc->cmd==LC_SEGMENT_64){ struct seg64*hs=(void*)hc; int ok=0;
-            for(int s=0;s<im->nsegs;s++) if(!strncmp(di->segs[s].name,hs->segname,16)){ hs->vmaddr=di->segs[s].vmaddr; ok=1; break; }
+            for(int s=0;s<im->nsegs;s++) if(!strncmp(di->segs[s].name,hs->segname,16)){
+                /* perf#24c2d fix: rewrite section addrs by the same delta as the segment vmaddr.
+                 * dyld's parseLoadCmds dereferences (sect->addr + fSlide) for specific sections
+                 * (e.g. __objc_imageinfo, ImageLoaderMachO.cpp:804); if only the LC_SEGMENT_64.vmaddr
+                 * is rewritten and section addrs keep the ORIGINAL vmaddr, that deref lands outside the
+                 * mapped region and reads garbage (libdispatch: bogus ObjC-GC flag => spurious throw). */
+                int64_t delta=(int64_t)di->segs[s].vmaddr-(int64_t)hs->vmaddr;
+                struct sect64*sc=(void*)((char*)hs+sizeof *hs);
+                for(uint32_t si=0;si<hs->nsects;si++,sc++) sc->addr=(uint64_t)((int64_t)sc->addr+delta);
+                hs->vmaddr=di->segs[s].vmaddr; ok=1; break; }
             if(!ok){fprintf(stderr,"ABORT header seg %.16s no table %s\n",hs->segname,im->path);return 1;} }
             hc=(void*)((char*)hc+hc->cmdsize); }
         /* seg-in-region invariant */
