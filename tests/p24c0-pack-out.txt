@@ -1,0 +1,25 @@
+=== PACKED PLANE LAYOUT (2-dylib toy) ===
+
+libSystem.B.dylib:
+  __TEXT      vmaddr=0x0 vmsize=0x8000  file: 0x0 -> plane+0x0 (size 0x8000)
+  __DATA      vmaddr=0x8000 vmsize=0x2000  file: 0x8000 -> plane+0x0 (size 0x2000)
+  __LINKEDIT  vmaddr=0xa000 vmsize=0x9000  file: 0xa000 -> plane+0x0 (size 0x89d4)
+
+libsystem_kernel.dylib:
+  __TEXT      vmaddr=0x0 vmsize=0x62000  file: 0x0 -> plane+0x8000 (size 0x62000)
+  __DATA      vmaddr=0x62000 vmsize=0x1b000  file: 0x62000 -> plane+0x2000 (size 0x9000)
+  __LINKEDIT  vmaddr=0x7d000 vmsize=0x3f000  file: 0x6c000 -> plane+0x9000 (size 0x3eccc)
+
+plane sizes: TEXT=0x6a000  DATA=0xb000  LINKEDIT=0x48000
+
+=== BUILDER FIXUP SET (per dylib, header-only — NO text/code bytes touched) ===
+  1. LC_SEGMENT_64.fileoff  := plane base + new_plane_off  (TEXT->text plane, DATA->data plane, LINK->link plane)
+  2. LC_DYLD_INFO_ONLY {rebase,bind,weak_bind,lazy_bind,export}_off  += (link_new - link_old)
+  3. LC_SYMTAB {symoff,stroff}  += (link_new - link_old)
+  4. LC_DYSYMTAB {indirectsymoff,...}  += (link_new - link_old)
+  5. LC_FUNCTION_STARTS / LC_DATA_IN_CODE dataoff  += (link_new - link_old)
+  6. LC_CODE_SIGNATURE dropped (Darling doesn't enforce) or offset-fixed
+  vmaddr/vmsize UNCHANGED => dladdr/dlsym/rebase/bind targets identical => IDENTITY PRESERVED
+  DATA plane mapped MAP_PRIVATE (COW) per process; TEXT+LINKEDIT MAP_SHARED RO
+
+=> VMA count: 2 dylibs x3 = 6 VMAs  ->  3 plane VMAs (TEXT/DATA/LINK). At 40 dylibs: 120 -> 3.
