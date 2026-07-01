@@ -1,0 +1,37 @@
+Attaching 7 probes...
+
+
+@argv2[-s]: 1
+@argv2[-c]: 1
+@argv2[BEGIN 17]: 1
+@argv2[-p]: 1
+@argv2[/Users/i]: 1
+@argv2[--login]: 1
+@argv2[BEGINpri]: 1
+@argv2[-rf]: 1
+@argv2[-j8]: 2
+@argv2[-l]: 2
+@argv2[f1.o]: 2
+@argv2[-d]: 2
+@argv2[+%s.%N]: 2
+@argv2[]: 200
+@argv2[-isysroo]: 200
+@copy_pte_cnt: 77543
+@copy_pte_ns: 60225174
+
+@exec_total: 418
+@exit_mmap_cnt: 837
+@exit_mmap_ns: 427904614
+@guestbin[/bin/sh]: 1
+@guestbin[mkdir]: 1
+@guestbin[make]: 1
+@guestbin[rm]: 1
+@guestbin[/usr/libexec/path_helper]: 1
+@guestbin[wc]: 2
+@guestbin[ls]: 2
+@guestbin[tr]: 2
+@guestbin[/bin/bash]: 2
+@guestbin[date]: 2
+@guestbin[awk]: 2
+@guestbin[/Library/Developer/CommandLineTools/usr/bin/]: 401
+

@@ -1,0 +1,62 @@
+=== core 52-dylib set (clang driver, pid 4141117) ===
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libbsm.0.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libbz2.1.0.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libc++.1.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libc++abi.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libcoretls_cfhelpers.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libcoretls.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libDiagnosticMessagesClient.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libenergytrace.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libicucore.A.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libMobileGestalt.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libobjc.A.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libpam.2.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libresolv.9.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libsqlite3.0.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libSystem.B.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libxar.1.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libxml2.2.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/libz.1.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libcache.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libcommonCrypto.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libcompiler_rt.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libcopyfile.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libcorecrypto.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libdispatch.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libdyld.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libkeymgr.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libkxld.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/liblaunch.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libmacho.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libquarantine.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libremovefile.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_asl.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_blocks.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_c.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_configuration.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_coreservices.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_coretls.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_darwin.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_dnssd.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_duct.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_info.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_kernel.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_malloc.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_m.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_networkextension.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_notify.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_platform.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_pthread.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_sandbox.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libsystem_trace.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libunwind.dylib
+/home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/system/libxpc.dylib
+
+=== +5 graphics-lib variant diff (57-set minus 52-set) ===
+0a1
+> /home/ilyagulya/work/darling-prefix-homebrew-test/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib
+18a20,23
+> /home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/native/libEGL.dylib
+> /home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/native/libX11.dylib
+> /home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/native/libXext.dylib
+> /home/ilyagulya/work/darling-prefix-homebrew-test/usr/lib/native/libXRandR.dylib

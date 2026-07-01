@@ -1,0 +1,43 @@
+#!/usr/bin/env bpftrace
+// perf#23a Block 1+2: process histogram + clang driver-vs-cc1 split + exit_mmap/copy_pte per comm.
+// Guest execs appear on host as execve(mldr,[mldr, <guest-bin>, <args...>]).
+// argv[1] = guest binary path; -cc1 appears in argv[2]. Keep str slices short (<48B).
+
+// --- process histogram: key by a short slice of argv[1] (the guest binary path) ---
+tracepoint:syscalls:sys_enter_execve /comm=="mldr"/
+{
+  @guestbin[str(args->argv[1], 44)] = count();
+  @exec_total = count();
+}
+
+// --- clang driver vs cc1: is argv[2] == "-cc1"? ---
+tracepoint:syscalls:sys_enter_execve /comm=="mldr"/
+{
+  @argv2[str(args->argv[2], 8)] = count();
+}
+
+// --- address-space teardown cost (all guest procs are comm=mldr) ---
+kprobe:exit_mmap /comm=="mldr"/ { @tmap_start[tid] = nsecs; }
+kretprobe:exit_mmap /comm=="mldr"/
+{
+  $s = @tmap_start[tid];
+  if ($s) {
+    @exit_mmap_ns = sum(nsecs - $s);
+    @exit_mmap_cnt = count();
+    delete(@tmap_start[tid]);
+  }
+}
+
+// --- fork COW pte-copy cost for comparison ---
+kprobe:copy_page_range /comm=="mldr"/ { @cpr_start[tid] = nsecs; }
+kretprobe:copy_page_range /comm=="mldr"/
+{
+  $s = @cpr_start[tid];
+  if ($s) {
+    @copy_pte_ns = sum(nsecs - $s);
+    @copy_pte_cnt = count();
+    delete(@cpr_start[tid]);
+  }
+}
+
+END { clear(@tmap_start); clear(@cpr_start); }
