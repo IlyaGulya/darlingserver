@@ -1,0 +1,71 @@
+### DCC2 builder ###
+-- smoke {libsystem_blocks,libunwind} --
+OK DCC2: 2 dylibs  RX=0xc000 RW=0x8000 RO=0xc000 total=0x24000
+  fixups=55  rebases=50  binds=5  [internal(ord)=0 self=0 flat-resolved=1 extern=4]  extern-strtab=64B
+  UNRESOLVED (two-level/self that fell back to extern = suspicious)=0
+-- full 40-dylib --
+OK DCC2: 40 dylibs  RX=0x52c000 RW=0xfc000 RO=0x2a0000 total=0x9c4000
+  fixups=24802  rebases=23407  binds=1395  [internal(ord)=1236 self=154 flat-resolved=5 extern=0]  extern-strtab=0B
+  UNRESOLVED (two-level/self that fell back to extern = suspicious)=0
+
+### DCC2 applier/validator ###
+-- smoke --
+=== DCC2 applier/validator ===
+  ok:   magic DCC2
+  ok:   version 2
+images=2 fixups=55 extern-strtab=64B
+  ok:   3 regions share one uniform slide (relative spacing preserved)
+  table: rebases=50 bind_internal=1 bind_extern=4 bad=0
+  ok:   no unknown fixup kinds
+  ok:   fixup kinds sum to fixup_count
+  ok:   ACCEPTANCE 4: every fixup location lands inside RW region (0 out)
+  ok:   ACCEPTANCE 5a: every internal-bind target lands inside a packed region (0 out)
+  ok:   ACCEPTANCE 5b: every extern references the resolver strtab (0 unbucketed)
+  applied 51 fixups to private RW copy (4 extern left for runtime resolver)
+  ok:   ACCEPTANCE 3: applied all rebases+internal-binds
+  ok:   spot-check: >90% of sampled rebases point within cache arena (50/50)
+  ok:   COW: writes to private RW did NOT modify the cache file (0x0)
+  ok:   ACCEPTANCE 6: every fixup attributed to an image (table fully covers DCC images)
+  ok:   header LC_SEGMENT_64.vmaddr == table vmaddr for all segs (0 mismatch)
+
+DCC2-APPLIER PASS (0 failures)
+-- full --
+=== DCC2 applier/validator ===
+  ok:   magic DCC2
+  ok:   version 2
+images=40 fixups=24802 extern-strtab=0B
+  ok:   3 regions share one uniform slide (relative spacing preserved)
+  table: rebases=23407 bind_internal=1395 bind_extern=0 bad=0
+  ok:   no unknown fixup kinds
+  ok:   fixup kinds sum to fixup_count
+  ok:   ACCEPTANCE 4: every fixup location lands inside RW region (0 out)
+  ok:   ACCEPTANCE 5a: every internal-bind target lands inside a packed region (0 out)
+  ok:   ACCEPTANCE 5b: every extern references the resolver strtab (0 unbucketed)
+  applied 24802 fixups to private RW copy (0 extern left for runtime resolver)
+  ok:   ACCEPTANCE 3: applied all rebases+internal-binds
+  ok:   spot-check: >90% of sampled rebases point within cache arena (200/200)
+  ok:   COW: writes to private RW did NOT modify the cache file (0x0)
+  ok:   ACCEPTANCE 6: every fixup attributed to an image (table fully covers DCC images)
+  ok:   header LC_SEGMENT_64.vmaddr == table vmaddr for all segs (0 mismatch)
+
+DCC2-APPLIER PASS (0 failures)
+
+### RED arms (full) — each MUST be detected ###
+-- red=1 --
+
+RED-ARM PASS (error correctly detected)
+-- red=2 --
+
+RED-ARM PASS (error correctly detected)
+-- red=3 --
+
+RED-ARM PASS (error correctly detected)
+-- red=4 --
+
+RED-ARM PASS (error correctly detected)
+
+### determinism ###
+full md5: 1 distinct (want 1) = ee17e2e3f5e6
+
+### byte-identity vs source (only header vmaddr changed) ###
+byte-identity: DATA mismatch=0 LINKEDIT mismatch=0 TEXT-body mismatch=0 (segs=120)
