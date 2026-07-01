@@ -1,0 +1,16 @@
+=== upper-bound: full closure lifecycle (400 procs) ===
+pattern    | procs | VMAs  | mmap ms | fault ms | unmap ms | total ms | minflt
+CURRENT 40x3|  400 | 48000 |    36.5 |    257.9 |     75.0 |    369.4 | 960803
+CACHE 6-reg |  400 |  2400 |     1.9 |    211.6 |      8.8 |    222.3 | 960800
+
+per-process: CURRENT 120 VMAs, CACHE 6 VMAs (20.0x fewer)
+unmap(teardown) delta: 75.0 ms -> 8.8 ms (8.5x)
+mmap(load) delta:      36.5 ms -> 1.9 ms (19.2x)
+minflt delta:          960803 -> 960800 (1.0x)
+
+=== VMA-count isolation (faulted bytes constant 9.4MB, 400 iters) ===
+nvma | unmap ms (400 iters) | us/proc | us/vma
+   6 |     55.3 |  138.15 | 23.025
+  40 |     85.0 |  212.39 |  5.310
+ 120 |    167.5 |  418.78 |  3.490
+ 240 |    251.3 |  628.17 |  2.617
