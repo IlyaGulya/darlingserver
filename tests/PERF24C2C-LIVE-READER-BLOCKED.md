@@ -65,6 +65,33 @@ cannot run regardless of DCC2 correctness. The DCC2 mechanism itself is already 
 (perf#24c2b: builder + standalone applier, 7 acceptance checks + 4 RED arms green on the same
 {libsystem_blocks, libunwind} pair).
 
+## UPDATE (perf#24c2c-pre) — DCC2 exonerated; blocker is a BUILD/TOOLCHAIN mismatch, not a source commit
+
+Root-causing the earlier A/B revealed a confound: a leftover orphaned `mldr /sbin/launchd` from a wedged
+prior boot silently blocks shellspawn, so *any* dyld looked broken until it was killed. With a corrected clean
+teardown (`darling shutdown` → kill the prefix's `darlingserver`/`vchroot`/orphan-`mldr…launchd` by PID →
+boot), the boot matrix is:
+
+| dyld | source | boots? |
+|---|---|---|
+| `79b22273` (prod-bak, pre-built backup) | matched deployed build | **YES** (reliable, 2×) |
+| built `63f667c` (submodule pointer) `17bf41c9` | current tree | **NO** |
+| built `a9c2e29` (branch HEAD, **zero DCC2**) `df6a411c` | current tree | **NO** |
+| built `a9c2e29` + DCC2 `355b44af` | current tree + reader | **NO (identical to clean a9c2e29)** |
+
+Conclusions:
+1. **The DCC2 reader is exonerated** — clean `a9c2e29` fails identically without it.
+2. **No dyld I build from this tree boots, at any commit**, while the pre-built matched binary `79b22273`
+   does. So the blocker is a **build-environment/toolchain mismatch** (my dyld build ≠ the toolchain that
+   produced the deployed, matched dyld+mldr+dylib set), **not** a source-commit choice.
+
+Therefore the **preferred path (align dyld source + rebuild only dyld) is dead.** The only remaining route to
+the live smoke is the **fallback**: rebuild+redeploy the whole closure (dyld + dylibs + mldr, one build) in a
+**disposable prefix** (fresh `DPREFIX`), prove a plain flag-OFF dyld boots there first, then enable DCC2.
+
+Note: the earlier known-good `10af572e` was overwritten during testing; the working baseline is now
+`79b22273` (restored to both prefix copies; `env-final-healthy` confirmed). mldr `f0cd2a82` intact.
+
 ## Artifacts / state
 Reader code: `src/external/dyld/dyld3/DCC2Reader.{h,cpp}`, edits in `dyld3/Loading.{h,cpp}`, `src/dyld2.cpp`,
 `CMakeLists.txt` (uncommitted in the dyld submodule working tree). prod dserver `835946f9` + mldr `f0cd2a82`
