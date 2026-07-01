@@ -1,0 +1,867 @@
+{
+  "uptime_s": 44,
+  "rpcs_serviced": 726498,
+  "replies_sent": 989075,
+  "messages_received": 989067,
+  "checkins": 667,
+  "forks": 29,
+  "inline_handled": 988934,
+  "queued_to_pool": 123,
+  "ring_serviced_spin": 457986,
+  "ring_serviced_doorbell": 720,
+  "ring_doorbells_received": 850,
+  "ring_wakes_issued": 434642,
+  "ring_wakes_skipped": 24064,
+  "ring_fast_hit": 164,
+  "ring_fast_fallback": 0,
+  "ring_fast_fail": 0,
+  "ring_s2c_full": 0,
+  "ring_fast_suspend": 0,
+  "ring_duplex_s2c": 0,
+  "ring_duplex_reject": 0,
+  "ring_duplex_parent": 0,
+  "ring_duplex_decline": 0,
+  "ring_duplex_vmdealloc_parent": 0,
+  "ring_duplex_vmdealloc_decline": 0,
+  "ring_duplex_vmdealloc_s2c": 0,
+  "ring_duplex_vmdealloc_final": 0,
+  "ring_duplex_vmdealloc_timeout": 0,
+  "ring_duplex_vmdealloc_disarmed": 0,
+  "s2c_munmap_ring_parent": 0,
+  "s2c_munmap_uds_parent": 5,
+  "s2c_munmap_no_parent": 0,
+  "msg_census_on": 0,
+  "msg_total": 0,
+  "msg_send_msg": 0,
+  "msg_rcv_msg": 0,
+  "msg_send_only": 0,
+  "msg_receive_only": 0,
+  "msg_send_receive": 0,
+  "msg_rcv_size_nonzero": 0,
+  "msg_blocking_receive": 0,
+  "msg_send_only_simple": 0,
+  "msg_send_only_complex": 0,
+  "msg_send_only_ool": 0,
+  "msg_send_only_port_descriptors": 0,
+  "msg_census_hdr_read_fail": 0,
+  "last_reply_age_ms": 24,
+  "workqueue_depth": 0,
+  "workers_total": 1,
+  "workers_busy": 0,
+  "workers_available": 1,
+  "clients_blocked_in_rpc": 0,
+  "rpc_latency": {
+    "count": 726498,
+    "mean_us": 7,
+    "p50_us": 4,
+    "p95_us": 32,
+    "p99_us": 32,
+    "max_us": 16634
+  },
+  "checkin_latency": {
+    "count": 667,
+    "mean_us": 11,
+    "p50_us": 8,
+    "p95_us": 64,
+    "p99_us": 128,
+    "max_us": 171
+  },
+  "fork_latency": {
+    "count": 29,
+    "mean_us": 55,
+    "p50_us": 64,
+    "p95_us": 256,
+    "p99_us": 256,
+    "max_us": 158
+  },
+  "per_call": {
+    "dserver_callnum_checkin": {
+      "count": 667,
+      "mean_us": 11,
+      "p50_us": 8,
+      "p95_us": 64,
+      "p99_us": 128,
+      "max_us": 171
+    },
+    "dserver_callnum_checkout": {
+      "count": 632,
+      "mean_us": 7,
+      "p50_us": 8,
+      "p95_us": 16,
+      "p99_us": 32,
+      "max_us": 310
+    },
+    "dserver_callnum_vchroot_path": {
+      "count": 77,
+      "mean_us": 9,
+      "p50_us": 8,
+      "p95_us": 32,
+      "p99_us": 32,
+      "max_us": 31
+    },
+    "dserver_callnum_started_suspended": {
+      "count": 52,
+      "mean_us": 10,
+      "p50_us": 4,
+      "p95_us": 32,
+      "p99_us": 64,
+      "max_us": 57
+    },
+    "dserver_callnum_get_tracer": {
+      "count": 26,
+      "mean_us": 6,
+      "p50_us": 4,
+      "p95_us": 32,
+      "p99_us": 32,
+      "max_us": 28
+    },
+    "dserver_callnum_uidgid": {
+      "count": 62,
+      "mean_us": 17,
+      "p50_us": 32,
+      "p95_us": 32,
+      "p99_us": 128,
+      "max_us": 92
+    },
+    "dserver_callnum_set_thread_handles": {
+      "count": 663,
+      "mean_us": 60,
+      "p50_us": 4,
+      "p95_us": 32,
+      "p99_us": 4096,
+      "max_us": 3743
+    },
+    "dserver_callnum_vchroot": {
+      "count": 1,
+      "mean_us": 26,
+      "p50_us": 32,
+      "p95_us": 32,
+      "p99_us": 32,
+      "max_us": 26
+    },
+    "dserver_callnum_mldr_path": {
+      "count": 25,
+      "mean_us": 21,
+      "p50_us": 32,
+      "p95_us": 64,
+      "p99_us": 64,
+      "max_us": 52
+    },
+    "dserver_callnum_fork_wait_for_child": {
+      "count": 29,
+      "mean_us": 257,
+      "p50_us": 256,
+      "p95_us": 512,
+      "p99_us": 1024,
+      "max_us": 807
+    },
+    "dserver_callnum_interrupt_enter": {
+      "count": 11,
+      "mean_us": 4,
+      "p50_us": 8,
+      "p95_us": 16,
+      "p99_us": 16,
+      "max_us": 10
+    },
+    "dserver_callnum_interrupt_exit": {
+      "count": 11,
+      "mean_us": 2,
+      "p50_us": 4,
+      "p95_us": 16,
+      "p99_us": 16,
+      "max_us": 8
+    },
+    "dserver_callnum_console_open": {
+      "count": 9,
+      "mean_us": 16,
+      "p50_us": 16,
+      "p95_us": 64,
+      "p99_us": 64,
+      "max_us": 36
+    },
+    "dserver_callnum_set_dyld_info": {
+      "count": 26,
+      "mean_us": 2,
+      "p50_us": 4,
+      "p95_us": 4,
+      "p99_us": 8,
+      "max_us": 6
+    },
+    "dserver_callnum_set_executable_path": {
+      "count": 26,
+      "mean_us": 4,
+      "p50_us": 8,
+      "p95_us": 8,
+      "p99_us": 16,
+      "max_us": 11
+    },
+    "dserver_callnum_kqchan_mach_port_open": {
+      "count": 8,
+      "mean_us": 2100,
+      "p50_us": 32,
+      "p95_us": 32768,
+      "p99_us": 32768,
+      "max_us": 16634
+    },
+    "dserver_callnum_kqchan_proc_open": {
+      "count": 11,
+      "mean_us": 20,
+      "p50_us": 32,
+      "p95_us": 32,
+      "p99_us": 32,
+      "max_us": 27
+    },
+    "dserver_callnum_pthread_canceled": {
+      "count": 2639,
+      "mean_us": 1,
+      "p50_us": 2,
+      "p95_us": 4,
+      "p99_us": 8,
+      "max_us": 746
+    },
+    "dserver_callnum_task_self_trap": {
+      "count": 81,
+      "mean_us": 12,
+      "p50_us": 8,
+      "p95_us": 64,
+      "p99_us": 128,
+      "max_us": 73
+    },
+    "dserver_callnum_host_self_trap": {
+      "count": 360111,
+      "mean_us": 7,
+      "p50_us": 4,
+      "p95_us": 32,
+      "p99_us": 32,
+      "max_us": 1911
+    },
+    "dserver_callnum_thread_self_trap": {
+      "count": 360693,
+      "mean_us": 6,
+      "p50_us": 4,
+      "p95_us": 32,
+      "p99_us": 32,
+      "max_us": 1534
+    },
+    "dserver_callnum_mach_reply_port": {
+      "count": 164,
+      "mean_us": 5,
+      "p50_us": 2,
+      "p95_us": 32,
+      "p99_us": 64,
+      "max_us": 34
+    },
+    "dserver_callnum_ring_attach": {
+      "count": 474,
+      "mean_us": 71,
+      "p50_us": 64,
+      "p95_us": 128,
+      "p99_us": 128,
+      "max_us": 9986
+    }
+  },
+  "rpc_heatmap_on": 1,
+  "rpc_heatmap": {
+    "dserver_callnum_checkin": {
+      "total": 667,
+      "uds": 667,
+      "ring": 0,
+      "used_fiber": 667,
+      "caller_s2c": 0,
+      "uds_p50_us": 8,
+      "uds_p99_us": 128,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_checkout": {
+      "total": 632,
+      "uds": 632,
+      "ring": 0,
+      "used_fiber": 632,
+      "caller_s2c": 0,
+      "uds_p50_us": 8,
+      "uds_p99_us": 32,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_vchroot_path": {
+      "total": 77,
+      "uds": 25,
+      "ring": 52,
+      "used_fiber": 77,
+      "caller_s2c": 0,
+      "uds_p50_us": 16,
+      "uds_p99_us": 16,
+      "ring_p50_us": 8,
+      "ring_p99_us": 32,
+      "class_simple": 1,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_started_suspended": {
+      "total": 52,
+      "uds": 26,
+      "ring": 26,
+      "used_fiber": 52,
+      "caller_s2c": 0,
+      "uds_p50_us": 4,
+      "uds_p99_us": 8,
+      "ring_p50_us": 32,
+      "ring_p99_us": 64,
+      "class_simple": 1,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_get_tracer": {
+      "total": 26,
+      "uds": 0,
+      "ring": 26,
+      "used_fiber": 26,
+      "caller_s2c": 0,
+      "uds_p50_us": 0,
+      "uds_p99_us": 0,
+      "ring_p50_us": 4,
+      "ring_p99_us": 32,
+      "class_simple": 1,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_uidgid": {
+      "total": 62,
+      "uds": 0,
+      "ring": 62,
+      "used_fiber": 62,
+      "caller_s2c": 0,
+      "uds_p50_us": 0,
+      "uds_p99_us": 0,
+      "ring_p50_us": 32,
+      "ring_p99_us": 128,
+      "class_simple": 1,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_set_thread_handles": {
+      "total": 663,
+      "uds": 219,
+      "ring": 444,
+      "used_fiber": 663,
+      "caller_s2c": 0,
+      "uds_p50_us": 4,
+      "uds_p99_us": 16,
+      "ring_p50_us": 4,
+      "ring_p99_us": 4096,
+      "class_simple": 1,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_vchroot": {
+      "total": 1,
+      "uds": 1,
+      "ring": 0,
+      "used_fiber": 1,
+      "caller_s2c": 0,
+      "uds_p50_us": 32,
+      "uds_p99_us": 32,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_mldr_path": {
+      "total": 25,
+      "uds": 0,
+      "ring": 25,
+      "used_fiber": 25,
+      "caller_s2c": 0,
+      "uds_p50_us": 0,
+      "uds_p99_us": 0,
+      "ring_p50_us": 32,
+      "ring_p99_us": 64,
+      "class_simple": 1,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_fork_wait_for_child": {
+      "total": 29,
+      "uds": 23,
+      "ring": 6,
+      "used_fiber": 29,
+      "caller_s2c": 0,
+      "uds_p50_us": 256,
+      "uds_p99_us": 512,
+      "ring_p50_us": 256,
+      "ring_p99_us": 1024,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_interrupt_enter": {
+      "total": 11,
+      "uds": 11,
+      "ring": 0,
+      "used_fiber": 11,
+      "caller_s2c": 0,
+      "uds_p50_us": 8,
+      "uds_p99_us": 16,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_interrupt_exit": {
+      "total": 11,
+      "uds": 11,
+      "ring": 0,
+      "used_fiber": 11,
+      "caller_s2c": 0,
+      "uds_p50_us": 4,
+      "uds_p99_us": 16,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_console_open": {
+      "total": 9,
+      "uds": 8,
+      "ring": 1,
+      "used_fiber": 9,
+      "caller_s2c": 0,
+      "uds_p50_us": 16,
+      "uds_p99_us": 64,
+      "ring_p50_us": 16,
+      "ring_p99_us": 16,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_set_dyld_info": {
+      "total": 26,
+      "uds": 26,
+      "ring": 0,
+      "used_fiber": 26,
+      "caller_s2c": 0,
+      "uds_p50_us": 4,
+      "uds_p99_us": 8,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_set_executable_path": {
+      "total": 26,
+      "uds": 26,
+      "ring": 0,
+      "used_fiber": 26,
+      "caller_s2c": 0,
+      "uds_p50_us": 8,
+      "uds_p99_us": 16,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_kqchan_mach_port_open": {
+      "total": 8,
+      "uds": 7,
+      "ring": 1,
+      "used_fiber": 8,
+      "caller_s2c": 0,
+      "uds_p50_us": 32,
+      "uds_p99_us": 32768,
+      "ring_p50_us": 64,
+      "ring_p99_us": 64,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_kqchan_proc_open": {
+      "total": 11,
+      "uds": 11,
+      "ring": 0,
+      "used_fiber": 11,
+      "caller_s2c": 0,
+      "uds_p50_us": 32,
+      "uds_p99_us": 32,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_pthread_canceled": {
+      "total": 2639,
+      "uds": 2634,
+      "ring": 5,
+      "used_fiber": 2639,
+      "caller_s2c": 0,
+      "uds_p50_us": 2,
+      "uds_p99_us": 8,
+      "ring_p50_us": 4,
+      "ring_p99_us": 4,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    },
+    "dserver_callnum_task_self_trap": {
+      "total": 81,
+      "uds": 0,
+      "ring": 81,
+      "used_fiber": 0,
+      "caller_s2c": 0,
+      "uds_p50_us": 0,
+      "uds_p99_us": 0,
+      "ring_p50_us": 8,
+      "ring_p99_us": 128,
+      "class_simple": 1,
+      "class_nofiber": 1,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_host_self_trap": {
+      "total": 360111,
+      "uds": 131400,
+      "ring": 228711,
+      "used_fiber": 131400,
+      "caller_s2c": 0,
+      "uds_p50_us": 2,
+      "uds_p99_us": 4,
+      "ring_p50_us": 8,
+      "ring_p99_us": 64,
+      "class_simple": 1,
+      "class_nofiber": 1,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_thread_self_trap": {
+      "total": 360693,
+      "uds": 131619,
+      "ring": 229074,
+      "used_fiber": 131619,
+      "caller_s2c": 0,
+      "uds_p50_us": 2,
+      "uds_p99_us": 4,
+      "ring_p50_us": 4,
+      "ring_p99_us": 64,
+      "class_simple": 1,
+      "class_nofiber": 1,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_mach_reply_port": {
+      "total": 164,
+      "uds": 0,
+      "ring": 164,
+      "used_fiber": 0,
+      "caller_s2c": 0,
+      "uds_p50_us": 0,
+      "uds_p99_us": 0,
+      "ring_p50_us": 2,
+      "ring_p99_us": 64,
+      "class_simple": 1,
+      "class_nofiber": 1,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "already-on-ring"
+    },
+    "dserver_callnum_ring_attach": {
+      "total": 474,
+      "uds": 474,
+      "ring": 0,
+      "used_fiber": 474,
+      "caller_s2c": 0,
+      "uds_p50_us": 64,
+      "uds_p99_us": 128,
+      "ring_p50_us": 0,
+      "ring_p99_us": 0,
+      "class_simple": 0,
+      "class_nofiber": 0,
+      "class_destroy": 0,
+      "class_caller_s2c": 0,
+      "verdict": "lane1-candidate"
+    }
+  },
+  "attach_census_on": 1,
+  "attach_census_processes": 474,
+  "attach_census_first_uds_calls": 30,
+  "attach_census_total_pre_attach_eligible": 0,
+  "attach_attempts": 474,
+  "attach_successes": 474,
+  "attach_rejects": 0,
+  "attach_mldr_callers": 0,
+  "attach_dylib_callers": 0,
+  "attach_no_ring_code": 0,
+  "attach_reject_by_reason": {},
+  "attach_ordinal": {
+    "count": 474,
+    "mean_us": 140,
+    "p50_us": 256,
+    "p95_us": 512,
+    "p99_us": 512,
+    "max_us": 297
+  },
+  "attach_census": {
+    "dserver_callnum_checkin": {
+      "pre_attach_uds": 30,
+      "post_attach_uds": 637,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_checkout": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 632,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_vchroot_path": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 25,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_started_suspended": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 26,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_set_thread_handles": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 219,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_vchroot": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 1,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_fork_wait_for_child": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 29,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_interrupt_enter": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 11,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_interrupt_exit": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 11,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_console_open": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 9,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_set_dyld_info": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 25,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_set_executable_path": {
+      "pre_attach_uds": 1,
+      "post_attach_uds": 25,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_kqchan_mach_port_open": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 8,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_kqchan_proc_open": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 11,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_pthread_canceled": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 2639,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_host_self_trap": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 131400,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_thread_self_trap": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 131619,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 1
+    },
+    "dserver_callnum_mach_msg_overwrite": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 398,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_deallocate": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 720154,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_mod_refs": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 2,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_move_member": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 18,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_construct": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 2,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_destruct": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 2,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_request_notification": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 8,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_mach_port_get_attributes": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 6,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_semaphore_signal": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 607,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_semaphore_timedwait": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 13,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_psynch_cvbroad": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 1,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_psynch_cvsignal": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 3,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_psynch_cvwait": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 5,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_psynch_mutexdrop": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 1,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_psynch_mutexwait": {
+      "pre_attach_uds": 0,
+      "post_attach_uds": 4,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    },
+    "dserver_callnum_ring_attach": {
+      "pre_attach_uds": 30,
+      "post_attach_uds": 444,
+      "pre_attach_eligible": 0,
+      "ring_eligible": 0
+    }
+  },
+  "residual_census_on": 1,
+  "residual_reason": {
+    "thread_no_ring_proc_none": 0,
+    "thread_no_ring_proc_has": 263238,
+    "thread_has_ring": 51,
+    "control_plane": 1141,
+    "ineligible": 724627
+  },
+  "residual_max_ring_threads_per_process": 3,
+  "residual_total_ring_threads_registered": 423,
+  "residual_uds_despite_lane": {
+    "dserver_callnum_vchroot_path": 25,
+    "dserver_callnum_started_suspended": 26
+  }
+}
