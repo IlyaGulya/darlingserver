@@ -1,0 +1,10 @@
+// per-syscall count + total time for guest (comm=mldr) during build
+tracepoint:raw_syscalls:sys_enter /comm=="mldr"/ { @ts[tid]=nsecs; @cnt[args->id]=count(); }
+tracepoint:raw_syscalls:sys_exit /comm=="mldr" && @ts[tid]/ {
+    @time_ns[args->id] = sum(nsecs - @ts[tid]);
+    delete(@ts[tid]);
+}
+END { clear(@ts);
+    printf("\n=== syscall COUNT by id (mldr) ===\n"); print(@cnt);
+    printf("=== syscall TOTAL TIME ns by id (mldr) ===\n"); print(@time_ns);
+}
