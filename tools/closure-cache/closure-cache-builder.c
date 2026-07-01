@@ -225,6 +225,28 @@ int main(int argc,char**argv){
             /* copy the segment file bytes into its region blob */
             memcpy(out + rfile + roff, im->map + im->sliceOff + sg->fileoff, sg->filesize);
         }
+        /* --- REWRITE the LC_SEGMENT_64 vmaddrs INSIDE the packed mach-o header ---
+         * dyld reads seg vmaddrs from the header (not our dcc_seg table): getSlide()=loadedAddr-hdrTEXT.vmaddr
+         * and segRuntime=hdrSeg.vmaddr+getSlide. The header lives in the TEXT segment bytes we just copied
+         * into the RX region at im->rx_off. Patch each LC_SEGMENT_64.vmaddr to the rewritten region-relative
+         * value so a single uniform slide reproduces every segment address. Code/text bytes are untouched;
+         * only the load-command vmaddr fields change (header is in TEXT but these are metadata, not code). */
+        {
+            struct mh64* mh=(struct mh64*)(out + rx_file + im->rx_off);
+            if(mh->magic!=MH_MAGIC_64){fprintf(stderr,"ABORT: packed header not MH_MAGIC_64 for %s\n",im->path);return 1;}
+            struct lc* hc=(struct lc*)((char*)mh+sizeof *mh);
+            for(uint32_t ci=0;ci<mh->ncmds;ci++){
+                if(hc->cmd==LC_SEGMENT_64){
+                    struct seg64* hsg=(struct seg64*)hc;
+                    int matched=0;
+                    for(int s=0;s<im->nsegs;s++){
+                        if(!strncmp(di->segs[s].name,hsg->segname,16)){ hsg->vmaddr=di->segs[s].vmaddr; matched=1; break; }
+                    }
+                    if(!matched){fprintf(stderr,"ABORT: header seg %.16s has no table entry in %s\n",hsg->segname,im->path);return 1;}
+                }
+                hc=(struct lc*)((char*)hc+hc->cmdsize);
+            }
+        }
         /* --- single-slide invariant (build-time assert) ---
          * dyld reads the REWRITTEN LC_SEGMENT vmaddrs (ds->vmaddr) and computes
          *   getSlide = loadedAddr(TEXT) - rewrittenTEXT.vmaddr ; segAddr = seg.vmaddr + slide.
