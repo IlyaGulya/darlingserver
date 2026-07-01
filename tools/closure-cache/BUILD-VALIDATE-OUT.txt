@@ -1,0 +1,8 @@
+=== builder ===
+OK: 40 dylibs, RX=0x52c000 RW=0xfc000 RO=0x2a0000 total=0x8d0000 hash=0x3ffd98502f8fed96 -> /tmp/scc.cache
+=== validate ===
+magic=44434331 ver=1 arch=1000007 images=40 total=0x8d0000
+regions: RX off=0x8000 size=0x52c000 vm=0x0 | RW off=0x534000 size=0xfc000 vm=0x52c000 | RO off=0x630000 size=0x2a0000 vm=0x628000
+uniform-slide region layout: OK (RW-RX=0x52c000 want 0x52c000; RO-RW=0xfc000 want 0xfc000)
+images=40 segs=120 | region-layout=OK seg-in-region=OK byte-identical=OK
+VMA PROJECTION: mapped as 3 regions => 3 VMAs (was 120 segs = ~120 VMAs)
