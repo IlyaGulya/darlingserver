@@ -676,7 +676,8 @@ int main(int argc,char**argv){
     for(int i=0;i<np;i++){ walk_rebases(&imgs[i],i); walk_binds(&imgs[i],i); }
 
     struct dcc_header hdr; memset(&hdr,0,sizeof hdr);
-    hdr.magic=DCC5_MAGIC; hdr.version=DCC5_VERSION; hdr.arch=CPU_TYPE_X86_64; hdr.image_count=np;
+    /* perf#24f-#107: DCC6 = DCC5 layout + per-seg orig_vmaddr/orig_vmsize (dcc_seg grew). */
+    hdr.magic=DCC6_MAGIC; hdr.version=DCC6_VERSION; hdr.arch=CPU_TYPE_X86_64; hdr.image_count=np;
     hdr.closure_hash=chash; strncpy(hdr.install_root,root,sizeof hdr.install_root-1);
 
     uint64_t tbl_off=sizeof(struct dcc_header);
@@ -705,6 +706,9 @@ int main(int argc,char**argv){
         di->image_vmbase=RXb+im->rx_off; di->nsegs=im->nsegs; di->init_index=i;
         for(int s=0;s<im->nsegs;s++){ struct src_seg*sg=&im->segs[s]; struct dcc_seg*ds=&di->segs[s];
             memcpy(ds->name,sg->name,16); ds->vmsize=sg->vmsize; ds->filesize=sg->filesize; ds->prot=sg->prot;
+            /* perf#24f-#107: record ORIGINAL seg vmaddr/vmsize so the reader can translate an
+             * export-trie address (original-image-relative) to the rewritten region-relative arena. */
+            ds->orig_vmaddr=sg->vmaddr; ds->orig_vmsize=sg->vmsize;
             uint64_t roff,vmb,rfile; int ridx=sg->region;
             if(ridx==0){roff=im->rx_off;vmb=RXb;rfile=rx_file;} else if(ridx==1){roff=im->rw_off;vmb=RWb;rfile=rw_file;} else {roff=im->ro_off;vmb=ROb;rfile=ro_file;}
             ds->region_idx=ridx; ds->region_off=roff; ds->vmaddr=vmb+roff;
