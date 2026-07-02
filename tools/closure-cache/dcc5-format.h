@@ -35,6 +35,12 @@
 
 #define DCC5_MAGIC   0x44434335u  /* "DCC5" */
 #define DCC5_VERSION 5
+/* perf#24f-#107: DCC6 adds per-segment ORIGINAL vmaddr/vmsize so the dyld reader can translate an
+ * export-trie address (which is ORIGINAL-image-relative) to the rewritten region-relative arena
+ * address. DCC5 lacked this (dcc_seg.vmaddr is the REWRITTEN value) → __DATA exports like ___stdinp
+ * resolved into the RX region (#106). Bump magic+version so any pre-#107 cache is rejected. */
+#define DCC6_MAGIC   0x44434336u  /* "DCC6" */
+#define DCC6_VERSION 6
 #define DCC5_REGION_ALIGN 0x4000
 #define DCC5_MAX_SEGS 8
 
@@ -45,7 +51,11 @@
 #define DCC_FIX_BIND_EXTERN_LAZY 3 /* like EXTERN but from a LAZY bind: resolve-or-sentinel(0), no hard-fail */
 
 struct dcc_region { uint64_t file_off; uint64_t size; uint64_t vm_base; uint32_t prot; uint32_t _pad; };
-struct dcc_seg    { char name[16]; uint64_t vmaddr; uint64_t vmsize; uint64_t region_off; uint64_t filesize; uint32_t region_idx; uint32_t prot; };
+/* perf#24f-#107: orig_vmaddr/orig_vmsize are the ORIGINAL (pre-repack) LC_SEGMENT_64 vmaddr/vmsize;
+ * vmaddr/vmsize below are the REWRITTEN region-relative values. The reader translates an
+ * original-image-relative address A via: find seg with orig_vmaddr<=A<orig_vmaddr+orig_vmsize, then
+ * runtime = arena + regions[region_idx].vm_base + region_off + (A - orig_vmaddr). */
+struct dcc_seg    { char name[16]; uint64_t vmaddr; uint64_t vmsize; uint64_t region_off; uint64_t filesize; uint32_t region_idx; uint32_t prot; uint64_t orig_vmaddr; uint64_t orig_vmsize; };
 struct dcc_image {
     char     path[256];
     uint8_t  uuid[16];
