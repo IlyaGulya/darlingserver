@@ -105,6 +105,17 @@ static int64_t sleb(const uint8_t**p,const uint8_t*e){int64_t r=0;int s=0;uint8_
 
 struct src_seg { char name[16]; uint64_t vmaddr,vmsize,fileoff,filesize; uint32_t prot; int region; };
 struct func_range { uint64_t start,end; };  /* original vmaddr range of a function */
+/* Executable sections that llvm-objdump does NOT reliably decode (perf#24f): __stubs (S_SYMBOL_STUBS)
+ * and __stub_helper. Both carry baked RIP-relative TEXT->DATA refs that region-packing breaks and that a
+ * pointer-fixup table cannot touch. Each needs a format-aware rewrite pass. */
+struct stub_sec { uint64_t addr, size, fileoff; uint32_t entsize; int kind; };  /* kind: 0=__stubs 1=__stub_helper */
+#define S_SYMBOL_STUBS 0x8
+#define S_ATTR_PURE_INSTRUCTIONS 0x80000000u
+#define S_ATTR_SOME_INSTRUCTIONS 0x00000400u
+#define DCC5_MAX_STUBSECS 16
+/* one executable section's coverage accounting (for the exec-coverage gate) */
+struct exec_sec { char seg[16], sec[16]; uint64_t addr,size,fileoff; uint32_t flags; int decoder_blind; };
+#define DCC5_MAX_EXECSECS 32
 struct src_img {
     char path[256]; char hostpath[600]; uint64_t sliceOff,sliceSize; uint8_t*map; uint64_t mapsize;
     uint64_t inode,mtime,size; uint8_t uuid[16];
@@ -120,8 +131,14 @@ struct src_img {
     struct func_range* franges; int nfranges;
     /* __text section bounds (original vmaddr) */
     uint64_t text_addr, text_size, text_fileoff;
+    /* decoder-blind rewrite sections (__stubs + __stub_helper) */
+    struct stub_sec stubsecs[DCC5_MAX_STUBSECS]; int nstubsecs;
+    /* all executable sections (for the zero-uncovered-exec-bytes gate) */
+    struct exec_sec execsecs[DCC5_MAX_EXECSECS]; int nexecsecs;
     /* per-image rip-rel accounting */
     uint32_t riprel_rewritten, riprel_sametext, riprel_skipped_pool;
+    uint32_t stub_rewritten, stub_sametext, stub_total;
+    uint32_t helper_rewritten, helper_total;
     /* data-in-text (constant pool) byte offsets within __text — bytes llvm-objdump could NOT decode and
      * that are not cc/00/90 padding. The rewriter must NEVER touch these (perf#24f safety gate). */
     uint8_t* pool_bitmap;   /* text_size bytes; 1 => undecodable-pool byte */
@@ -218,12 +235,32 @@ static int parse_image(const char*hostpath, const char*guestpath, struct src_img
             struct src_seg*d=&im->segs[im->nsegs++];
             memcpy(d->name,s->segname,16); d->vmaddr=s->vmaddr; d->vmsize=s->vmsize;
             d->fileoff=s->fileoff; d->filesize=s->filesize; d->prot=s->initprot;
-            if(!strcmp(s->segname,"__TEXT")){d->region=0; im->textVmaddr=s->vmaddr;
-                struct sect64*sc=(void*)((char*)s+sizeof *s);
-                for(uint32_t si=0;si<s->nsects;si++,sc++) if(!strncmp(sc->sectname,"__text",16)){
-                    im->text_addr=sc->addr; im->text_size=sc->size; im->text_fileoff=sc->offset; }
-            }
+            if(!strcmp(s->segname,"__TEXT")){d->region=0; im->textVmaddr=s->vmaddr;}
             else if(!strcmp(s->segname,"__LINKEDIT")) d->region=2; else d->region=1;
+            /* scan sections of EVERY segment: record __text bounds, decoder-blind stub sections, and ALL
+             * executable sections (for the zero-uncovered-exec-bytes gate). */
+            { struct sect64*sc=(void*)((char*)s+sizeof *s);
+              for(uint32_t si=0;si<s->nsects;si++,sc++){
+                int is_text = (!strncmp(sc->sectname,"__text",16) && !strcmp(s->segname,"__TEXT"));
+                int is_stubs = ((sc->flags & 0xff)==S_SYMBOL_STUBS);
+                int is_helper = (!strncmp(sc->sectname,"__stub_helper",16));
+                int has_instr = (sc->flags & (S_ATTR_PURE_INSTRUCTIONS|S_ATTR_SOME_INSTRUCTIONS))!=0;
+                int executable = is_text || is_stubs || is_helper || has_instr;
+                if(is_text){ im->text_addr=sc->addr; im->text_size=sc->size; im->text_fileoff=sc->offset; }
+                if(is_stubs || is_helper){
+                    if(im->nstubsecs>=DCC5_MAX_STUBSECS){fprintf(stderr,"%s: too many stub sections\n",path);return -1;}
+                    uint32_t es = is_stubs ? (sc->reserved2 ? sc->reserved2 : 6) : 0;   /* __stubs uniform 6; helper scanned */
+                    im->stubsecs[im->nstubsecs++]=(struct stub_sec){sc->addr,sc->size,sc->offset,es, is_stubs?0:1};
+                }
+                if(executable){
+                    if(im->nexecsecs>=DCC5_MAX_EXECSECS){fprintf(stderr,"%s: too many exec sections\n",path);return -1;}
+                    struct exec_sec*e=&im->execsecs[im->nexecsecs++];
+                    memcpy(e->seg,s->segname,16); memcpy(e->sec,sc->sectname,16);
+                    e->addr=sc->addr; e->size=sc->size; e->fileoff=sc->offset; e->flags=sc->flags;
+                    e->decoder_blind = (is_stubs || is_helper);
+                }
+              }
+            }
         } else if(c->cmd==LC_DYLD_INFO||c->cmd==LC_DYLD_INFO_ONLY){ im->di=(void*)c; }
         else if(c->cmd==LC_FUNCTION_STARTS){ im->funcstarts=(void*)c; }
         else if(c->cmd==LC_DYLD_CHAINED_FIXUPS){ im->has_chained=1; }
@@ -498,11 +535,122 @@ static int rewrite_image_text(struct src_img*im,int imgIdx,uint8_t*rxblob,
     return 0;
 }
 
+/* ===== perf#24f: MANDATORY rewrite of decoder-blind executable sections (__stubs + __stub_helper) =====
+ * llvm-objdump does NOT decode S_SYMBOL_STUBS, and treats __stub_helper as data too. Both carry baked
+ * RIP-relative TEXT->DATA refs (stub `ff25 jmp*`, helper head `4c8d1d lea r11` + `ff25 jmp*dyld_stub_binder`)
+ * that region-packing breaks. Format-aware passes rewrite them; unknown pattern in an executable section
+ * => HARD ABORT (never best-effort). */
+static int g_redstub=0;   /* 1=skip one stub, 2=wrong disp on one stub, 3=corrupt one stub's opcode */
+static int g_nostubs=0;   /* RED arm: skip __stubs pass entirely */
+static int g_nohelper=0;  /* RED arm: skip __stub_helper pass entirely */
+static int g_redhelper=0; /* 1=skip one helper rip rewrite */
+
+/* Rewrite one RIP-relative disp32 at packed offset `poff_in_seg` (disp field), whose instruction ends at
+ * original vmaddr `insn_end_va` and targets `tgt_va`. Verifies the new target lands in the expected region.
+ * Returns 0 ok (and sets *rewritten=1 if a same-DATA/RO rewrite happened, 0 if same-TEXT left as-is). */
+static int rewrite_rip_field(struct src_img*im,uint64_t RXb,uint64_t RWb,uint64_t ROb,
+                             uint8_t*rxblob,uint64_t poff_field,uint64_t insn_end_va,uint64_t tgt_va,
+                             int32_t olddisp,int forced_bad_disp,struct riprel_gate*gate,int*rewritten){
+    int64_t dText=seg_delta(im,0,RXb,RWb,ROb);
+    int tseg=seg_index_of_va(im,tgt_va);
+    if(tseg<0){ gate->target_class_bad++; fprintf(stderr,"ABORT %s rip end=0x%llx tgt=0x%llx outside all segments\n",
+        im->path,(unsigned long long)insn_end_va,(unsigned long long)tgt_va); return 1; }
+    int64_t dTgt=seg_delta(im,tseg,RXb,RWb,ROb);
+    if(dTgt==dText){ *rewritten=0; return 0; }   /* same-move: leave unchanged */
+    int64_t newdisp=(int64_t)olddisp + (dTgt-dText) + forced_bad_disp;
+    if(newdisp < -(1LL<<31) || newdisp >= (1LL<<31)){ gate->int32_overflow++;
+        fprintf(stderr,"ABORT %s rip end=0x%llx int32 overflow\n",im->path,(unsigned long long)insn_end_va); return 1; }
+    uint32_t new32=(uint32_t)(int32_t)newdisp;
+    uint8_t*loc=rxblob+poff_field;
+    loc[0]=new32&0xff; loc[1]=(new32>>8)&0xff; loc[2]=(new32>>16)&0xff; loc[3]=(new32>>24)&0xff;
+    /* verify: packed insn_end + new disp lands exactly on the moved target */
+    uint64_t packed_insn_end = (RXb+im->rx_off) + (insn_end_va - im->textVmaddr);
+    uint64_t new_tgt = packed_insn_end + (int64_t)(int32_t)new32;
+    uint64_t tbase=(im->segs[tseg].region==0)?RXb:(im->segs[tseg].region==1)?RWb:ROb;
+    uint64_t toff =(im->segs[tseg].region==0)?im->rx_off:(im->segs[tseg].region==1)?im->rw_off:im->ro_off;
+    uint64_t exp = tbase+toff+(tgt_va-im->segs[tseg].vmaddr);
+    if(!forced_bad_disp && new_tgt!=exp){ fprintf(stderr,"ABORT %s rip end=0x%llx new tgt 0x%llx != exp 0x%llx\n",
+        im->path,(unsigned long long)insn_end_va,(unsigned long long)new_tgt,(unsigned long long)exp); return 1; }
+    *rewritten=1; return 0;
+}
+
+/* __stubs: uniform 6-byte `ff 25 disp32` (or ff 15). */
+static int rewrite_stubs_section(struct src_img*im,uint64_t RXb,uint64_t RWb,uint64_t ROb,uint8_t*rxblob,
+                                 struct stub_sec*S,struct riprel_gate*gate,int*red_done){
+    if(S->entsize!=6){ fprintf(stderr,"ABORT %s __stubs entsize=%u (must be 6)\n",im->path,S->entsize); return 1; }
+    uint64_t base_off=(S->fileoff - im->segs[0].fileoff);
+    for(uint64_t k=0,n=S->size/S->entsize;k<n;k++){
+        uint64_t stub_va=S->addr+k*S->entsize;
+        const uint8_t*o=im->map+im->sliceOff+S->fileoff+k*S->entsize;
+        im->stub_total++;
+        if(!(o[0]==0xff && (o[1]==0x25||o[1]==0x15))){ fprintf(stderr,"ABORT %s __stubs@0x%llx unknown %02x%02x\n",im->path,(unsigned long long)stub_va,o[0],o[1]); return 1; }
+        int32_t disp=(int32_t)(o[2]|(o[3]<<8)|(o[4]<<16)|((uint32_t)o[5]<<24));
+        uint64_t poff_field=base_off+k*S->entsize+2; uint64_t end=stub_va+6; uint64_t tgt=end+(int64_t)disp;
+        int fb=0; if(g_redstub && !*red_done){ if(g_redstub==1){*red_done=1;im->stub_rewritten++;continue;} if(g_redstub==2){fb=0x20;*red_done=1;} if(g_redstub==3){ rxblob[base_off+k*S->entsize+1]=0x99; *red_done=1; } }
+        int rw=0; if(rewrite_rip_field(im,RXb,RWb,ROb,rxblob,poff_field,end,tgt,disp,fb,gate,&rw)) return 1;
+        if(rw) im->stub_rewritten++; else im->stub_sametext++;
+    }
+    return 0;
+}
+
+/* __stub_helper: scan for known RIP-relative forms; rewrite ff25/ff15 (indirect jmp and call) and the
+ * lea disp(%rip),reg forms (4c8d/488d with modrm rm=101). Everything else must be a known non-rip filler:
+ * 41 53 (push r11), 68 imm32 (push), e9 rel32 (jmp rel, TEXT-internal), 90/cc/00 padding. Any other byte
+ * in an executable section => HARD ABORT. */
+static int rewrite_stub_helper(struct src_img*im,uint64_t RXb,uint64_t RWb,uint64_t ROb,uint8_t*rxblob,
+                               struct stub_sec*S,struct riprel_gate*gate,int*red_done){
+    uint64_t base_off=(S->fileoff - im->segs[0].fileoff);
+    const uint8_t*b=im->map+im->sliceOff+S->fileoff;
+    uint64_t i=0, n=S->size;
+    while(i<n){
+        uint64_t va=S->addr+i; uint8_t c=b[i];
+        im->helper_total++;
+        if(c==0x90||c==0xcc||c==0x00){ i++; continue; }                 /* padding */
+        if(c==0x41 && i+1<n && b[i+1]==0x53){ i+=2; continue; }          /* push %r11 */
+        if(c==0x68 && i+5<=n){ i+=5; continue; }                        /* push imm32 (lazy bind index) */
+        if(c==0xe9 && i+5<=n){ i+=5; continue; }                        /* jmp rel32 (TEXT-internal, moves rigidly) */
+        /* lea disp32(%rip),reg : REX.W (48/4c) + 8d + modrm with mod=00,rm=101 */
+        if((c==0x48||c==0x4c) && i+7<=n && b[i+1]==0x8d && (b[i+2]&0xc7)==0x05){
+            int32_t disp=(int32_t)(b[i+3]|(b[i+4]<<8)|(b[i+5]<<16)|((uint32_t)b[i+6]<<24));
+            uint64_t end=va+7, tgt=end+(int64_t)disp; uint64_t poff=base_off+i+3;
+            int fb=0; if(g_redhelper && !*red_done){ *red_done=1; fb=0x40; }
+            int rw=0; if(rewrite_rip_field(im,RXb,RWb,ROb,rxblob,poff,end,tgt,disp,fb,gate,&rw)) return 1;
+            if(rw) im->helper_rewritten++; i+=7; continue;
+        }
+        /* indirect jmp/call disp32(%rip): ff /4 or ff /2, modrm mod=00 rm=101 => ff 25 / ff 15 */
+        if(c==0xff && i+6<=n && (b[i+1]==0x25||b[i+1]==0x15)){
+            int32_t disp=(int32_t)(b[i+2]|(b[i+3]<<8)|(b[i+4]<<16)|((uint32_t)b[i+5]<<24));
+            uint64_t end=va+6, tgt=end+(int64_t)disp; uint64_t poff=base_off+i+2;
+            int fb=0; if(g_redhelper && !*red_done){ *red_done=1; fb=0x40; }
+            int rw=0; if(rewrite_rip_field(im,RXb,RWb,ROb,rxblob,poff,end,tgt,disp,fb,gate,&rw)) return 1;
+            if(rw) im->helper_rewritten++; i+=6; continue;
+        }
+        fprintf(stderr,"ABORT %s __stub_helper@0x%llx unknown executable byte 0x%02x (offset %llu)\n",
+            im->path,(unsigned long long)va,c,(unsigned long long)i); return 1;
+    }
+    return 0;
+}
+
+static int rewrite_image_stubs(struct src_img*im,int imgIdx,uint8_t*rxblob,
+                               uint64_t RXb,uint64_t RWb,uint64_t ROb,struct riprel_gate*gate){
+    int red_done=0;
+    for(int ss=0; ss<im->nstubsecs; ss++){
+        struct stub_sec*S=&im->stubsecs[ss];
+        if(S->kind==0){ if(g_nostubs) continue;  if(rewrite_stubs_section(im,RXb,RWb,ROb,rxblob,S,gate,&red_done)) return 1; }
+        else          { if(g_nohelper) continue; if(rewrite_stub_helper(im,RXb,RWb,ROb,rxblob,S,gate,&red_done)) return 1; }
+    }
+    return 0;
+}
+
 int main(int argc,char**argv){
     const char*root=NULL,*listf=NULL,*outf=NULL;
     for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"--red5")) g_red5=1;
+        else if(!strncmp(argv[i],"--redstub=",10)) g_redstub=atoi(argv[i]+10);
+        else if(!strcmp(argv[i],"--no-stubs")) g_nostubs=1;    /* RED arm: __stubs UNrewritten */
+        else if(!strcmp(argv[i],"--no-helper")) g_nohelper=1;  /* RED arm: __stub_helper UNrewritten */
+        else if(!strcmp(argv[i],"--redhelper")) g_redhelper=1; /* RED arm: skip one helper rip rewrite */
         else if(!root)root=argv[i]; else if(!listf)listf=argv[i]; else outf=argv[i]; }
-    if(!root||!listf||!outf){fprintf(stderr,"usage: %s [--red5] <install_root> <closure_list.txt> <out.dcc5>\n",argv[0]);return 2;}
+    if(!root||!listf||!outf){fprintf(stderr,"usage: %s [--red5|--redstub=N|--no-stubs|--no-helper|--redhelper] <install_root> <closure_list.txt> <out.dcc5>\n",argv[0]);return 2;}
 
     FILE*lf=fopen(listf,"r"); if(!lf){perror("list");return 2;}
     char*paths[MAX_IMAGES]; int np=0; char line[512];
@@ -595,12 +743,18 @@ int main(int argc,char**argv){
     /* ===== perf#24f: RIP-relative TEXT rewrite pass (after headers+section addrs are packed) ===== */
     struct riprel_gate gate; memset(&gate,0,sizeof gate);
     uint64_t T_total=0,T_rw=0,T_st=0,T_pool=0,T_poolbytes=0;
+    uint64_t S_total=0,S_rw=0,S_st=0,H_total=0,H_rw=0;
     for(int i=0;i<np;i++){ struct src_img*im=&imgs[i];
         uint8_t*rxblob=out+rx_file+im->rx_off;   /* packed __TEXT segment start */
         if(detect_pool(im)) return 1;
         T_poolbytes+=im->pool_count;
         if(rewrite_image_text(im,i,rxblob,RXb,RWb,ROb,&gate)) return 1;
+        /* MANDATORY stub pass: llvm-objdump does NOT decode S_SYMBOL_STUBS, so the text pass above misses
+         * them. Without this, every ff25 stub keeps its original TEXT->DATA disp32 => clang SIGSEGV. */
+        if(rewrite_image_stubs(im,i,rxblob,RXb,RWb,ROb,&gate)) return 1;
         T_rw+=im->riprel_rewritten; T_st+=im->riprel_sametext; T_pool+=im->riprel_skipped_pool;
+        S_total+=im->stub_total; S_rw+=im->stub_rewritten; S_st+=im->stub_sametext;
+        H_total+=im->helper_total; H_rw+=im->helper_rewritten;
     }
     T_total=T_rw+T_st+T_pool;
     hdr.riprel_total=T_total; hdr.riprel_rewritten=T_rw; hdr.riprel_sametext=T_st; hdr.riprel_skipped_pool=T_pool;
@@ -626,5 +780,9 @@ int main(int argc,char**argv){
     fprintf(stderr,"  RIPREL: total=%llu rewritten(same-DATA/RO)=%llu same-TEXT(left)=%llu skipped-pool=%llu  [int32-overflow=%d outside-seg=%d pool-overlap=%d]\n",
         (unsigned long long)T_total,(unsigned long long)T_rw,(unsigned long long)T_st,(unsigned long long)T_pool,gate.int32_overflow,gate.target_class_bad,gate.pool_overlap);
     fprintf(stderr,"  constant-pool (data-in-text) bytes protected=%llu (never rewritten)\n",(unsigned long long)T_poolbytes);
+    fprintf(stderr,"  STUBS (__stubs, ff25 — decoder-blind): total=%llu rewritten=%llu same-TEXT=%llu%s\n",
+        (unsigned long long)S_total,(unsigned long long)S_rw,(unsigned long long)S_st, g_nostubs?"  [--no-stubs SKIPPED]":"");
+    fprintf(stderr,"  STUB_HELPER (decoder-blind, lea-rip + jmp*): exec-bytes=%llu rip-rewritten=%llu%s\n",
+        (unsigned long long)H_total,(unsigned long long)H_rw, g_nohelper?"  [--no-helper SKIPPED]":"");
     return 0;
 }

@@ -41,6 +41,47 @@ echo "== RED ARM 5: pool treated as code (--red5) must ABORT =="
 [ $? -eq 1 ] && pass "RED5 pool-as-code detected (build ABORT)" || bad "RED5 pool-as-code slipped through"
 rm -f "$WORK/_red5.dcc5" "$WORK/_red5.dcc5.tmp"
 
+# ===== perf#24f STUB COVERAGE (the blindness fix) =====
+# CRITICAL: the after-rewrite riprel gate above uses llvm-objdump, which does NOT decode S_SYMBOL_STUBS.
+# A gate built ONLY on llvm-objdump is INSUFFICIENT (it let clang crash with "offline green"). This gate
+# reads stubs from Mach-O section metadata, disassembler-independent.
+STUBGATE="$HERE/dcc5-stubgate.py"
+echo "== STUB GATE (Mach-O metadata): every ff25 stub covered + rewritten to moved pointer =="
+python3 "$STUBGATE" "$CACHE" "$ROOT" "$LIST" > "$WORK/stub.log" 2>&1
+if [ $? -eq 0 ] && grep -q 'RESULT: PASS' "$WORK/stub.log"; then
+  scount=$(grep 'total stubs' "$WORK/stub.log" | grep -o '[0-9]\+' | head -1)
+  pass "STUB coverage complete ($scount stubs rewritten, 0 unknown/escape)"
+else bad "STUB coverage"; cat "$WORK/stub.log"; fi
+
+echo "== STUB RED ARMS: unrewritten / skipped / wrong disp / unknown pattern must all FAIL =="
+sfail=0
+"$BIN" --no-stubs "$ROOT" "$LIST" "$WORK/_rs.dcc5" >/dev/null 2>&1; python3 "$STUBGATE" "$WORK/_rs.dcc5" "$ROOT" "$LIST" >/dev/null 2>&1; [ $? -eq 1 ] || { sfail=1; echo "   unrewritten-stub slipped"; }
+"$BIN" --redstub=1 "$ROOT" "$LIST" "$WORK/_rs.dcc5" >/dev/null 2>&1; python3 "$STUBGATE" "$WORK/_rs.dcc5" "$ROOT" "$LIST" >/dev/null 2>&1; [ $? -eq 1 ] || { sfail=1; echo "   skip-one slipped"; }
+"$BIN" --redstub=2 "$ROOT" "$LIST" "$WORK/_rs.dcc5" >/dev/null 2>&1; python3 "$STUBGATE" "$WORK/_rs.dcc5" "$ROOT" "$LIST" >/dev/null 2>&1; [ $? -eq 1 ] || { sfail=1; echo "   wrong-disp slipped"; }
+"$BIN" --redstub=3 "$ROOT" "$LIST" "$WORK/_rs.dcc5" >/dev/null 2>&1; python3 "$STUBGATE" "$WORK/_rs.dcc5" "$ROOT" "$LIST" >/dev/null 2>&1; [ $? -eq 1 ] || { sfail=1; echo "   unknown-pattern slipped"; }
+[ $sfail -eq 0 ] && pass "STUB RED arms all detected (unrewritten/skip/wrong/unknown)" || bad "STUB RED arms"
+rm -f "$WORK/_rs.dcc5" "$WORK/_rs.dcc5.tmp"
+
+# ===== perf#24f EXEC-COVERAGE (the general blindness fix): ZERO uncovered executable bytes =====
+EXECCOV="$HERE/dcc5-execcov.py"
+echo "== EXEC-COVERAGE gate: every executable byte accounted (Mach-O metadata, not objdump-only) =="
+python3 "$EXECCOV" "$CACHE" "$ROOT" "$LIST" > "$WORK/exec.log" 2>&1
+if [ $? -eq 0 ] && grep -q 'RESULT: PASS' "$WORK/exec.log"; then
+  eb=$(grep 'total executable' "$WORK/exec.log" | grep -o '[0-9]\+')
+  pass "EXEC coverage complete ($eb exec bytes, 0 uncovered)"
+else bad "EXEC coverage (uncovered executable bytes)"; cat "$WORK/exec.log"; fi
+
+echo "== EXEC RED ARMS: unrewritten __stub_helper / skipped helper rip must FAIL exec-cov =="
+# NOTE the division of labor: __stubs disp correctness is the STUBGATE's job (unrewritten __stubs still
+# carry valid ff25 opcodes, so exec-cov — which verifies coverage + known opcodes + helper rip targets —
+# does NOT flag --no-stubs; the STUB RED arms above already prove stubgate catches it). exec-cov owns the
+# __stub_helper rip targets, which the objdump-based riprel gate is blind to.
+efail=0
+"$BIN" --no-helper "$ROOT" "$LIST" "$WORK/_re.dcc5" >/dev/null 2>&1; python3 "$EXECCOV" "$WORK/_re.dcc5" "$ROOT" "$LIST" >/dev/null 2>&1; [ $? -eq 1 ] || { efail=1; echo "   no-helper slipped exec-cov"; }
+"$BIN" --redhelper "$ROOT" "$LIST" "$WORK/_re.dcc5" >/dev/null 2>&1; python3 "$EXECCOV" "$WORK/_re.dcc5" "$ROOT" "$LIST" >/dev/null 2>&1; [ $? -eq 1 ] || { efail=1; echo "   redhelper slipped exec-cov"; }
+[ $efail -eq 0 ] && pass "EXEC RED arms all detected (no-helper/redhelper)" || bad "EXEC RED arms"
+rm -f "$WORK/_re.dcc5" "$WORK/_re.dcc5.tmp"
+
 echo
-if [ $fail -eq 0 ]; then echo "==== ALL OFFLINE GATES GREEN — DCC5 cache safe to proceed to LIVE sequence ===="; else echo "==== GATES FAILED — DO NOT DEPLOY ===="; fi
+if [ $fail -eq 0 ]; then echo "==== ALL OFFLINE GATES GREEN (incl. exec-coverage) ===="; else echo "==== GATES FAILED — DO NOT DEPLOY ===="; fi
 exit $fail
