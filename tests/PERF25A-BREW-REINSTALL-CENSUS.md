@@ -81,3 +81,64 @@ The hang is NOT missing homebrew psynch fixes, and NOT (only) the experimental r
 - **Consequence:** a clean end-to-end brew reinstall A/B is blocked until this stranded-wait bug is
   fixed. This IS the (A0) blocker for branch A, above any launch/init micro-optimization. Recon only,
   not chased here.
+
+## UPDATE 2 — ROOT CAUSE FOUND (A0 / dar-gwn.1.7 family / bead dar-dar6x4-perf-5dq.15)
+The hang is a **ring↔UDS reply-channel split-brain** in the perf#18 shared-memory ring transport.
+Not psynch, not reaping-loss primary (the zombie is a downstream consequence).
+
+REPRODUCED + A/B (deployed baseline server 835946f9, guest dylib built with DARLING_RING_TRANSPORT=ON):
+- Ring ON  (default): `brew reinstall xz` HANGS intermittently (~1 in 2–3). Leaf `sh ../../libtool
+  --mode=compile clang …` parked in `__unix_dgram_recvmsg` (UDS RPC recvmsg); every make/sh ancestor
+  correctly in `do_wait` behind it; server fully IDLE (`ep_poll`, `clients_blocked_in_rpc:0`,
+  `workqueue_depth:0`). The server believes it replied; the guest never got it.
+- Ring OFF (`DARLING_SERVER_FAST_OPS=0`): `brew reinstall xz` COMPLETES cleanly (🍺 ~53–54 s), 2/2.
+
+MECHANISM (code-level, both sides):
+- GUEST `gr_wait_reply()` (dserver-ring.c:420): after 512 spin iters it arms `s2c_waiters=1` and enters
+  a **bounded** futex-wait loop `for (guard=0; guard<100000; ++guard)`. Each `FUTEX_WAIT` returns EINTR
+  on every signal. Under a make -jN **SIGCHLD storm**, 100000 EINTR cycles burn in well under a second,
+  so the loop **exhausts and returns NULL → the caller UDS-falls-back** and blocks on `recvmsg`.
+- SERVER `Thread::_publishReplyToRingLocked()` (thread.cpp:2213) via `pushCallReply` (2249): the reply
+  channel is chosen SOLELY by `_ringReplyPending` (armed by `beginRingReply` when the request arrived
+  over the ring) — NOT by whether the guest is still listening on the ring. So the server publishes the
+  reply onto the **s2c ring** + `wakeGuest()` while the guest has already abandoned the ring and is on
+  **UDS**. Reply lands in a buffer nobody reads; UDS resend gets no matching reply. Permanent deadlock,
+  server idle. (The guest comment at dserver-ring.c:482 already flags "the reply may still land" — benign
+  only for the very first op; under load a mid-stream op hits it and wedges.)
+
+WHY ONLY UNDER BREW (not the synthetic `make -j8` clang harness): brew's configure/libtool/`make check`
+drive a far denser SIGCHLD flood (thousands of nested `sh -c` + short tools + test-runs), which is what
+pushes the 100000-guard to exhaust. Flat `( ) &`+`wait` fork storms and a plain `%.o` Makefile do NOT
+reproduce (3/3 + 3200-fork storm clean).
+
+FIX DIRECTION (option 1, surgical): once the guest has published a request the server will answer on the
+ring, the ring is the ONLY channel that reply will ever arrive on — so the guest must NOT abandon it.
+Make the slow-path wait for a ring-originated reply effectively unbounded (keep EINTR/EAGAIN re-loop; a
+genuine server death is already globally fatal, so liveness is unchanged). Removing the arbitrary 100000
+bound closes the split-brain. Alternatives: (2) teach the server to fall back to UDS when the guest
+abandoned (invasive, needs a guest→server "I left the ring" signal); (3) ship DARLING_RING_TRANSPORT=OFF
+by default (the experiment is not supposed to be default-on per its own patch blocker; the deployed tree
+has it ON). Rate + fix to be validated by the A0 A/B batch + a rebuilt guest dylib.
+
+## UPDATE 3 — option-1 fix REGRESSED BOOT; the UDS fallback is LOAD-BEARING (A0 still open)
+Built option 1 (guest `gr_wait_reply`: `for (guard<100000)` -> `for(;;)`), libsystem_kernel a6608de1 from
+~/work/darling-build, deployed to all 3 copies (baseline 6bd251c3 backed up first).
+RESULT: **boot HANGS** — launchd never brings up shellspawn.sock; guest wedges during early init.
+=> The premise "the server ALWAYS replies on the ring for a ring-originated op, so the guest can wait
+forever" is FALSE. There is at least one boot-path case where a `_ringReplyPending` op's reply arrives
+over UDS (or the guest legitimately must abandon the ring and retry over UDS). Server-side candidates: the
+`_interruptedForSignal` saved-reply branch and the `_deferReplyForS2C` deferred-reply branch in
+`pushCallReply` (thread.cpp:2256/2262) bypass/delay `_publishReplyToRingLocked`, so a signal or S2C upcall
+on a ring op can route its reply off the ring. The OLD bounded guard + UDS fallback is what let boot
+survive that — the fallback is LOAD-BEARING, not merely a bug escape.
+REVERTED byte-identical to baseline 6bd251c3 (all 3 copies); `west darling-doctor` ALL GREEN; brew ring-OFF
+reconfirmed 🍺 clean; guest torn down; fix branch discarded (source back on perf/shmem-ring-guest @ caddc2b).
+
+CORRECTED FIX SHAPE (A0, still to build): close the split-brain SYMMETRICALLY, do NOT remove the fallback.
+When the guest abandons the ring and UDS-falls-back, either (a) the SERVER must be told to reply on UDS
+(clear `_ringReplyPending` / re-point the sink), or (b) the guest must drain a late ring reply before
+UDS-waiting, or (c) the server replies on BOTH channels for the abandonment window. This is genuine
+guest+server co-designed transport correctness on the EXPERIMENTAL ring — not a one-line change. Every
+candidate MUST pass BOTH a boot smoke AND the brew ring-ON A/B (RED baseline: RING_ON 3/3 hang, RING_OFF
+2/2 clean) before any deploy. Safe interim posture: `DARLING_SERVER_FAST_OPS=0` (proven clean) or building
+the guest dylib with `DARLING_RING_TRANSPORT=OFF`.
