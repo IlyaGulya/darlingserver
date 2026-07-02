@@ -142,3 +142,34 @@ guest+server co-designed transport correctness on the EXPERIMENTAL ring — not 
 candidate MUST pass BOTH a boot smoke AND the brew ring-ON A/B (RED baseline: RING_ON 3/3 hang, RING_OFF
 2/2 clean) before any deploy. Safe interim posture: `DARLING_SERVER_FAST_OPS=0` (proven clean) or building
 the guest dylib with `DARLING_RING_TRANSPORT=OFF`.
+
+## UPDATE 4 — attempt-2 fix also regressed; SOCKET-LEVEL capture reframes the bug (A0 still open)
+Attempt 2 = symmetric: guest `gr_wait_reply` unbounded (`for(;;)`) + server InterruptExit saved-reply flush
+routed through `_publishReplyToRingLocked` (mirror the S2C-defer flush). Built libsystem_kernel 7e311a9b +
+darlingserver 196801fa from ~/work/darling-build, deployed 4 copies (baselines 6bd251c3 / 835946f9 backed up).
+RESULT: brew ring-ON still hung (stall MOVED libtool-compile -> configure `ld` link), AND — decisively —
+**ring-OFF (`FAST_OPS=0`), which is CLEAN on baseline, ALSO hung with this build** => the server-side
+InterruptExit change is WRONG as written (routes a reply to a ring the interrupted guest is not reading).
+Reverted byte-identical (dylib 6bd251c3 x3, srv 835946f9), doctor GREEN, both fix branches' edits discarded.
+
+SOCKET-LEVEL CAPTURE (baseline binaries, `ss -x` on the hung guest — the reframing evidence, saved
+tmp/a0_sock_snapshot.HANG.txt): the wedge is NOT a simple lost ring reply. At the hang, with the server IDLE
+(ep_poll, workqueue_depth:0, clients_blocked_in_rpc:0), TWO socket anomalies coexist on the guest side:
+  1. **darlingserver fd=91 has Send-Q = 768 bytes STUCK** (u_seq / SEQPACKET), peer = the stuck guest's fd
+     (launchd fd=39 in the captured hang). The server produced a ~768B reply, handed it to the async writer
+     (AsyncWriter: O_NONBLOCK + Writable-Monitor, async-writer.cpp), but it never drained — the peer's recv
+     buffer never freed because the peer isn't reading.
+  2. **guest launchd fd=14 has Recv-Q = 12 bytes UNREAD** — data sitting in a socket the guest owns while all
+     its threads are parked in recvmsg on OTHER fds => a missed wakeup / wrong-fd wait in the guest's
+     multi-socket RPC receive multiplexing.
+So the true failure is a **guest multi-fd receive-ordering / lost-wakeup deadlock** interacting with SEQPACKET
+send backpressure on the server's async writer — the guest waits on fd A while its unblocking datum sits on
+fd B (12B unread) and the server's reply for yet another op is stuck in Send-Q to fd C. The victim varies per
+hang (libtool `sh`, configure `ld`, launchd) because it's a timing race in the multiplex, not one fixed op.
+This is deeper than the ring reply-channel choice — it lives in the guest RPC socket-demux + the server
+async-writer/SEQPACKET-backpressure interaction, and is very likely present (rarer) even without the ring
+(the ring just widens the race window, matching RING_ON hangs a lot / RING_OFF baseline clean-but-not-proven-
+immune). A correct fix needs to target that demux/wakeup + writer-backpressure path with per-fd tracing, and
+is a multi-iteration darlingserver-internals effort — NOT a ring-wait one-liner. PAUSED here: root cause
+localized to the socket layer, prod byte-identical + doctor GREEN. Interim: `DARLING_SERVER_FAST_OPS=0` (ring
+inline off) is the lowest-hang-rate proven posture.
