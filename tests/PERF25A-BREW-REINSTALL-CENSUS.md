@@ -61,3 +61,23 @@ full `reinstall` deadlocks. Two independent runs both hung (run 1: single ruby s
   Guest torn down clean. bpftrace census saved: `brew_census_full.out` (job tmp).
 - **Next (branch A), in order:** A0 lost-RPC-hang fix (blocker) → A1 DCC6-on brew A/B →
   A2 libSystem init-laziness audit. Do not start A1/A2 before A0.
+
+## UPDATE — hang root-classed (perf#25a-hang / bead #111)
+The hang is NOT missing homebrew psynch fixes, and NOT (only) the experimental ring fast-path:
+- **psynch fixes ARE present.** Deployed xnu HEAD `caddc2b` (perf/shmem-ring-guest) has BOTH
+  `psynch: fix cvsignal/cvbroad argument widths` (8a7797f) and `return psynch wait errors as
+  negative errno` (f7ae4e0) as ancestors; source `psynch_cvwait.c` materially returns `-ret`/`-EINTR`.
+  The dar-q95.2/.19 download-hang fixes are IN. So the earlier "missing homebrew patch" hypothesis is
+  ruled out.
+- **Ring fast-path OFF does NOT fix it.** Re-ran `brew reinstall xz` with `DARLING_SERVER_FAST_OPS=0`
+  (ring inline fast paths disabled). Still deadlocks — same `__skb_wait_for_more_packets` — but on a
+  different process: `sh ../../libtool --mode=compile clang …` (compile stage) instead of `ld`
+  (make-check stage). Frozen set stable 20 s (23 procs).
+- **Real class = stranded SIGCHLD / lost wait4 reply.** The stuck `sh` has a **zombie child**
+  (Z, ppid == the stuck sh): the child exited but the parent is parked forever in
+  `__skb_wait_for_more_packets` instead of being woken to reap it. wchan = waiting on a dserver RPC
+  reply (the child-exit / wait notification path) that never arrives. This is DEEPER than the ring
+  fast-path — it's darlingserver's wait/SIGCHLD delivery under heavy concurrent fork/exec/exit.
+- **Consequence:** a clean end-to-end brew reinstall A/B is blocked until this stranded-wait bug is
+  fixed. This IS the (A0) blocker for branch A, above any launch/init micro-optimization. Recon only,
+  not chased here.
