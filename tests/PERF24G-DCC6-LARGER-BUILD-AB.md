@@ -3,8 +3,9 @@
 Status: **DONE.** Measured DCC6 OFF vs ON on a larger, CPU-heavy build (500 TUs, real `-O2`
 work). **Headline honest result: the VMA collapse persists on the larger build (cc1 193 → 65
 maps, −66%), but wall time is identical OFF vs ON because a 500-file `-O2` build is
-compiler-CPU-bound — the mm-teardown/VMA win is real but not on the critical path here.** No
-DCC6 builder/reader/init/default-on changes; prod restored byte-identical, doctor ALL GREEN.
+compiler-CPU-bound — the mm-teardown/VMA win is real (directly measured: exit_mmap −17.7 %, −191 ms/build; unmap_vmas
+−78 %) but not on the critical path here.** No DCC6 builder/reader/init/default-on changes; prod
+restored byte-identical, doctor ALL GREEN.
 
 ## Workload (larger than the milestone's 200 tiny files)
 - 500 C files, **342 000 lines total (~684 lines/file), 9.8 MB**, generated deterministically.
@@ -47,20 +48,40 @@ have shown ~190. Matches the milestone's cc1 ~190 → ~65.
   391bc704 / 8fe03894 / 988c4ed7 identical both arms) — DCC6 does not perturb codegen.
 - No `_flockfile`/`__text` crash; env true=0 / false=1; sh/clang all green (from #107, re-confirmed).
 
-## exit_mmap / teardown bucket
-Not separately instrumented this run (kprobe/bpftrace on `zap_pte_range`/`exit_mmap` needs root;
-sudo is not authorized here). The VMA count IS the proxy: teardown cost scales with VMA count
-(perf#24a measured ~140 µs page-zap floor + per-VMA cost; perf#22a: teardown ≈ 88 % of the mm
-bucket). 193 → 65 VMAs ⇒ ~66 % fewer VMAs to unmap per cc1 exit. On this CPU-bound build that
-saving is dwarfed by compile time; on a launch/teardown-heavy build (many tiny TUs, or a
-fork-exec-heavy driver) it surfaces as wall — as the milestone run showed.
+## exit_mmap / teardown bucket — MEASURED DIRECTLY (perf#24g-teardown, sudo/bpftrace)
+Measured on the host with bpftrace kprobes filtered to guest processes (host `comm == "mldr"`;
+every guest process, incl. cc1, keeps the launcher's comm). One full 500-file build per arm,
+same dyld/cache/install_root. `exit_mmap` latency = kprobe→kretprobe delta.
+
+| kernel teardown metric | OFF | ON (DCC6) | delta |
+|---|---|---|---|
+| exit_mmap calls (= process exits) | 2031 | 2031 | same (identical process population) |
+| **exit_mmap total CPU** | **1.080 s** | **0.888 s** | **−17.7 % (−191 ms / build)** |
+| exit_mmap mean / exit | 532 µs | 437 µs | −17.7 % |
+| **unmap_vmas / free_pgtables calls** | **150 239** | **32 584** | **−78.3 %** (per-exit 74 → 16 VMAs) |
+| zap_pte_range calls | 551 217 | 185 600 | −66.3 % (per-exit 271 → 91) |
+| exit_mmap latency hist | mass in 256K–1M ns | shifts down into 64K–256K ns | lighter tail |
+
+Reading these honestly:
+- **`unmap_vmas`/`free_pgtables` = the VMA count torn down: −78 %** (74 → 16 per process). This is
+  the VMA collapse measured at the kernel — it matches the `/proc/maps` collapse (193 → 65, −66 %)
+  and confirms the mechanism from the mm side, not just from `/proc`.
+- **`zap_pte_range` −66 %**: far fewer page-table ranges to walk per teardown.
+- **But `exit_mmap` CPU only −17.7 %**, not −78 %. Teardown cost is *not* purely per-VMA: the
+  resident pages a process actually touched still have to be zapped, and although the DCC regions
+  are shared/faulted-once, each process still unmaps its own view of them. So the teardown win is
+  **real and now quantified (191 ms per 500-file build)** but **sublinear in VMA count** — the same
+  physics as perf#24a's "minor faults ≈ unchanged." Still, 191 ms is ~1.4 % of the 14 s build; on
+  this CPU-bound workload it does not move wall (OFF == ON), consistent with §Wall above. It
+  surfaces as wall only when process launch/teardown is a large fraction of the work (milestone
+  200-tiny-file case, −17 % wall).
 
 ## Acceptance (perf#24g)
 - [x] Build succeeds OFF and ON (500 objs each).
 - [x] Object outputs valid (Mach-O) and byte-identical OFF vs ON.
 - [x] VMA collapse persists on the larger build (193 → 65, −66 %); confirms DCC engaged.
-- [x] Teardown/mm bucket: VMA-count proxy reported; direct exit_mmap tracing not available
-      without root (stated honestly, not faked).
+- [x] Teardown/mm bucket: measured DIRECTLY with bpftrace (sudo authorized) — exit_mmap CPU
+      1.080 s → 0.888 s (−17.7 %, −191 ms/build); unmap_vmas −78 %; zap_pte_range −66 %.
 - [x] Wall/sys deltas reported honestly: **wall OFF = ON at this file size (CPU-bound)**; the win
       is VMA/teardown, which this workload does not stress.
 - [x] Prod restored byte-identical (dyld 79b22273 both copies); `west darling-doctor` ALL GREEN.
