@@ -173,3 +173,30 @@ immune). A correct fix needs to target that demux/wakeup + writer-backpressure p
 is a multi-iteration darlingserver-internals effort — NOT a ring-wait one-liner. PAUSED here: root cause
 localized to the socket layer, prod byte-identical + doctor GREEN. Interim: `DARLING_SERVER_FAST_OPS=0` (ring
 inline off) is the lowest-hang-rate proven posture.
+
+## UPDATE 5 — PER-FD DEMUX capture: it is NOT the ring; it is a DGRAM-RPC-wait vs SEQPACKET-aux-channel split
+Per-fd capture (baseline binaries; `/proc/<tid>/syscall` gives the EXACT fd each parked thread waits on,
+cross-referenced with `ss -x` queues; evidence tmp/a0_fd_snapshot.HANG.txt). At a reproduced hang the wedged
+process is the guest **launchd** (guest pid 1), and the picture is precise:
+  - launchd's 3 threads are each blocked in `recvmsg` (syscall nr 47) on their **DGRAM RPC sockets in the
+    perf#21b high fd-band**: fds 8191 / 8190 / 8189 (band = [TOP-BAND, TOP) = [7680, 8192)). Nothing wrong
+    with those waits — that's the normal per-thread RPC reply-wait.
+  - Meanwhile TWO **SEQPACKET (u_seq)** sockets that launchd owns — fd=14 and fd=39, both LOW (outside the
+    band) — each hold **Recv-Q = 12 bytes UNREAD**, and `waited_by_a_thread = NO`: no launchd thread is
+    reading them. Their server peers (darlingserver fd=16 and fd=91) each show **Send-Q = 768** stuck.
+So the guest RPC path (DGRAM sockets, mldr.c __mldr_create_rpc_socket = SOCK_DGRAM + sendto to the server
+address, band-relocated) is DISTINCT from the stranded channel: the stuck 12-byte messages sit on a
+**SEQPACKET connected auxiliary channel** (guest<->server, low fds 14/39 <-> server 16/91) that NO thread is
+draining because every thread is parked on its DGRAM RPC reply. The 768-byte server Send-Q is the server
+trying to push MORE onto that same undrained SEQPACKET connection -> SEQPACKET backpressure, never flushed.
+=> The bug is the **interaction between the DGRAM RPC reply-wait and an undrained SEQPACKET aux channel**
+(fork-checkin / S2C / kqchan family — the connected per-client channel, dar-gwn.6.x territory), NOT the ring
+reply-channel choice and NOT perf#21b's relocation per se (the band fds behave correctly; the stranded fds
+are the LOW un-relocated SEQPACKET ones). This also explains why BOTH earlier fix attempts failed: they
+targeted the ring DGRAM reply path, which is not where the 12 bytes strand.
+NEXT (one build cycle, approved): instrument the SERVER per-connection — log, for every message sent on a
+guest's SEQPACKET aux channel, `(target guest nsid, channel kind, callnum/s2c-number, bytes, send result)`,
+and for every such inbound message the same — reproduce once, and read WHICH 12-byte SEQPACKET message type
+strands on fd 14/39 and which thread was supposed to drain it. That names the exact aux-channel op and pins
+the fix (drain-ordering / wakeup on the SEQPACKET channel vs the DGRAM RPC wait). Prod byte-identical
+(dylib 6bd251c3, srv 835946f9, mldr/dyld baseline), doctor GREEN, guest torn down.
