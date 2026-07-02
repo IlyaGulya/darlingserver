@@ -1,0 +1,47 @@
+diff --git a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
+index 67de2d0..bc79379 100644
+--- a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
++++ b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
+@@ -314,6 +314,42 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
+ 	kern_printf("sigexc: have RIP 0x%llx\n", ctxt->uc_mcontext.gregs.rip);
+ #endif
+ 
++#if defined(__x86_64__)
++	// perf#24c2d-crashcap TEMP DIAGNOSTIC: on a fatal fault (SEGV/BUS/ILL/FPE/TRAP), dump the guest
++	// faulting PC, fault address, all GP registers, instruction bytes around RIP, and the stack top —
++	// BEFORE forwarding to dserver. Uses __simple_kprintf (unconditional -> dserver log). Read-only.
++	if ( linux_signum == 11 /*SEGV*/ || linux_signum == 7 /*BUS*/ || linux_signum == 4 /*ILL*/
++	  || linux_signum == 8 /*FPE*/  || linux_signum == 5 /*TRAP*/ ) {
++		const struct linux_gregset* g = &ctxt->uc_mcontext.gregs;
++		__simple_kprintf("CRASHCAP: sig=%d RIP=0x%llx faultaddr=0x%llx cr2=0x%llx err=0x%llx trapno=0x%llx\n",
++			linux_signum, (unsigned long long)g->rip, (unsigned long long)(info ? (unsigned long)info->si_addr : 0),
++			(unsigned long long)g->cr2, (unsigned long long)g->err, (unsigned long long)g->trapno);
++		__simple_kprintf("CRASHCAP: rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx\n",
++			(unsigned long long)g->rax, (unsigned long long)g->rbx, (unsigned long long)g->rcx,
++			(unsigned long long)g->rdx, (unsigned long long)g->rsi, (unsigned long long)g->rdi);
++		__simple_kprintf("CRASHCAP: rbp=0x%llx rsp=0x%llx r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx\n",
++			(unsigned long long)g->rbp, (unsigned long long)g->rsp, (unsigned long long)g->r8,
++			(unsigned long long)g->r9, (unsigned long long)g->r10, (unsigned long long)g->r11);
++		__simple_kprintf("CRASHCAP: r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n",
++			(unsigned long long)g->r12, (unsigned long long)g->r13, (unsigned long long)g->r14, (unsigned long long)g->r15);
++		// stack top FIRST (RSP valid in a fault; *RSP is the RETURN ADDRESS => the caller that jumped here).
++		const unsigned long long* sp = (const unsigned long long*)(unsigned long)g->rsp;
++		for (int si = 0; si < 24; si += 4) {
++			__simple_kprintf("CRASHCAP: stack[+0x%x] 0x%llx 0x%llx 0x%llx 0x%llx\n",
++				si*8, sp[si], sp[si+1], sp[si+2], sp[si+3]);
++		}
++		// insn bytes LAST, only if RIP looks like mapped code (an instruction-fetch fault means RIP is
++		// unmapped — reading it faults again and would lose the stack dump above).
++		if ( (unsigned long long)g->rip > 0x1000000ULL && ((unsigned long long)g->rip >> 47) == 0 ) {
++			const unsigned char* ip = (const unsigned char*)(unsigned long)g->rip;
++			__simple_kprintf("CRASHCAP: insn@RIP %02x %02x %02x %02x %02x %02x %02x %02x\n",
++				ip[0],ip[1],ip[2],ip[3],ip[4],ip[5],ip[6],ip[7]);
++		} else {
++			__simple_kprintf("CRASHCAP: RIP not mapped-code => jumped to a bad function pointer\n");
++		}
++	}
++#endif
++
+ 	thread_t thread = mach_thread_self();
+ 
+ #if defined(__x86_64__)
