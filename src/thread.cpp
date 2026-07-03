@@ -657,6 +657,10 @@ void DarlingServer::Thread::doWork() {
 		if (!_pendingCallOverride && _pendingCall && _pendingCall->number() == Call::Number::InterruptEnter) {
 			_interrupts.emplace();
 			_interrupts.top().savedStack = _stack;
+			// A0-ARCH stage 1b: capture the interrupted context's ucontext WITH its stack.
+			// _resumeContext is a single slot; if the interrupt fiber suspends mid-flight it
+			// overwrites it, and jumpToResume would resume a stale context (#114 SEGV shape).
+			_interrupts.top().savedResumeContext = _resumeContext;
 			_stack = StackPool::Stack();
 			_interruptedContinuation = _continuationCallback;
 			_continuationCallback = nullptr;
@@ -2601,11 +2605,14 @@ void DarlingServer::Thread::sendSignal(int signal) const {
 	}
 };
 
-void DarlingServer::Thread::jumpToResume(void* stack, size_t stackSize) {
+void DarlingServer::Thread::jumpToResume(ucontext_t* context, void* stack, size_t stackSize) {
+	// A0-ARCH stage 1b: resume an EXPLICIT saved context, not the shared _resumeContext slot
+	// (which may have been overwritten by a park of the interrupt fiber itself in the
+	// meantime -- the #114 stale-setcontext SEGV).
 #if DSERVER_ASAN
 	__sanitizer_start_switch_fiber(&asanOldFakeStack, stack, stackSize);
 #endif
-	setcontext(&_resumeContext);
+	setcontext(context);
 	__builtin_unreachable();
 };
 
@@ -2823,7 +2830,7 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 		} else if (self->_interrupts.top().interruptedCall) {
 			self->_handlingInterruptedCall = true;
 			self->_pendingCallOverride = true;
-			self->jumpToResume(self->_interrupts.top().savedStack.base, self->_interrupts.top().savedStack.size);
+			self->jumpToResume(&self->_interrupts.top().savedResumeContext, self->_interrupts.top().savedStack.base, self->_interrupts.top().savedStack.size);
 		}
 	} else if (self->_handlingInterruptedCall) {
 #if DSERVER_ASAN
