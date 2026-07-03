@@ -565,7 +565,10 @@ void DarlingServer::Call::Checkin::processCall() {
 		if (auto process = thread->process()) {
 			// the process needs to know when the checkin occurs, in case it has a pending replacement
 			// and also to notify its parent about when the fork is complete
-			process->notifyCheckin(static_cast<Process::Architecture>(_header.architecture));
+			// perf#25a A0 (Part 4): tell the process WHO is checking in -- only a main-thread
+			// non-fork re-checkin may be treated as an exec replacement (see notifyCheckin).
+			process->notifyCheckin(static_cast<Process::Architecture>(_header.architecture),
+				thread->nsid() == process->nsid(), _body.is_fork);
 		} else {
 			code = -ESRCH;
 		}
