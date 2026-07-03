@@ -525,7 +525,14 @@ void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
 	// thread_go(), not by the caller hand-clearing TH_WAIT. (perf#25a A0)
 	thread->xnu_thread.state &= ~TH_UNINT;
 	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
-	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
+	// perf#25a A0 TRACE: capture what the abort sees and leaves behind, to explain why the
+	// waitq.c:2835 panic returns once the mutex-queue change is present.
+	void* wq_before = (void*)thread->xnu_thread.waitq;
+	uint32_t st_before = thread->xnu_thread.state;
+	kern_return_t cw = clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
+	dtape_log_error("perf#25a A0 SIGEXC tid=%llu waitq_before=%p st_before=0x%x clear_wait_ret=%d waitq_after=%p st_after=0x%x mlq=%d",
+		(unsigned long long)thread->xnu_thread.thread_id, wq_before, st_before, (int)cw,
+		(void*)thread->xnu_thread.waitq, thread->xnu_thread.state, thread->mutex_link._dbg_queued);
 	thread_unlock(&thread->xnu_thread);
 };
 
