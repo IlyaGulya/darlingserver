@@ -352,10 +352,17 @@ void DarlingServer::Thread::makePendingCallActive() {
 };
 
 void DarlingServer::Thread::_deactivateCallLocked(std::shared_ptr<Call> expectedCall) {
-	if ((_interruptedForSignal ? _interrupts.top().interruptedCall : _activeCall).get() != expectedCall.get()) {
+	// A0-ARCH stage 1c: under an RPC-stream desync a stray interrupt_exit can pop
+	// _interrupts while an interrupt is notionally in flight; top() on an empty stack is UB
+	// (captured as jumpToResume(context=0x2) SIGSEGV). Fall back to the plain slot loudly.
+	bool viaInterrupt = _interruptedForSignal && !_interrupts.empty();
+	if (_interruptedForSignal && _interrupts.empty()) {
+		threadLog.error() << _tid << "(" << _nstid << "): _deactivateCallLocked: interrupted-for-signal with EMPTY interrupt stack (desync); using active call slot" << threadLog.endLog;
+	}
+	if ((viaInterrupt ? _interrupts.top().interruptedCall : _activeCall).get() != expectedCall.get()) {
 		throw std::runtime_error("Upon deactivating the active call found active/interrupted call != expected call");
 	}
-	(_interruptedForSignal ? _interrupts.top().interruptedCall : _activeCall) = nullptr;
+	(viaInterrupt ? _interrupts.top().interruptedCall : _activeCall) = nullptr;
 };
 
 void DarlingServer::Thread::deactivateCall(std::shared_ptr<Call> expectedCall) {
@@ -1362,7 +1369,8 @@ void DarlingServer::Thread::syscallReturn(int resultCode) {
 	}
 
 	{
-		auto call = (currentThreadVar->_interruptedForSignal) ? currentThreadVar->_interrupts.top().interruptedCall : currentThreadVar->_activeCall;
+		// A0-ARCH stage 1c: guard the empty-interrupt-stack desync case (see _deactivateCallLocked)
+		auto call = (currentThreadVar->_interruptedForSignal && !currentThreadVar->_interrupts.empty()) ? currentThreadVar->_interrupts.top().interruptedCall : currentThreadVar->_activeCall;
 		if (!call || !call->isXNUTrap()) {
 			throw std::runtime_error("Attempt to return from syscall on thread with no active syscall");
 		}
@@ -1561,7 +1569,11 @@ void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNu
 
 	{
 		std::unique_lock lock(_rwlock);
-		_interrupts.top().signal = 0;
+		if (!_interrupts.empty()) {
+			_interrupts.top().signal = 0;
+		} else {
+			microthreadLog.error() << _tid << "(" << _nstid << "): processSignal with empty interrupt stack (desync)" << microthreadLog.endLog;
+		}
 		_processingSignal = true;
 	}
 
@@ -1583,7 +1595,11 @@ void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNu
 void DarlingServer::Thread::handleSignal(int signal) {
 	std::unique_lock lock(_rwlock);
 	if (_processingSignal) {
-		_interrupts.top().signal = signal;
+		if (!_interrupts.empty()) {
+			_interrupts.top().signal = signal;
+		} else {
+			microthreadLog.error() << _tid << "(" << _nstid << "): handleSignal with empty interrupt stack (desync); signal " << signal << " dropped" << microthreadLog.endLog;
+		}
 	} else {
 		throw std::runtime_error("Attempt to handle signal while not processing signal");
 	}
@@ -2512,12 +2528,25 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 			id(), (long long)nsid(), callnum, disp);
 	}
 
-	if (_interruptedForSignal) {
+	if (_interruptedForSignal && !_interrupts.empty()) {
 		if (_interrupts.top().savedReply) {
 			throw std::runtime_error("New reply would overwrite existing saved reply");
 		}
 
 		_interrupts.top().savedReply = std::move(reply);
+	} else if (_interruptedForSignal) {
+		// A0-ARCH stage 1c: interrupted-for-signal but the interrupt stack is empty (stray
+		// interrupt_exit popped it during a desync). There is no interrupt frame to stash
+		// the reply on; send it directly rather than corrupt memory / lose it.
+		microthreadLog.error() << _tid << "(" << _nstid << "): pushCallReply: interrupted-for-signal with EMPTY interrupt stack (desync); sending reply directly" << microthreadLog.endLog;
+		if (!_dead) {
+#ifdef DSERVER_RING_TRANSPORT
+			if (_publishReplyToRingLocked(reply)) {
+				return;
+			}
+#endif
+			Server::sharedInstance().sendMessage(std::move(reply));
+		}
 	} else if (_deferReplyForS2C) {
 		// A ring-originated call that performs an S2C upcall defers its reply here; the flush in
 		// _s2cPerform() (NOT this path) republishes it -- and MUST honor _ringReplyPending or a
@@ -2774,6 +2803,16 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 	{
 		std::unique_lock lock(self->_rwlock);
 
+		// A0-ARCH stage 1c: doWork pushes an InterruptContext for every InterruptEnter
+		// dispatch, so an empty stack here means a stray interrupt_exit popped it out from
+		// under us (RPC-stream desync). Bail out gracefully: processCall still replies 0,
+		// the server survives, and the desync is loud in the log instead of top()-UB
+		// (captured as jumpToResume(context=0x2) SIGSEGV).
+		if (self->_interrupts.empty()) {
+			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt_enter with EMPTY interrupt stack (desync); ignoring" << microthreadLog.endLog;
+			return;
+		}
+
 		if (self->_pendingSavedReply) {
 			if (self->_interrupts.top().savedReply) {
 				throw std::runtime_error("Pending saved reply would overwrite saved reply");
@@ -2827,6 +2866,10 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 	if (!self->_didSyscallReturnDuringInterrupt) {
 		if (localInterruptedContinuation) {
 			localInterruptedContinuation();
+		} else if (self->_interrupts.empty()) {
+			// A0-ARCH stage 1c: a stray interrupt_exit popped our frame while we were
+			// suspended in sigexc_enter (desync); nothing to resume, survive loudly.
+			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt frame popped mid-interrupt_enter (desync); skipping interrupted-call resume" << microthreadLog.endLog;
 		} else if (self->_interrupts.top().interruptedCall) {
 			self->_handlingInterruptedCall = true;
 			self->_pendingCallOverride = true;
@@ -2846,12 +2889,16 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 	{
 		std::unique_lock lock(self->_rwlock);
 
-		if (self->_interrupts.top().savedStack.isValid()) {
-			stackPool.free(self->_interrupts.top().savedStack);
+		if (!self->_interrupts.empty()) {
+			if (self->_interrupts.top().savedStack.isValid()) {
+				stackPool.free(self->_interrupts.top().savedStack);
+			}
+			self->_interrupts.top().interruptedCall = nullptr;
+		} else {
+			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt frame missing at interrupt_enter epilogue (desync)" << microthreadLog.endLog;
 		}
 
 		self->_interruptedForSignal = false;
-		self->_interrupts.top().interruptedCall = nullptr;
 	}
 
 	dtape_thread_sigexc_enter2(self->_dtapeThread);
