@@ -684,3 +684,33 @@ signal-resumed microthread cannot double-link. Equivalent: only INSERT if not al
 REMOVE on wake. Must hold dtape_queue_lock for the remove. Verify: cvstorm RESULT=OK with zero panics across
 many runs (deterministic, seconds), THEN brew A/B zero hangs. Prod restored byte-identical baseline 835946f9,
 doctor GREEN. Evidence: tmp/cvstorm_trace_1636756.log.
+
+## UPDATE 17 — root cause CONFIRMED by diagnostic (7 DOUBLE-INSERT hits) but the mutex-queue FIX REGRESSES BOOT. Fix needs redesign.
+
+Diagnostic (commit d5d01dd, _dbg_queued flag) PROVED the mechanism: cvstorm produced 7 "DOUBLE-INSERT of
+mutex_link (already queued)" hits, all in dtape_mutex_lock, while RESULT=HANG. So UPDATE 16 is CONFIRMED: a
+signal-aborted wait leaves thread->mutex_link linked (the SAME link backs both the condvar and mutex queues),
+and the next insert double-links it -> corruption -> lost wakeup -> livelock. Not assumed — measured.
+
+The load-bearing fix (commit 5766b1d, binary 92c0ff7e): (a) dtape_condvar_wait re-locks condvar->queue_lock
+after thread_suspend returns and TAILQ_REMOVEs self if still linked; (b) dtape_mutex_lock removes self at the
+top of the retry loop if still linked. BOOT-GATE RESULT (isolation test, same teardown+boot sequence):
+  FIX 92c0ff7e:      "Cannot open mnt namespace file" — WEDGES boot, reproducibly (3x).
+  BASELINE 835946f9: BASE_BOOT_OK.
+=> the fix REGRESSES BOOT. Prime suspect: the dtape_condvar_wait post-resume re-lock of condvar->queue_lock.
+thread_suspend(&condvar->queue_lock) hands that lock to the suspend/resume machinery; re-locking it in the
+cooperative single-threaded (DSERVER_SINGLE_THREADED=1) microthread scheduler during early init appears to
+deadlock. ALSO: a locks.c-only variant is INCORRECT — the stale link is on the CONDVAR queue, so
+TAILQ_REMOVE(&mutex->dtape_queue_head, link) would corrupt; the cleanup must remove from the queue the link is
+actually on.
+
+STATUS: mechanism proven & pinned; fix DIRECTION correct (unlink the stale link on signal-abort resume) but
+this IMPLEMENTATION breaks boot. NEXT (redesign, gate boot FIRST): do the unlink WITHOUT re-locking inside
+condvar_wait's resumed context — options: (1) have the signal-abort path itself (dtape_thread_sigexc_enter /
+the resume) remove the link from whatever queue it is on, using a back-pointer to the owning head + its lock,
+done at the abort site (which already holds the thread locked) rather than in the resumed microthread; (2) give
+the link a stable owning-queue back-pointer and a single dequeue helper invoked from the unblock path
+(thread_go/thread_unblock) so every wakeup (normal AND abort) dequeues uniformly. Whatever the choice: boot
+smoke is the FIRST gate, then cvstorm RESULT=OK 0-panic, then brew A/B 0 hangs. Commits bd7cdb9 (TH_WAIT, boots
++ removes panic, KEEP), 5766b1d (this boot-breaking attempt, on branch — do NOT deploy). Prod baseline
+835946f9, doctor GREEN.
