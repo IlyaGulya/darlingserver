@@ -500,28 +500,26 @@ void dtape_thread_release(dtape_thread_t* thread) {
 
 void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
-	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
+	// Clear only TH_UNINT so this signal is allowed to abort even an
+	// uninterruptible wait. Do NOT pre-clear TH_WAIT here: clear_wait_internal()
+	// -> waitq_pull_thread_locked() must see the thread still marked TH_WAIT so
+	// it routes through thread_go() -> thread_unblock(), which is what actually
+	// FINALIZES the unblock -- pulls the thread off its waitq (clearing
+	// thread->waitq), cancels the wait_timer, and resumes the microthread. If we
+	// pre-clear TH_WAIT, clear_wait_internal takes its
+	//   (state & (TH_WAIT|TH_TERMINATE)) == TH_WAIT   // false
+	// branch, returns KERN_NOT_WAITING, and SKIPS thread_go(): the wait is left
+	// half-torn-down with thread->waitq still set. Under brew `make -j`'s SIGCHLD
+	// storm the guest re-issues the aborted psynch_cvwait (-EINTR retry), which
+	// re-enters waitq_assert_wait64_locked() with thread->waitq != NULL and trips
+	// its invariant -- panic("thread already waiting", waitq.c:2835) in a debug
+	// build, and a corrupted-waitq lost-wakeup condvar livelock otherwise (the
+	// intermittent `brew reinstall` hang; deterministic repro in
+	// tests/../tmp/cvstorm.c). Letting clear_wait_internal own the state
+	// transition matches XNU, where a signal-interrupted wait is torn down by
+	// thread_go(), not by the caller hand-clearing TH_WAIT. (perf#25a A0)
+	thread->xnu_thread.state &= ~TH_UNINT;
 	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
-	// Cancel any armed wait timer before aborting the wait. This mirrors the
-	// cancel already done in thread_unblock() (normal wakeup) and
-	// dtape_thread_destroy() (teardown); the signal-abort path was the one
-	// clear_wait_internal() site that left the timer armed. A timed psynch
-	// wait (e.g. pthread_cond_timedwait / a cvwait carrying a deadline) arms
-	// wait_timer; a SIGCHLD delivered to the parent microthread during a
-	// brew `make -j` fork storm aborts the wait here with THREAD_INTERRUPTED
-	// but, without this cancel, leaves the timer armed. The guest re-issues
-	// the wait after -EINTR, and the stale timer then fires
-	// thread_timer_expire() -> clear_wait_internal(THREAD_TIMED_OUT), which
-	// delivers a SPURIOUS timeout to the *re-issued* wait, aborts it with
-	// ETIMEDOUT, and strands the condvar/mutex handoff -- the intermittent
-	// psynch lost-wakeup livelock (many cvwaits vs few cvsignals) observed
-	// under `brew reinstall`. (perf#25a A0)
-	if (thread->xnu_thread.wait_timer_is_set) {
-		if (timer_call_cancel(&thread->xnu_thread.wait_timer)) {
-			thread->xnu_thread.wait_timer_active--;
-		}
-		thread->xnu_thread.wait_timer_is_set = FALSE;
-	}
 	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
 	thread_unlock(&thread->xnu_thread);
 };
