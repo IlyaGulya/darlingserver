@@ -748,3 +748,33 @@ on, whether thread_go runs, whether waitq_pull happens, and where thread->waitq 
 touching code again. Consider whether the correct model is that the signal-abort must dequeue from the
 condvar/mutex queues too (not just the XNU waitq), unified at one abort/unblock point. Prod restored
 byte-identical baseline 835946f9, doctor GREEN. Repro: tmp/cvstorm.c + cvstorm_run.sh. Binaries in job tmp.
+
+## UPDATE 19 — TRACE corrects the model AGAIN: sigexc does NOT leak thread->waitq. It's a re-abort loop with clear_wait_internal returning KERN_NOT_WAITING (48).
+
+Instrumented dtape_thread_sigexc_enter (binary ab7929d1, temporary trace commit) to log per-abort:
+waitq_before / state / clear_wait_internal return / waitq_after / mutex_link._dbg_queued. cvstorm still
+RESULT=HANG; the trace at the freeze shows ONE thread (tid=35) aborted DOZENS of times in a tight ~0.1ms loop,
+every line IDENTICAL:
+  waitq_before=0x60f8357bd040  st_before=0x4 (TH_WAIT set)  clear_wait_ret=48 (KERN_NOT_WAITING)
+  waitq_after=(nil)  st_after=0x4  mlq=0
+FINDINGS that correct UPDATE 16/18's model:
+  - sigexc does NOT leak thread->waitq — waitq_after is (nil) every time; the abort DOES clear it.
+  - clear_wait_internal returns KERN_NOT_WAITING (48), NOT success, despite TH_WAIT being set. So
+    waitq_pull_thread_locked did not find the thread on the queue it points at (waitq_before), yet TH_WAIT
+    stays set (st_after still 0x4) -> the thread is in a "marked waiting but not pullable" limbo.
+  - mutex_link is NOT queued at abort time (mlq=0), so the double-insert is not happening at THIS abort.
+  - the SAME thread (tid=35) with the SAME waitq address is re-aborted in a tight loop making zero progress
+    (done_count frozen) -> this IS the livelock, viewed from the abort side: re-enter wait -> re-abort ->
+    re-enter -> ... never completing.
+=> the driver is NOT (only) the mutex_link double-insert; it's that a signal-aborted psynch wait re-enters and
+is immediately re-aborted while TH_WAIT/waitq bookkeeping is inconsistent (clear_wait NOT_WAITING + TH_WAIT
+still set). The waitq.c:2835 panic is a downstream manifestation of this inconsistent state on some
+interleaving, not a simple leak.
+
+STATUS: this is genuinely subtle duct-tape scheduler/waitq state-machine behavior under a signal storm, and my
+mechanistic model has now been corrected three times by measurement (double-insert -> boot-uninit ->
+NOT_WAITING re-abort limbo). The cvstorm repro + this trace are the durable assets. A correct fix requires
+understanding why clear_wait_internal returns NOT_WAITING with TH_WAIT set (thread marked waiting but absent
+from its waitq) -- likely the psynch/ksyn wait queue and the XNU thread->waitq are out of sync under the
+duct-tape. That is the next thing to pin. KEEP bd7cdb9 + 65038e3 (correct). 5766b1d (mutex-queue) is a real
+but insufficient fix. Trace commit is temporary. Prod baseline 835946f9, doctor GREEN.
