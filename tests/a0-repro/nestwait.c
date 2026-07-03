@@ -118,7 +118,14 @@ int main(int argc, char** argv) {
 		stall = (cur == last) ? stall + 1 : 0; last = cur;
 		printf("[t=%2ds] jobs=%ld storm_hits=%d stall=%ds\n", t+1, cur, storm_hits, stall);
 		fflush(stdout);
-		if (stall >= STALL_LIMIT) { printf("HANG jobs=%ld\n", cur); fflush(stdout); hung = 1; break; }
+		if (stall >= STALL_LIMIT) {
+			printf("HANG jobs=%ld\n", cur); fflush(stdout); hung = 1;
+#ifdef HOLD_ON_HANG
+			// keep the hung state alive for live capture (host inspects /proc + server auxlog)
+			for (;;) sleep(60);
+#endif
+			break;
+		}
 	}
 	stop = 1;
 	for (int t = 0; t < 3; t++) usleep(200000);
