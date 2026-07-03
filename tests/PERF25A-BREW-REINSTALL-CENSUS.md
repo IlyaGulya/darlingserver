@@ -851,3 +851,56 @@ GATE RESULTS (build b58c6c90, boot smoke PASS):
   cvstorm2 (full, storm)         => no-result                     ❌
 
 => The SIGNAL-FREE lost wake is genuinely fixed (Part 1, committed 57b86c8). But a SECOND, DISTINCT bug lives in the SIGNAL-STORM path. Storm census on the Part-1 fix (cvstorm2 -DNCONS=1, SIGUSR1 no-SA_RESTART hammering the consumer): the consumer wedges almost immediately (done=300 frozen, work climbs to 649M, storm_hits=100K, c0=300). So the SIGCHLD-equivalent storm breaks the consumer's cond_wait recovery — this IS the sigexc/interrupt-abort territory from UPDATE 14-19 (which was a red herring for the signal-free case but is REAL for the storm case). Mechanism to pin next: SIGUSR1 -> interrupt_enter RPC -> dtape_thread_sigexc_enter -> clear_wait_internal(THREAD_INTERRUPTED) aborts the ksyn_wait; the psynch_cvcontinue/psynch_mtxcontinue continuation runs with THREAD_INTERRUPTED; the guest re-issues cvwait (EINTR) but a wakeup is lost across the abort. Note brew's real workload HAS the SIGCHLD storm, so Part 1 alone is necessary-but-not-sufficient for the brew hang; Part 2 (storm path) is required for the zero-hang criterion. NEXT: instrument the interrupt-abort + psynch_cvcontinue path on cvstorm2 -DNCONS=1 (storm) to find the lost wake across the sigexc abort. Prod restored byte-identical baseline 835946f9; Part 1 on branch @ 57b86c8.
+
+---
+
+## UPDATE 24 — Part 2a: psynch grant-clobber race FIXED (measured); residual is a distinct CV-EINTR bug on BOTH transports
+
+Instrumented the storm path (cvstorm2 -DNCONS=1, SIGUSR1 storm) layer by layer.
+Findings, in order:
+
+1. **psynch layer is healthy.** ksyn_signal NEVER returns KERN_NOT_WAITING under the
+   storm (all grants ret=0/OK). The CV path ignoring ksyn_signal's return (line 992,
+   `(void)ksyn_signal`) is NOT the bug. FALSIFIED.
+
+2. **STRANDED-PERMIT is not it.** doneWorking's `resumeAfterWorking = (permit && suspended)
+   || rerunPending` never left a permit stranded at doneWork (0 occurrences). FALSIFIED.
+
+3. **ROOT CAUSE of the dominant hang = mtxcontinue grant-clobber.** Trace caught it exactly:
+   `ksyn_signal tid=29 ret=0(OK)` (mutex granted, waiter dequeued, kwe_psynchretval stamped)
+   immediately followed by `mtxcontinue-ERR tid=29 wr=2 stillq=(nil) retval=0x1103` — the
+   continuation ran with wait_result = THREAD_INTERRUPTED (wr=2), took its EINTR error path,
+   and THREW AWAY the committed grant (retval 0x1103, already dequeued). The guest re-issued
+   psynch_mutexwait against an empty queue and deadlocked.
+
+   The clobber has TWO duct-tape causes, both fixed (commit cf8ccfb):
+   - `thread_unblock()` did not clear TH_WAIT / set TH_RUN (XNU does). So after a grant's
+     thread_go->thread_unblock set wait_result=THREAD_AWAKENED, TH_WAIT was still set, and a
+     racing `clear_wait_internal(THREAD_INTERRUPTED)` re-fired thread_go -> clobber.
+   - `dtape_thread_sigexc_enter()` UNCONDITIONALLY pre-assigned `wait_result = THREAD_INTERRUPTED`
+     *before* clear_wait_internal. Even with TH_WAIT fixed (so clear_wait_internal returns
+     NOT_WAITING), that direct write alone clobbered the just-delivered AWAKENED grant.
+   Fix: let clear_wait_internal own the wait_result write (only rouses a genuinely-waiting
+   thread), and finalize TH_WAIT->TH_RUN in thread_unblock.
+
+   PROOF: mtxcontinue clobber detector 0/0 after the fix (was firing every few thousand ops);
+   cvstorm2 -DNCONS=1 storm went from freezing at done<=5390 to running 50k+ ops.
+
+4. **A grant-recovery heuristic in mtxcontinue is WRONG.** Adding "if error && dequeued &&
+   (retval & MTX_WAIT) then error=0" made hangs WORSE (8/10) — kwe_psynchretval is often
+   STALE from a prior cycle, so honoring it grants a mutex the thread doesn't hold. Reverted.
+
+5. **RESIDUAL (Part 2b, OPEN): a distinct CV-wait EINTR bug, transport-independent.**
+   With the clobber gone (detector 0), cvstorm2 -DNCONS=1 storm STILL hangs ~3/10 (FAST_OPS=1)
+   and ~5/8 (FAST_OPS=0 / ring OFF) — so it is NOT the ring/shmem transport. Freeze signature:
+   consumer `cvwait-BLOCK` (inq=0 at log), then producer `cvsignal` on the SAME kwq sees
+   `inq=0` (consumer already left the queue via a storm abort), preposts (upd=0x100); the
+   consumer then NEVER re-issues cvwait OR mutexwait and its microthread sits idle at
+   doneWork (`resched=0, susp=0`) — i.e. it returned to the guest and is stuck in USERSPACE /
+   a call not re-entering the server. Class = CV-EINTR + prepost-orphan / interrupted-cvwait
+   retry, NOT psynch grant loss and NOT transport. Needs guest-libpthread cvwait-retry vs
+   server sword/prepost bookkeeping analysis under abort.
+
+STATE: Part 1 (57b86c8) + Part 2a (cf8ccfb) on branch fix/psynch-cvwait-timer-cancel-on-sigexc.
+Prod restored byte-identical baseline 835946f9, doctor ALL GREEN. USER CRITERION = ZERO hangs,
+so A0 remains OPEN pending Part 2b (the CV-EINTR residual).
