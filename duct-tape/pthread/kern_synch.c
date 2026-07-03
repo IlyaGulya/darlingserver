@@ -560,6 +560,10 @@ _psynch_mutexdrop_internal(ksyn_wait_queue_t kwq, uint32_t mgen, uint32_t ugen,
 
 	ksyn_wqlock(kwq);
 	kwq->kw_lastunlockseq = (ugen & PTHRW_COUNT_MASK);
+	dtape_log_error("A0 MTX DROP-enter mtx=%p tid=%llu ugen=0x%x nextgen=0x%x inq=%u prepost=%u firstwr=0x%x",
+		(void*)kwq->kw_addr, (unsigned long long)thread_tid(current_thread()), ugen, nextgen,
+		kwq->kw_inqueue, kwq->kw_prepost.count,
+		kwq->kw_ksynqueues[KSYN_QUEUE_WRITE].ksynq_firstnum & PTHRW_COUNT_MASK);
 
 redrive:
 	updatebits = (kwq->kw_highseq & PTHRW_COUNT_MASK) |
@@ -567,6 +571,9 @@ redrive:
 
 	if (firstfit) {
 		if (kwq->kw_inqueue == 0) {
+			dtape_log_error("A0 MTX FF-prepost mtx=%p tid=%llu mgen=0x%x prepost.count=%u->%u (inq=0, wakes nobody)",
+				(void*)kwq->kw_addr, (unsigned long long)thread_tid(current_thread()),
+				mgen & PTHRW_COUNT_MASK, kwq->kw_prepost.count, kwq->kw_prepost.count + 1);
 			uint32_t count = kwq->kw_prepost.count + 1;
 			// Increment the number of preposters we have waiting
 			_kwq_mark_preposted_wakeup(kwq, count, mgen & PTHRW_COUNT_MASK, 0);
@@ -582,6 +589,8 @@ redrive:
 		} else {
 			// signal first waiter
 			ret = ksyn_mtxsignal(kwq, NULL, updatebits, &old_owner);
+			dtape_log_error("A0 MTX FF-signal mtx=%p tid=%llu inq=%u ksyn_mtxsignal_ret=%d (0=SUCCESS,48=NOT_WAITING)",
+				(void*)kwq->kw_addr, (unsigned long long)thread_tid(current_thread()), kwq->kw_inqueue, (int)ret);
 			if (ret == KERN_NOT_WAITING) {
 				// <rdar://problem/39093536> ksyn_mtxsignal attempts to signal
 				// the thread but it sets up the turnstile inheritor first.
@@ -601,6 +610,15 @@ redrive:
 			prepost = true;
 		} else {
 			uint32_t low_writer = (kwq->kw_ksynqueues[KSYN_QUEUE_WRITE].ksynq_firstnum & PTHRW_COUNT_MASK);
+			{
+				ksyn_waitq_element_t a0_first = TAILQ_FIRST(&kwq->kw_ksynqueues[KSYN_QUEUE_WRITE].ksynq_kwelist);
+				const char* a0_branch = (low_writer == nextgen) ? "EQ-signal"
+					: (is_seqhigher(low_writer, nextgen) ? "HIGHER-prepost" : "LOWER-findseq");
+				dtape_log_error("A0 MTX DROP-match mtx=%p nextgen=0x%x low_writer=0x%x branch=%s first_kwe_lockseq=0x%x first_kwe_state=%d",
+					(void*)kwq->kw_addr, nextgen, low_writer, a0_branch,
+					a0_first ? (a0_first->kwe_lockseq & PTHRW_COUNT_MASK) : 0xffffffff,
+					a0_first ? a0_first->kwe_state : -1);
+			}
 			if (low_writer == nextgen) {
 				/* next seq to be granted found */
 				/* since the grant could be cv, make sure mutex wait is set incase the thread interrupted out */
@@ -608,6 +626,8 @@ redrive:
 						updatebits | PTH_RWL_MTX_WAIT, &old_owner);
 				if (ret == KERN_NOT_WAITING) {
 					/* interrupt post */
+					dtape_log_error("A0 MTX DROP-intrpost mtx=%p tid=%llu nextgen=0x%x (signal hit NOT_WAITING -> mark interrupted)",
+						(void*)kwq->kw_addr, (unsigned long long)thread_tid(current_thread()), nextgen);
 					_kwq_mark_interruped_wakeup(kwq, KWQ_INTR_WRITE, 1,
 							nextgen, updatebits);
 				}
@@ -627,6 +647,8 @@ redrive:
 						goto redrive;
 					}
 				} else {
+					dtape_log_error("A0 MTX DROP-MISS mtx=%p nextgen=0x%x low_writer=0x%x (find_seq MISS -> prepost, waiter NOT woken)",
+						(void*)kwq->kw_addr, nextgen, low_writer);
 					prepost = true;
 				}
 			}
@@ -697,6 +719,8 @@ again:
 	ksyn_wqlock(kwq);
 
 	if (_kwq_handle_interrupted_wakeup(kwq, KWQ_INTR_WRITE, lseq, retval)) {
+		dtape_log_error("A0 MTX WAIT-recovered-intr mtx=%p tid=%llu lseq=0x%x (got the interrupt-marked wakeup)",
+			(void*)kwq->kw_addr, (unsigned long long)thread_tid(current_thread()), lseq);
 		old_owner = _kwq_set_owner(kwq, current_thread(), 0);
 		pthread_kern->psynch_wait_update_owner(kwq, kwq->kw_owner,
 				&kwq->kw_turnstile);
@@ -734,6 +758,8 @@ again:
 		PTHREAD_TRACE(psynch_mutex_kwqprepost, kwq->kw_addr,
 				kwq->kw_prepost.lseq, kwq->kw_prepost.count, 1);
 
+		dtape_log_error("A0 MTX WAIT-prepost mtx=%p tid=%llu lseq=0x%x (got preposted lock)",
+			(void*)kwq->kw_addr, (unsigned long long)thread_tid(current_thread()), lseq);
 		old_owner = _kwq_set_owner(kwq, current_thread(), 0);
 		pthread_kern->psynch_wait_update_owner(kwq, kwq->kw_owner,
 				&kwq->kw_turnstile);
@@ -783,6 +809,9 @@ again:
 		tid_th = THREAD_NULL;
 	}
 	assert(old_owner == THREAD_NULL);
+	dtape_log_error("A0 MTX WAIT-block mtx=%p tid=%llu lseq=0x%x inq=%u prepost=%u intr.count=%u -> ksyn_wait (SLEEP)",
+		(void*)kwq->kw_addr, (unsigned long long)thread_tid(current_thread()), lseq,
+		kwq->kw_inqueue, kwq->kw_prepost.count, kwq->kw_intr.count);
 	error = ksyn_wait(kwq, KSYN_QUEUE_WRITE, mgen, ins_flags, 0, 0,
 			psynch_mtxcontinue, kThreadWaitPThreadMutex);
 	// ksyn_wait drops wait queue lock
@@ -1057,14 +1086,21 @@ __psynch_cvsignal(user_addr_t cv, uint32_t cgen, uint32_t cugen,
 		PTHREAD_TRACE(psynch_cvar_signal | DBG_FUNC_START, kwq->kw_addr,
 				fromseq, uptoseq, broadcast);
 
+		int a0_diff = diff_genseq(kwq->kw_lword, kwq->kw_sword);
+		int a0_woke = -1;
 		if (!broadcast) {
 			// No need to signal if the CV is already balanced.
-			if (diff_genseq(kwq->kw_lword, kwq->kw_sword)) {
+			if (a0_diff) {
+				uint32_t ub_before = updatebits;
 				ksyn_cvsignal(kwq, th, uptoseq, fromseq, &updatebits,
 						&broadcast, &nkwe);
+				a0_woke = (updatebits != ub_before) ? 1 : 0;
 				PTHREAD_TRACE(psynch_cvar_signal, kwq->kw_addr, broadcast, 0,0);
 			}
 		}
+		dtape_log_error("A0 CV SIGNAL cv=%p tid=%llu bcast=%d uptoseq=0x%x L=0x%x S=0x%x inq=%u fake=%u diff(L!=S)=%d woke=%d",
+			(void*)kwq->kw_addr, (unsigned long long)thread_tid(current_thread()), broadcast, uptoseq,
+			kwq->kw_lword, kwq->kw_sword, kwq->kw_inqueue, kwq->kw_fakecount, a0_diff, a0_woke);
 		
 		if (broadcast) {
 			ksyn_handle_cvbroad(kwq, uptoseq, &updatebits);
@@ -1190,6 +1226,9 @@ _psynch_cvwait(__unused proc_t p, user_addr_t cv, uint64_t cvlsgen,
 	/* Look for the sequence for prepost (or conflicting thread */
 	ksyn_queue_t kq = &ckwq->kw_ksynqueues[KSYN_QUEUE_WRITE];
 	kwe = ksyn_queue_find_cvpreposeq(kq, lockseq);
+	dtape_log_error("A0 CV WAIT-enter cv=%p tid=%llu lockseq=0x%x L=0x%x S=0x%x inq=%u fake=%u found_prepost=%d",
+		(void*)ckwq->kw_addr, (unsigned long long)thread_tid(current_thread()), lockseq,
+		ckwq->kw_lword, ckwq->kw_sword, ckwq->kw_inqueue, ckwq->kw_fakecount, kwe != NULL);
 	if (kwe != NULL) {
 		if (kwe->kwe_state == KWE_THREAD_PREPOST) {
 			if ((kwe->kwe_lockseq & PTHRW_COUNT_MASK) == lockseq) {
@@ -1243,7 +1282,10 @@ _psynch_cvwait(__unused proc_t p, user_addr_t cv, uint64_t cvlsgen,
 		}
 
 		PTHREAD_TRACE(psynch_cvar_kwait, cv, mutex, kwe_flags, 1);
-		
+
+		dtape_log_error("A0 CV WAIT-block cv=%p tid=%llu lockseq=0x%x L=0x%x S=0x%x -> ksyn_wait (SLEEP)",
+			(void*)ckwq->kw_addr, (unsigned long long)thread_tid(current_thread()), lockseq,
+			ckwq->kw_lword, ckwq->kw_sword);
 		error = ksyn_wait(ckwq, KSYN_QUEUE_WRITE, cgen, SEQFIT, abstime,
 				kwe_flags, psynch_cvcontinue, kThreadWaitPThreadCondVar);
 		// ksyn_wait drops wait queue lock
@@ -1990,6 +2032,9 @@ ksyn_signal(ksyn_wait_queue_t kwq, kwq_queue_type_t kqi,
 	}
 
 	ret = pthread_kern->psynch_wait_wakeup(kwq, kwe, tstore);
+
+	dtape_log_error("A0 CV KSYN_SIGNAL cv=%p wake_tid=%llu wakeup_ret=%d (0=SUCCESS,48=NOT_WAITING) inq_now=%u",
+		(void*)kwq->kw_addr, (unsigned long long)thread_tid(kwe->kwe_thread), (int)ret, kwq->kw_inqueue);
 
 	if (ret != KERN_SUCCESS && ret != KERN_NOT_WAITING) {
 		panic("ksyn_signal: panic waking up thread %x\n", ret);
