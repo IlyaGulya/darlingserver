@@ -78,4 +78,17 @@ Fixes so far:
 - **Perf A/B vs 886d13af: NO REGRESSION.** nestwait NO_STORM 3627/3644/3635 jobs/15s
   (mean ~3635 vs fix-baseline ~3679, −1.2%, within historical run spread 3609–3688 and
   under the 3% stop threshold); 300× /usr/bin/true = 2s (identical).
-- Full gate (brew xz strict + wget no-freeze): RUNNING — stage-1 landing criterion.
+- **Full gate (d5daa0ed): 17/18** — all synthetics green, brew-xz 2/2 strict green,
+  brew-wget-2 green, **brew-wget-1 FROZE** (RPC stall at openssl@3 `make test`
+  HARNESS_JOBS=12; freeze snapshot: leaves in `__skb_wait_for_more_packets` + one perl
+  zombie — the classic lost-reply shape). NO `BAD RECEIVE` in the guest log → not the
+  EAGAIN/desync class.
+- **Wake-token telemetry over 3 further full wget runs (a889e85f, info-level): ZERO
+  stale-wake drops / re-arms fired.** (An earlier "31k drops" reading was a grep false
+  positive on the pre-existing kqchan "dropping new kqchan" messages.) The typed tokens
+  are behaviorally transparent under real brew load; the freeze is NOT a token drop.
+  Stage-1c wget record so far: 4 clean / 1 freeze in 5 runs.
+- **Baseline freeze-rate A/B RUNNING**: 886d13af redeployed, 4× wget legs — if the
+  baseline also freezes, the wget-1 freeze is the pre-existing residual class (stage 2/3
+  target) and stage 1 is no-worse; if baseline is 4/4 clean, suspicion returns to stage 1
+  and the hunt continues with the RPC auxlog.
