@@ -470,3 +470,47 @@ call.cpp:305-322); (b) on interrupt_exit teardown, drain any orphaned `_pendingS
 enter-detected park + promotion atomic under `_rwlock` so an exit can't slip between them. Prod restored
 byte-identical to baseline 835946f9 after capture; doctor GREEN. Evidence: tmp/a0_firstfreeze2_1628865.txt,
 tmp/a0_sudostacks_1629201.txt, auxlog nstid=370 tail.
+
+## UPDATE 11 — CORRECTION: UPDATE 10's stranded-reply is NOT the reproducible cause. 3/3 fresh hangs = guest-side LIVELOCK with a HEALTHY, SATURATED server (balanced reply accounting)
+
+A confirmation loop (tmp/a0_confirm_dropsite.sh: catch N independent durable >=40s freezes, print each one's
+reply-stash accounting) FALSIFIED UPDATE 10 as the general root cause — the same over-claim pattern as
+UPDATE 7 (a single capture's apparent smoking gun that didn't generalize). Result across 3/3 independent
+freezes (ring ON, instrumented b600271b):
+  attempt 1: pendingSaved-stash=0 interruptTop-stash=5 promotions=0 flushes=16
+  attempt 2: pendingSaved-stash=0 interruptTop-stash=4 promotions=0 flushes=12
+  attempt 3: pendingSaved-stash=0 interruptTop-stash=2 promotions=0 flushes=3
+In NONE of the 3 is a reply stranded: pendingSaved-stash=0 (the UPDATE-10 orphan does NOT recur), and
+flushes >= interruptTop-stashes so the interrupt-stack stashes all drain. Reply accounting BALANCES.
+
+What the auxlog shows at these freezes instead (attempt-3 tail): the server is NOT idle and NOT stuck — it is
+at FULL THROUGHPUT. Final-second event count = 8918; 54 distinct server microthreads active in the last 2000
+lines; disposition histogram of the last 3000 events = 985 disp=SEND vs 1 STASH-SAVED; RECV 1017 ~= SENT
+(956 UDS + 30 ring). Replies flow normally. Yet the guest workload makes zero forward progress and the
+__skb_wait >=40s watchdog fires. The active guest threads are CHURNING, not blocked: nstid 292 (one server
+microthread) replays a full process-launch handshake over and over (ring_attach 81, task/host/thread_self_trap
+33/34/35, set_thread_handles 8, vchroot_path 3, uidgid 7, mach_msg 38, mach_port_deallocate 39 — the checkin/
+bootstrap sequence, repeating); nstid 295 hammers pthread_canceled (call 31) densely (~83ms of back-to-back
+issue in the tail). This is a GUEST-SIDE LIVELOCK / non-convergence (a fork/exec/cancel storm that never
+settles), NOT a darlingserver stranded-reply deadlock.
+
+REVISED ROOT-CAUSE PICTURE: the "brew hang" caught by the __skb_wait>=Ns watchdog is NOT a single bug. It has
+AT LEAST TWO distinct flavors, both of which pile idle threads into __skb_wait behind the stuck/spinning party:
+  (A) [1 run, UPDATE 10] a reply stranded in _pendingSavedReply (interrupt_exit/push_reply/interrupt_enter
+      race) — REAL for that run but NOT reproducible here; a rare tail case, not the common cause.
+  (B) [3/3 runs, this update] guest-side livelock: server + RPC healthy and saturated, guest fork/exec/cancel
+      storm never converges. This is the DOMINANT reproducible flavor.
+The watchdog (a thread parked in __skb_wait for N seconds) cannot by itself distinguish (A) from (B): in both,
+SOME threads block in recvmsg. The discriminator is the reply accounting + server event rate: (A) shows a
+stranded stash + a quiescing server; (B) shows balanced replies + a server at full throughput with a churning
+guest cluster.
+
+NEXT (no fix; the direction just changed): stop looking for a darlingserver reply-drop. Instrument the GUEST
+side of the livelock — which guest userspace loop (libpthread cancellation? posix_spawn/fork retry? a
+make/sh/test-harness EINTR loop?) is re-issuing pthread_canceled/relaunch without converging. Candidate probes:
+(1) sudo kernel stacks CONCURRENT with a (B) freeze to see the recvmsg-blocked threads' callers vs the
+spinning threads' user PCs; (2) a guest-side strace/ltrace-equiv or a DARLING_ counter on pthread_canceled
+re-issue; (3) check whether a guest process is stuck in a cancellation point that keeps returning EINTR under
+the SIGCHLD storm (ties back to the dtape sigexc clear_wait interaction, but manifesting as spin not stall).
+Prod being restored byte-identical to baseline 835946f9; doctor GREEN. Evidence: tmp/a0_confirm_1629686.txt
++ the attempt-3 auxlog accounting above.
