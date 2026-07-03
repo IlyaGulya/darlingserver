@@ -239,6 +239,22 @@ void DarlingServer::Kqchan::_sendNotification() {
 		return;
 	}
 
+	// perf#25a-hang (A0): if notifications are currently deferred (a _read is in flight and will send
+	// its reply first, to keep channel messages in-order), DON'T consume _canSendNotification and DON'T
+	// stash a Message. Just record that a notification is owed. _sendDeferredNotification will re-drive
+	// _sendNotification once deferral clears, at which point it takes the real send path below. The old
+	// code consumed _canSendNotification here AND stashed into _deferredNotification; if the _read that
+	// was supposed to flush the stash had already run (the two are serialized only by _notificationMutex,
+	// not by program order across the split _mutex/_notificationMutex), the stash was orphaned and the
+	// gate stayed closed forever -> every future notification GATED -> guest never re-notified -> never
+	// acks -> deadlock (the brew fork-storm hang: id=259 stuck at canSendNotif=0 with a growing queue).
+	if (_deferNotification) {
+		_notificationRequestedWhileDeferred = true;
+		auxlog("sendNotif DEFER id=%llu socket_fd=%d (owed; will re-arm when deferral clears)",
+			(unsigned long long)_debugID, _socket ? _socket->fd() : -1);
+		return;
+	}
+
 	kqchanLog.debug() << *this << ": sending notification " << _notificationCount << kqchanLog.endLog;
 
 	// now that we're sending the notification, we shouldn't send another one until our peer acknowledges this one
@@ -251,32 +267,51 @@ void DarlingServer::Kqchan::_sendNotification() {
 	notification->header.pid = 0;
 	notification->header.tid = 0;
 
-	if (_deferNotification) {
-		auxlog("sendNotif DEFER id=%llu socket_fd=%d (stashed as deferred notification)",
-			(unsigned long long)_debugID, _socket ? _socket->fd() : -1);
-		_deferredNotification = std::move(msg);
-	} else {
-		auxlog("sendNotif PUSH  id=%llu socket_fd=%d count=%llu -> outbox (12B notification)",
-			(unsigned long long)_debugID, _socket ? _socket->fd() : -1,
-			(unsigned long long)_notificationCount);
-		lock.unlock(); // the outbox has its own lock
-		_outbox.push(std::move(msg));
-	}
+	auxlog("sendNotif PUSH  id=%llu socket_fd=%d count=%llu -> outbox (12B notification)",
+		(unsigned long long)_debugID, _socket ? _socket->fd() : -1,
+		(unsigned long long)_notificationCount);
+	lock.unlock(); // the outbox has its own lock
+	_outbox.push(std::move(msg));
 };
+
+bool DarlingServer::Kqchan::_hasPendingEvents() {
+	// base channels have no server-side event queue to inspect; the mach-port channel drives its own
+	// re-notification through _checkForEventsAsync after each read reply, so returning false here keeps
+	// its behavior unchanged. The proc channel overrides this to report a non-empty _events queue.
+	return false;
+}
 
 void DarlingServer::Kqchan::_sendDeferredNotification() {
 	std::unique_lock lock(_notificationMutex);
 
 	_deferNotification = false;
 
+	// perf#25a-hang (A0): deferral just cleared. Re-arm a notification if one was requested during the
+	// deferral, OR if the channel still has pending events (level-triggered: this recovers a notification
+	// that a defer/gate race would otherwise have dropped). We drop _notificationMutex before calling
+	// _sendNotification (which re-takes it) and before _hasPendingEvents (which takes _mutex) to avoid
+	// self-deadlock / lock-order inversion. A spurious notification is harmless by design: the guest
+	// reads, finds nothing, and drops the event (0xdead).
+	bool owed = _notificationRequestedWhileDeferred;
+	_notificationRequestedWhileDeferred = false;
+
+	// migrate any Message stashed by an older build's path (defensive; the new path never stashes)
 	if (_deferredNotification) {
 		Message notification(std::move(*_deferredNotification));
 		_deferredNotification = std::nullopt;
-
-		auxlog("sendDeferred PUSH id=%llu socket_fd=%d -> outbox (12B deferred notification)",
+		auxlog("sendDeferred PUSH id=%llu socket_fd=%d -> outbox (12B legacy deferred notification)",
 			(unsigned long long)_debugID, _socket ? _socket->fd() : -1);
-		lock.unlock(); // the outbox has its own lock
+		lock.unlock();
 		_outbox.push(std::move(notification));
+		return;
+	}
+
+	lock.unlock();
+
+	if (owed || _hasPendingEvents()) {
+		auxlog("sendDeferred REARM id=%llu socket_fd=%d owed=%d (re-driving _sendNotification)",
+			(unsigned long long)_debugID, _socket ? _socket->fd() : -1, (int)owed);
+		_sendNotification();
 	}
 };
 
@@ -743,6 +778,14 @@ void DarlingServer::Kqchan::Process::_read() {
 	// now let's send any deferred notifications we might have
 	_sendDeferredNotification();
 };
+
+bool DarlingServer::Kqchan::Process::_hasPendingEvents() {
+	// perf#25a-hang (A0): report whether the server still holds events the guest hasn't read. Takes
+	// _mutex (the event-queue lock). Used by _sendDeferredNotification to re-arm a notification when
+	// deferral clears, so a notification lost to a defer/gate race is always recovered.
+	std::unique_lock lock(_mutex);
+	return !_events.empty();
+}
 
 void DarlingServer::Kqchan::Process::_notify(uint32_t event, int64_t data) {
 	Event newEvent;
