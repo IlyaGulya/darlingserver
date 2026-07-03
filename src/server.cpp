@@ -69,12 +69,29 @@ struct DTapeHooks {
 		}
 	};
 
-	static void dtape_hook_thread_resume(void* thread_context) {
-		static_cast<DarlingServer::Thread*>(thread_context)->resume();
+	// A0-ARCH stage 1: typed wake tokens (see hooks.h). Kinds map 1:1 onto Thread::WakeKind.
+	static DarlingServer::Thread::WakeKind mapWakeKind(dtape_wake_kind_t kind) {
+		switch (kind) {
+			case dtape_wake_kind_raw:
+				return DarlingServer::Thread::WakeKind::Raw;
+			case dtape_wake_kind_user_suspension:
+				return DarlingServer::Thread::WakeKind::UserSuspension;
+			case dtape_wake_kind_xnu:
+			default:
+				return DarlingServer::Thread::WakeKind::Xnu;
+		}
 	};
 
-	static void dtape_hook_thread_clear_resume_permit(void* thread_context) {
-		static_cast<DarlingServer::Thread*>(thread_context)->clearResumePermit();
+	static void dtape_hook_thread_resume(void* thread_context, dtape_wake_kind_t kind, uint64_t generation) {
+		static_cast<DarlingServer::Thread*>(thread_context)->wake(mapWakeKind(kind), generation);
+	};
+
+	static uint64_t dtape_hook_thread_arm_wake(void* thread_context, dtape_wake_kind_t kind) {
+		return static_cast<DarlingServer::Thread*>(thread_context)->armWake(mapWakeKind(kind));
+	};
+
+	static void dtape_hook_thread_disarm_wake(void* thread_context, dtape_wake_kind_t kind) {
+		static_cast<DarlingServer::Thread*>(thread_context)->disarmWake(mapWakeKind(kind));
 	};
 
 	static dtape_task_t* dtape_hook_current_task(void) {
@@ -409,7 +426,8 @@ struct DTapeHooks {
 
 		.thread_suspend = dtape_hook_thread_suspend,
 		.thread_resume = dtape_hook_thread_resume,
-		.thread_clear_resume_permit = dtape_hook_thread_clear_resume_permit,
+		.thread_arm_wake = dtape_hook_thread_arm_wake,
+		.thread_disarm_wake = dtape_hook_thread_disarm_wake,
 		.thread_terminate = dtape_hook_thread_terminate,
 		.thread_create_kernel = dtape_hook_thread_create_kernel,
 		.thread_setup = dtape_hook_thread_setup,
