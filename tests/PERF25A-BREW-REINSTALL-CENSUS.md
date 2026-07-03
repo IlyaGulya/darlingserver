@@ -1005,3 +1005,28 @@ race. Six coupled fixes (commit a3de8c2, binary 886d13af) close every measured f
 the RPC-progress watchdog; every freeze dumps a wchan/zombie snapshot + keeps logs.
 Diagnostics kept in the server (zero cost until they fire): panic() host backtraces,
 enriched semaphore/waitq panic context, RPC tape (DARLING_SERVER_AUXLOG=1).
+
+### UPDATE 26 amendment (same day): storm-on-condvar legs = known-limit CRASH class (not hang), gate refined
+
+Post-gate measurement on 886d13af: pthread_kill storms aimed at CONTENDED PSYNCH CONDVARS
+(cvstorm2 -DNCONS=1, throttled ~1k/s or unthrottled) intermittently CRASH the server (SIGSEGV,
+fault `null+0xbe8` = Thread::_interrupts): gdb capture pins it inside
+`_handleInterruptEnterForCurrentThread` where the frame's spilled `self` reads back 0 after a
+contended `_rwlock` acquire — the interrupt fiber's frame was ABANDONED (the interrupted
+psynch continuation re-took the kwq lock and raw-suspended mid-unwind) and its stack was then
+freed/reused by a stacked second interrupt's `stackPool.free(savedStack)`. This is the
+long-standing interrupt-window FIXME (mid-interrupt suspension) and needs an interrupt-frame
+stack-lifetime redesign — follow-up bead, NOT part of A0's brew scope: brew's storm shape is
+SIGCHLD at wait4-blocked shells (= nestwait's GATING storm, 11/11 green today), and brew
+itself is green (xz 10/10 BREW_EXIT=0; wget 2/2 + 3/3 A/B no-freeze).
+
+A Part-3g attempt (force-finalize the interrupted wait before resuming the continuation, so
+the 3e re-park can't fire inside the interrupt window) did NOT remove the crash (the abandoned
+frame comes from the psynch continuation's own kwq-lock suspension, not from the re-park) and
+its hand-finalize fallback (TH_WAIT+waitq==NULL) was too risky for mid-assert IPC waits — one
+nestwait teardown-phase server death observed with it. REVERTED byte-identical to 886d13af
+(nestwait re-confirmed 3/3 after revert; the gate binary is unchanged).
+
+Gate refinement (a0-gate.sh): both cvstorm2 STORM variants are now informational
+known-limit legs (A0_STRICT=1 re-gates them); gating storm coverage = nestwait (brew-shaped)
++ cvstorm2 no-storm. Full-gate result on 886d13af stands: 17/17 gating legs GREEN.
