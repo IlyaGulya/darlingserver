@@ -76,7 +76,7 @@ run_synth() { # name src cflags secs [ring]
 	cleanboot
 	cp "$SELFDIR/$src" "$PREFIX/Users/ilyagulya/$src" 2>/dev/null || cp "$SELFDIR/$src" "$PREFIX/Users/"*"/$src"
 	local G="$WORK/$name.log" HARD=$((secs+50)) W=0
-	DARLING_SERVER_FAST_OPS="$ring" timeout "$HARD" "$L" shell /bin/bash --login -c \
+	DARLING_SERVER_FAST_OPS="$ring" DSERVER_SCHED_FUZZ="${FUZZ:-}" timeout "$HARD" "$L" shell /bin/bash --login -c \
 		"cd /Users/ilyagulya; $CLANG -isysroot $SDK -O2 $cf -o bin_$name $src 2>&1 && ./bin_$name $secs 2>&1; echo RUN_DONE" \
 		</dev/null > "$G" 2>&1 &
 	local GP=$!
@@ -186,6 +186,35 @@ run_knownlimit() { # name cflags secs
 }
 run_knownlimit "cvstorm2-throttled-KNOWNLIMIT" "-DNCONS=1 -DSTORM_THROTTLE_US=1000" 20
 run_knownlimit "cvstorm2-flood-KNOWNLIMIT" "-DNCONS=1" 20
+
+# 2b. scheduling-order fuzzer (A0-ARCH stage 0): re-run the two main wake/wait protocols
+# with the server's DSERVER_SCHED_FUZZ dispatch-reorder injection enabled. Every A0 bug was
+# a 2-event reorder; the fuzzer manufactures those reorders deterministically per seed, so a
+# protocol hole shows up here in minutes instead of intermittently under brew.
+# BASELINE (a3de8c2 + fuzzer, 2026-07-03): 5 of 6 legs RED (server death / guest SIGABRT)
+# -- the A0 patches close the measured faces, not the class. Non-gating until the A0-ARCH
+# stage 1-3 redesign lands (flip A0_FUZZ_GATING=1 to gate; stage acceptance runs it that way).
+FUZZ_SEEDS="${A0_FUZZ_SEEDS:-2}"
+run_fuzzleg() { # name src cflags secs
+	if [ "${A0_FUZZ_GATING:-0}" = 1 ]; then
+		run_synth "$1" "$2" "$3" "$4" 1
+	else
+		local SAVED_FAIL=$FAIL SAVED_PASS=$PASS
+		run_synth "$1" "$2" "$3" "$4" 1
+		if [ "$FAIL" -gt "$SAVED_FAIL" ]; then
+			FAIL=$SAVED_FAIL; PASS=$SAVED_PASS
+			unset 'RED[${#RED[@]}-1]' 2>/dev/null
+			note "$1" "(A0-ARCH pre-redesign hole -- not gating)"
+		fi
+	fi
+}
+s=1; while [ $s -le "$FUZZ_SEEDS" ]; do
+	FUZZ=$s
+	run_fuzzleg "fuzz-s$s-nestwait" nestwait.c "" 15
+	run_fuzzleg "fuzz-s$s-cvstorm-nostorm" cvstorm2.c "-DNO_STORM" 20
+	s=$((s+1))
+done
+FUZZ=""
 
 if [ "$MODE" != "synth" ]; then
 	# 3. real brew ------------------------------------------------------------
