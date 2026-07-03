@@ -904,3 +904,55 @@ Findings, in order:
 STATE: Part 1 (57b86c8) + Part 2a (cf8ccfb) on branch fix/psynch-cvwait-timer-cancel-on-sigexc.
 Prod restored byte-identical baseline 835946f9, doctor ALL GREEN. USER CRITERION = ZERO hangs,
 so A0 remains OPEN pending Part 2b (the CV-EINTR residual).
+
+---
+
+## UPDATE 25 — MAJOR RE-CLASSIFICATION: the brew hang is the wait4/child-exit-reply path, NOT psynch cond/mutex. cvstorm2 was the wrong primitive.
+
+Ran the ACTUAL brew reinstall xz A/B against the Part 1 + Part 2a fixed darlingserver
+(dc2ab77, ring ON) and captured the live hang. This overturns the working assumption
+that cvstorm2 (cond_wait/mutex) is a faithful proxy.
+
+**1. Part 1 + Part 2a do NOT fix brew.** brew reinstall xz still hangs 3/3 ring-ON on the
+fixed binary. Also: even the pristine BASELINE 835946f9 ring-OFF (the "🍺 clean" config from
+earlier updates) now hangs — so the environment/brew-state drifted since those runs; brew is
+no longer a stable pass/fail oracle by itself.
+
+**2. cvstorm2 residual is a PATHOLOGICAL-INTENSITY artifact, not the brew bug.** With a
+realistic throttled storm (STORM_THROTTLE_US=1000, ~800-1000 sig/s — already above brew's
+SIGCHLD rate) cvstorm2 -DNCONS=1 runs FLAWLESSLY on the fixed binary: done climbs to 17.4M,
+stall=0 throughout, RESULT=OK, GUEST_EXIT=0. The ~3/10 hang only appears under cvstorm2's
+DEFAULT unbounded pthread_kill flood (240k sig/s) — a scheduler-starvation livelock
+(doWork-ENTER for the same 2 nstids looping every ~13us with pc=pthread_kill/interrupt),
+not a correctness lost-wakeup. So Part 2b (cvstorm2 residual) is NOT brew's problem.
+
+**3. THE BREW HANG (live capture, ring ON, fixed binary), the decisive evidence:**
+```
+ruby brew.rb reinstall xz    wchan=__skb_wait_for_more_packets   <- parent parked on dserver socket
+[mldr] <defunct>  ppid=ruby  state=Z                             <- its child is a ZOMBIE
+bash (parent of ruby)        wchan=do_wait                       <- waiting for ruby
+```
+The child EXITED (zombie, reaped by nobody) but the parent (ruby) is parked FOREVER in
+__skb_wait_for_more_packets waiting a darlingserver child-exit / wait4 RPC reply that never
+arrives. Hang point = `==> Fetching downloads` (brew's FIRST fork+exec+wait: it spawns
+curl/git subprocesses and wait4()s them). This is EXACTLY the #111 root-class ("stranded
+SIGCHLD / lost wait4 reply"), a DIFFERENT subsystem from psynch cond/mutex.
+(Guest network itself is fine: in-guest `curl -sI github.com` => HTTP/2 200. The hang is the
+wait for the curl child's exit, not the network.)
+
+**4. cvstorm2 vs forkwait.** cvstorm2 exercises pthread_cond_wait/mutex (psynch) — real bugs
+found & fixed (Part 1/2a) but ORTHOGONAL to brew. A new fork+exec+wait4 repro (tmp/forkwait.c,
+flat forkers + SIGUSR1 storm, with & without EXEC_CHILD) does NOT reproduce on baseline (6/6 OK,
+~180-260 reaps/run) — too flat/slow. Brew's pattern is NESTED fork+exec+wait with pipes
+(sh->make->cc->ld, ruby->curl), which the flat forker doesn't capture.
+
+**CONCLUSION / NEXT.** The A0 brew hang lives in darlingserver's **child-exit / wait4 / SIGCHLD
+reply delivery** under nested-fork churn — the parent's wait RPC reply is lost. Part 1 (57b86c8)
++ Part 2a (cf8ccfb) are CORRECT psynch fixes to KEEP (they fix a real signal-abort grant-clobber
+class), but they are not the brew fix. NEXT: build a faithful nested-fork+exec+wait+pipe repro
+(mirror sh->make->ld or ruby->curl: parent forks a child that itself forks grandchildren, all
+connected by pipes, parent wait4()s), reproduce the zombie+stuck-wait4 on BASELINE, then trace
+the darlingserver wait4/child-reap/SIGCHLD-reply path (dtape child-exit notification ->
+parent wait4 RPC reply) to find the lost reply. Do NOT keep using cvstorm2 for the brew hang.
+Prod restored byte-identical baseline 835946f9, doctor ALL GREEN. Repro tmp/forkwait.c (insufficient),
+brew A/B harness tmp/a0_brew_ab.sh, hang capture tmp/brewhang_*.log.
