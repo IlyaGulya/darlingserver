@@ -514,3 +514,49 @@ re-issue; (3) check whether a guest process is stuck in a cancellation point tha
 the SIGCHLD storm (ties back to the dtape sigexc clear_wait interaction, but manifesting as spin not stall).
 Prod being restored byte-identical to baseline 835946f9; doctor GREEN. Evidence: tmp/a0_confirm_1629686.txt
 + the attempt-3 auxlog accounting above.
+
+## UPDATE 12 — ROOT CAUSE UNIFIED: A0 is a LOST-WAKEUP LIVELOCK in the guest pthread condition-variable (psynch) prepost machinery under the SIGCHLD storm. Flavors A and B are the same disease.
+
+The guest-side livelock capture (tmp/a0_livelock.sh: at a durable freeze, classify each mldr thread SPINNER
+[cumulative CPU-ns climbs over a 1s window; kstkeip is 0 in this kernel so spin is detected by schedstat delta]
+vs PARKED [flat CPU, in __skb_wait], dump spinners' hammered syscall + kstack, histogram each thread's RPCs)
+resolved the mechanism. One multi-threaded guest process (pid ...097) livelocks INTERNALLY:
+
+  SPINNERS (burning CPU, NOT blocked):
+    nstid 23  (main)  38M+/6M CPU-ns; re-issues call=71 psynch_cvwait endlessly (SEND every time) +
+                       recvmsg-retry spin. It cvwaits, gets woken/EINTR, re-cvwaits — never converges.
+    nstid 266         38M CPU-ns; kernel ep_poll (epoll_wait syscall 232, identical args every sample) +
+                       hammers call=30 pthread_kill. It spam-signals a peer trying to wake the stuck CV.
+  PARKED (idle, 0 CPU, behind the spinners):
+    nstid 1,3 (launchd), 6 (memberd), 7, 8 (accept fd3), 188 (psynch_mutexdrop/cvsignal/cvwait), and
+    nstid 269 whose last events are cvwait(71)/cvsignal(70)/mutexwait(73) -> PUSHREPLY-STASH slot=pendingSaved
+    (the flavor-A orphan — present HERE too, on a parked thread of the SAME livelocked process).
+
+QUANTIFICATION (the lost-wakeup signature): last 5000 events = 1497 pthread_kill(30) + 163 psynch_cvwait(71);
+GLOBAL 1145 psynch_cvwait RECV vs only 27 psynch_cvsignal RECV = a 42:1 wait:signal ratio. If the CV protocol
+converged, waits and signals would roughly balance; a 42:1 excess of waits means WAKEUPS ARE BEING LOST and
+threads re-cvwait forever. pthread_kill fires ~9x per cvwait (nstid 266 trying to nudge the stuck waiter).
+Reply accounting still balances at the transport (1 stranded pendingSaved is a co-symptom, not the driver).
+
+THE GUEST SOURCE CONFIRMS THE FAILURE SURFACE (xnu/darling libsystem_kernel emulation
+src/.../psynch/psynch_cvwait.c sys_psynch_cvwait): on ret<0 it returns -EINTR; its own comment warns the
+negated return drives libpthread `_pthread_psynch_cond_wait`'s "EINTR / prepost recovery", and that mishandling
+it "leav[es] an orphaned prepost that permanently strands a later condvar wakeup." Under brew make-check's
+SIGCHLD/fork storm psynch_cvwait is EINTR-aborted constantly (every signal clear_wait's the server-side wait —
+same dtape_thread_sigexc_enter / clear_wait_internal mechanism the fork-wait sticky flag dar-gwn.6.5 patched);
+a rare psynch_cvsignal wakeup races the abort and lands on an already-aborted waiter -> orphaned prepost ->
+the CV wakeup is lost -> waiters re-wait forever (1145 vs 27), one peer spam-pthread_kills, one reply strands.
+
+UNIFIED ROOT CAUSE: A0 = lost condvar wakeup in the guest psynch cvwait/cvsignal PREPOST path (and/or the
+server psynch cvwait wait that gets clear_wait'd) under signal-forced EINTR aborts during the SIGCHLD storm.
+Flavor A (stranded pendingSaved reply, UPDATE 10) and flavor B (spin/livelock, UPDATE 11) are two surfaces of
+THIS one bug. It is the SAME family as the fork-wait sticky flag (signal-abort races a wakeup handoff), now in
+the pthread CONDITION-VARIABLE machinery instead of the fork-wait semaphore. NOT the ring, NOT a generic
+darlingserver reply drop.
+
+FIX LOCUS (no fix written; must be surgical + gated on boot smoke AND brew A/B in BOTH ring modes): the guest
+psynch cvwait/cvsignal prepost handling and/or the server-side psynch_cvwait wait's interaction with
+clear_wait_internal (dtape sigexc). The prepost-orphan-on-EINTR the guest comment describes is the prime
+suspect — verify libpthread's _pthread_psynch_cond_wait recovery actually re-arms the prepost, and that
+psynch_cvsignal doesn't drop a signal delivered to a waiter that was just EINTR-aborted. Prod restored
+byte-identical baseline 835946f9; doctor GREEN. Evidence: tmp/a0_livelock_1630247.txt + the histograms above.
