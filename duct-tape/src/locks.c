@@ -77,6 +77,17 @@ void dtape_mutex_lock(dtape_mutex_t* mutex) {
 	while (true) {
 		libsimple_lock_lock(&mutex->dtape_queue_lock);
 
+		// perf#25a A0: if our link is still queued on THIS mutex when we hold the lock
+		// again, we were resumed by a signal-abort (dtape_thread_sigexc_enter ->
+		// clear_wait_internal -> thread_resume), NOT by dtape_mutex_unlock (which
+		// dequeues us before resuming). Unlink before re-evaluating so we neither
+		// double-insert below nor leave a stale link that a later TAILQ_REMOVE would
+		// corrupt (locks.c:151). Under dtape_queue_lock here, so race-free.
+		if (thread->mutex_link._dbg_queued) {
+			TAILQ_REMOVE(&mutex->dtape_queue_head, &thread->mutex_link, link);
+			thread->mutex_link._dbg_queued = 0;
+		}
+
 		if (mutex->dtape_owner == 0 || mutex->dtape_owner == (uintptr_t)xthread) {
 			// lock successfully acquired
 			mutex->dtape_owner = (uintptr_t)xthread;
@@ -86,9 +97,6 @@ void dtape_mutex_lock(dtape_mutex_t* mutex) {
 		}
 
 		// lock not acquired; let's wait
-		if (thread->mutex_link._dbg_queued) {
-			dtape_log_error("perf#25a A0: dtape_mutex_lock DOUBLE-INSERT of mutex_link %p (already queued) thread=%p mutex=%p", &thread->mutex_link, thread, mutex);
-		}
 		thread->mutex_link._dbg_queued = 1;
 		TAILQ_INSERT_TAIL(&mutex->dtape_queue_head, &thread->mutex_link, link);
 
