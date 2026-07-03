@@ -560,3 +560,32 @@ clear_wait_internal (dtape sigexc). The prepost-orphan-on-EINTR the guest commen
 suspect — verify libpthread's _pthread_psynch_cond_wait recovery actually re-arms the prepost, and that
 psynch_cvsignal doesn't drop a signal delivered to a waiter that was just EINTR-aborted. Prod restored
 byte-identical baseline 835946f9; doctor GREEN. Evidence: tmp/a0_livelock_1630247.txt + the histograms above.
+
+## UPDATE 13 — FIX FALSIFIED: the timer-cancel-on-sigexc fix does NOT resolve the hang (3/3 HUNG). Root cause still NOT pinned to a line.
+
+The Variant-A fix — cancel the armed wait_timer in dtape_thread_sigexc_enter (thread.c, mirroring the existing
+thread_unblock cancel), branch fix/psynch-cvwait-timer-cancel-on-sigexc commit 9c0b96d, binary b714c86f —
+was gated: boot smoke + brew reinstall A/B. Result:
+  BOOT SMOKE: PASS (fix does not break boot)
+  GATE 2 ring-ON: run 1 HUNG, run 2 HUNG, run 3 HUNG  -> aborted the gate; 3/3 is decisive.
+The fix does NOT eliminate the hang. => the "stale wait_timer on the signal-abort path fires a spurious
+THREAD_TIMED_OUT into the re-issued cvwait" mechanism (UPDATE 12) is FALSIFIED as the driver. The 42:1
+cvwait:cvsignal ratio (UPDATE 12) is a real SYMPTOM of a lost condvar wakeup, but the LOSS MECHANISM is not
+the stale timer.
+
+HONEST STATUS: three candidate root causes have now been falsified by measurement — the ring (UPDATE 9), the
+stranded _pendingSavedReply (UPDATE 11), and the stale wait_timer / timer-cancel fix (this update). What is
+SOLID: not the ring, not a transport reply drop, server healthy+saturated, symptom = pthread condvar livelock
+(cvwait re-issued forever, cvsignal starved 42:1). What is NOT known: the exact point where the cvsignal
+wakeup / prepost handoff is lost under the SIGCHLD/EINTR storm.
+
+METHOD CORRECTION (why the probabilistic brew gate is the wrong tool now): the brew A/B is slow (~1-5 min/run),
+noisy, and only tells hang-vs-clean — it can't show WHERE the wakeup is lost, and "0 hangs" is a statistical
+claim, not an invariant. The user's requirement is ZERO hangs, period. NEXT = build a DETERMINISTIC
+condvar-storm micro-repro: a small guest program with N threads on one pthread condvar (producer/consumer)
+while a driver spams signals (pthread_kill) to emulate brew's SIGCHLD EINTR-aborts, aiming to reproduce the
+livelock in SECONDS, repeatably, with none of brew. Then instrument cvwait/cvsignal/prepost on THAT to catch
+the specific lost wakeup (which generation, who signalled, who waited), fix the exact mechanism, and verify
+0/1000 iterations on the repro before any brew A/B. The timer-cancel change is retained on its branch (it is
+a correct hardening that matches thread_unblock and passed boot smoke) but is NOT the A0 fix and must not be
+described as such. Prod restored byte-identical baseline 835946f9; doctor GREEN.
