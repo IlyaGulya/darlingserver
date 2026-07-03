@@ -479,7 +479,6 @@ void DarlingServer::Thread::doWork() {
 	_rwlock.lock();
 
 	if (_deferralState != DeferralState::NotDeferred) {
-		threadLog.error() << "A0 DOWORK nstid=" << _nstid << " EARLY-RETURN deferred(state=" << (int)_deferralState << ") permit=" << _resumePermit << " -> DeferredPending" << threadLog.endLog;
 		microthreadLog.debug() << _tid << "(" << _nstid << "): execution was deferred" << microthreadLog.endLog;
 		_deferralState = DeferralState::DeferredPending;
 		_rwlock.unlock();
@@ -487,9 +486,15 @@ void DarlingServer::Thread::doWork() {
 	}
 
 	if (_running) {
-		// this is probably an error
-		threadLog.error() << "A0 DOWORK nstid=" << _nstid << " EARLY-RETURN already-running permit=" << _resumePermit << threadLog.endLog;
-		microthreadLog.warning() << _tid << "(" << _nstid << "): attempt to re-run already running microthread on another thread" << microthreadLog.endLog;
+		// perf#25a A0: this dispatch was popped while the microthread is still
+		// _running on another worker (it is mid suspend()/doneWorking transition;
+		// _running is only cleared at the doneWorking tail). We cannot run it now,
+		// but we MUST NOT silently drop it -- otherwise a wake that a waker
+		// delivered via scheduleThread() (rather than via _resumePermit) is lost
+		// forever and the microthread deadlocks. Record the owed re-run; the
+		// doneWorking tail will reschedule exactly once after _running clears.
+		_rerunPending = true;
+		microthreadLog.debug() << _tid << "(" << _nstid << "): dispatch arrived while still running; deferring re-run" << microthreadLog.endLog;
 		_rwlock.unlock();
 		return;
 	}
@@ -633,7 +638,20 @@ doneWorking:
 	// A wake can arrive after suspend()'s final permit check but before it
 	// physically switches back here. Now that _running is false, rescheduling
 	// is safe and cannot race another worker running this microthread.
-	bool resumeAfterWorking = _resumePermit && _suspended && !_terminating && !_dead;
+	//
+	// perf#25a A0: also honor a dispatch that a worker popped and deferred while
+	// we were still _running (doWork() set _rerunPending instead of dropping it).
+	// Now that _running is false it is safe to reschedule; consume the flag so we
+	// reschedule exactly once. Only reschedule if the microthread is actually
+	// parked with a resumable context (_suspended) and still alive -- if it is
+	// terminating/dead or has no context, the owed re-run is moot.
+	bool rerunPending = _rerunPending;
+	_rerunPending = false;
+	// _resumePermit only makes sense when there is a suspended context to resume.
+	// _rerunPending is a dropped dispatch (from doWork's _running guard): it must be
+	// honored whether the microthread is suspended (resume its context) OR has a
+	// pending call to process -- i.e. NOT gated on _suspended. Gate only on liveness.
+	bool resumeAfterWorking = ((_resumePermit && _suspended) || rerunPending) && !_terminating && !_dead;
 	bool canRelease = false;
 	if (_dead) {
 		threadLog.debug() << *this << ": dead thread returning. active call? " << (!!_activeCall ? "true" : "false") << " terminating? " << (_terminating ? "true" : "false") << threadLog.endLog;
@@ -1005,11 +1023,9 @@ void DarlingServer::Thread::resume() {
 	{
 		std::unique_lock lock(_rwlock);
 		if (!_running && !_suspended) {
-			threadLog.error() << "A0 RESUME nstid=" << _nstid << " DROPPED(not running, not suspended) permit=" << _resumePermit << threadLog.endLog;
 			return;
 		}
 		if (_resumePermit) {
-			threadLog.error() << "A0 RESUME nstid=" << _nstid << " coalesced(permit already set) running=" << _running << " susp=" << _suspended << threadLog.endLog;
 			return;
 		}
 		// Coalesce repeated wakes into one permit. If the microthread is still
@@ -1017,7 +1033,6 @@ void DarlingServer::Thread::resume() {
 		// itself from doWork() after physically stopping.
 		_resumePermit = true;
 		schedule = _suspended && !_running;
-		threadLog.error() << "A0 RESUME nstid=" << _nstid << " set-permit running=" << _running << " susp=" << _suspended << " schedule=" << schedule << threadLog.endLog;
 	}
 
 	if (schedule) {
