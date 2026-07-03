@@ -266,3 +266,38 @@ defer/gate race that CAN orphan a notification) and is kept on branch fix/a0-kqc
 the brew-hang cure. Prod RESTORED byte-identical to baseline srv 835946f9 (fix NOT deployed). AUXLOG
 instrumentation retained behind the env gate for the guest-side investigation. NEXT: guest-thread-stack +
 per-fd + server-RPC correlated capture to name the stuck RPC call and its missing reply.
+
+## UPDATE 7 — guest-RPC capture: the true stall is launchd wedged in a DGRAM RPC (Recv-Q=0, idle server)
+Ran the guest-side capture (tmp/a0_guest_rpc_capture.sh + loop) on BASELINE binaries (srv 835946f9, ring
+compiled ON) — the pure prod hang, no instrumentation. Caught the hang; evidence
+tmp/a0_guest_rpc_snapshot.HANG_dualns.txt. KEY METHOD FIX: the guest container has its OWN network
+namespace, so a host `ss -x` does NOT see the guest UDS sockets — must `nsenter -t <mldr-pid> -n ss -x`.
+Decisive facts at a reproduced hang (victim = a CommandLineTools clang, 4 worker threads, + the launchd/
+memberd/securityd/shellspawn daemons):
+  - SERVER IS FROZEN: rpcs_serviced / ring_serviced_spin / ring_fast_hit are IDENTICAL across two snapshots
+    3-4s apart (476535 / 20964 / 14518, unchanged). No workqueue depth, no busy workers. The server is idle
+    — it does NOT think it owes anyone a reply.
+  - Every parked guest thread (launchd ×3, memberd, securityd, clang ×4) sits in `recvmsg` (nr 47) on its
+    **DGRAM RPC band fd** (8188-8191). Those fds have **Recv-Q = 0** (they do NOT appear in the guest-ns
+    "nonzero queue" list) — i.e. NO reply is waiting; the guest is genuinely blocked for a reply that was
+    never sent.
+  - Meanwhile launchd holds **6-7 kqchan SEQPACKET channels** (fds 14/32/34/37/38/39/40) each with
+    **Recv-Q = 12** (one undelivered notification), and darlingserver holds the matching 6-7 peers each with
+    **Send-Q = 768** backed up. This is the SAME kqchan pile-up as UPDATE 6 — but now confirmed to be purely
+    SECONDARY: launchd can't run its kevent()/epoll loop to drain those notifications because ALL its
+    threads are blocked in the DGRAM RPC recvmsg above.
+CONCLUSION (root class, evidence-locked): the brew hang is a **lost/never-sent DGRAM RPC reply** — a guest
+thread (launchd and/or the compiler) is parked in `recvmsg` on its RPC socket with Recv-Q=0 while the
+server is idle and believes nothing is pending. The kqchan 12B/768B backlog is a downstream symptom of
+launchd being stuck (its kevent loop is the only kqchan drainer). NOT the ring (counters frozen, ring-OFF
+clean historically), NOT the kqchan notification gate (fixed; still hangs). This is the dar-gwn
+lost-reply family: either (a) the server never received the guest's call (send raced a teardown / wrong
+address), or (b) it received it and the reply was consumed by the push_reply / InterruptExit
+saved-reply re-delivery path (call.cpp:176-252 / 938-958) and stranded there, or (c) an S2C/signal
+interrupt reordered replies and the guest's `PUSH_UNKNOWN_REPLIES` retry (generate-rpc-wrappers.py:1573)
+pushed the real reply back and never got it re-sent.
+NEXT (needs 1 build cycle): name the exact stuck call. Add a server-side per-guest-tid RPC trace (env-
+gated, like AUXLOG): for the launchd/compiler tids, log every call received (number+tid) and every reply
+sent (number+target address), so at the hang we see whether the server ever received the parked thread's
+last call and whether it sent/dropped/mis-routed the reply. That names the call and the exact drop site.
+Prod byte-identical baseline 835946f9, doctor GREEN, guest torn down. Evidence + harnesses in job tmp.
