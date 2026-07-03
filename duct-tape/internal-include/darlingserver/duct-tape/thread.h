@@ -29,6 +29,12 @@ typedef LIST_HEAD(dtape_thread_user_state_head, dtape_thread_user_state) dtape_t
 struct dtape_thread {
 	void* context;
 	dtape_mutex_link_t mutex_link;
+	// A0-ARCH stage 1: generation of the currently-armed XNU wait (set by
+	// thread_mark_wait_locked via the arm_wake hook under the thread lock; read+cleared by
+	// thread_unblock under the same lock so the finalizing wake names exactly the wait it
+	// finalized). 0 = no armed XNU wait (a kernel thread's birth TH_WAIT from
+	// kernel_thread_create arrives here as 0 and is delivered as an untyped start kick).
+	uint64_t xnu_wait_gen;
 	const char* name;
 	uintptr_t pthread_handle;
 	uintptr_t dispatch_qaddr;
