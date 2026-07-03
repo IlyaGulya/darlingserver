@@ -589,3 +589,39 @@ the specific lost wakeup (which generation, who signalled, who waited), fix the 
 0/1000 iterations on the repro before any brew A/B. The timer-cancel change is retained on its branch (it is
 a correct hardening that matches thread_unblock and passed boot smoke) but is NOT the A0 fix and must not be
 described as such. Prod restored byte-identical baseline 835946f9; doctor GREEN.
+
+## UPDATE 14 — DETERMINISTIC REPRO BUILT; it exposes a hard PANIC: "thread already waiting" at waitq.c:2835 (invariant violation on the signal-abort path)
+
+Built cvstorm.c (tmp/cvstorm.c): 8 consumer threads on one pthread condvar + a producer + a "stormer" thread
+that spams pthread_kill(SIGUSR1, SA_RESTART OFF) at the consumers, emulating brew make-j's SIGCHLD storm
+interrupting psynch_cvwait. Built inside the guest (clang -isysroot .../MacOSX.sdk) and run on the deployed
+BASELINE 835946f9 (ring ON). Harness tmp/cvstorm_run.sh (file-based capture, no $(...) wedge).
+
+RESULT — the repro fires in SECONDS, deterministically, and does NOT merely livelock: it PANICS the server.
+  BUILD_OK; RUN_START; then:
+    darlingserver duct-tape panic: "thread already waiting on 0x...230" @ duct-tape/xnu/osfmk/kern/waitq.c:2835
+    sigprocess failed internally while processing Linux signal 10: -111
+    semaphore_timedwait failed (internally): -111 ; ./cvstorm: Illegal instruction (core dumped)
+This is the SAME subsystem as the brew hang (psynch condvar wait aborted by a signal) but the micro-repro
+drives it hard enough to hit the debug invariant instead of only livelocking. Signal 10 = SIGUSR1 (our storm);
+in brew the storm signal is SIGCHLD. The -111 (=EINTR mapped) on semaphore_timedwait/signal is the same
+interrupt-abort surface. => the repro is a valid, fast, deterministic proxy for the A0 fault site.
+
+MECHANISM (waitq.c:2834 asserts thread->waitq==NULL on entry to waitq_assert_wait64_locked; the panic means a
+thread RE-ENTERS a wait while still linked on its previous waitq). Reading the abort path:
+  dtape_thread_sigexc_enter (duct-tape/src/thread.c ~503): does
+      thread->state &= ~(TH_UNINT | TH_WAIT);   // <-- pre-clears TH_WAIT
+      thread->wait_result = THREAD_INTERRUPTED;
+      clear_wait_internal(thread, THREAD_INTERRUPTED);
+  clear_wait_internal (thread.c:1686): after waitq_pull_thread_locked, at line 1715 checks
+      if ((thread->state & (TH_WAIT | TH_TERMINATE)) == TH_WAIT) return thread_go(...);
+      else return KERN_NOT_WAITING;
+  Because sigexc_enter ALREADY cleared TH_WAIT, this takes the KERN_NOT_WAITING branch and SKIPS thread_go()
+  -> thread_unblock() -- the routine that finalizes the unblock (and cancels the timer). The unblock is left
+  half-done; the guest's EINTR-retry re-enters assert_wait and trips the thread->waitq!=NULL invariant.
+HYPOTHESIS (to be tested on the repro, NOT assumed — two prior root-cause claims were falsified): the
+TH_WAIT pre-clear in dtape_thread_sigexc_enter races/short-circuits clear_wait_internal's own state handling.
+Candidate fix: let clear_wait_internal do the state transition (do not pre-clear TH_WAIT in sigexc_enter), or
+ensure the thread is fully pulled + unblocked before returning. VALIDATION PLAN: the repro is deterministic —
+a correct fix must make cvstorm print RESULT=OK (0 panics) across many runs in seconds, THEN brew A/B must be
+0 hangs. Evidence: tmp/cvstorm_run_1636387.log. Prod baseline 835946f9, doctor GREEN.
