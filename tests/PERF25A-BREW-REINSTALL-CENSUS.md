@@ -956,3 +956,52 @@ the darlingserver wait4/child-reap/SIGCHLD-reply path (dtape child-exit notifica
 parent wait4 RPC reply) to find the lost reply. Do NOT keep using cvstorm2 for the brew hang.
 Prod restored byte-identical baseline 835946f9, doctor ALL GREEN. Repro tmp/forkwait.c (insufficient),
 brew A/B harness tmp/a0_brew_ab.sh, hang capture tmp/brewhang_*.log.
+
+## UPDATE 26 (2026-07-03, task #113): A0 ROOT CAUSES FOUND & FIXED (parts 3+4) — brew xz/wget ZERO hangs; permanent gate harness
+
+**One line: the entire A0 family was ONE state-machine disease with many faces — duct-tape's
+microthread wake/wait protocol let stale state (TH_WAIT bits, waitq links, resume permits,
+TLS) survive across interrupts and OS-thread migration — plus ONE independent exec-checkin
+race. Six coupled fixes (commit a3de8c2, binary 886d13af) close every measured face.**
+
+### The faces and their fixes (all MEASURED before fixed; nothing modeled-only)
+
+| # | Face (captured evidence) | Fix |
+|---|---|---|
+| 3 | `doWork()` ran `dtape_thread_entering()` for an interrupt_enter stacking onto a call suspended on a waitq → TH_WAIT cleared while STILL LINKED → `sigexc_enter`'s `clear_wait_internal` saw NOT_WAITING and skipped the real teardown → stale waitq link stole the next `semaphore_signal` from the genuine waiter → zombie child + parent parked in recvmsg forever (nestwait/brew hang; RPC tape: interrupt_enter onto blocked fork_wait_for_child) | skip `entering` for stacking interrupts AND for any dispatch that resumes a suspended context |
+| 3b | after Part 3's correct teardown, `thread_unblock`→`thread_resume` minted a `_resumePermit` that the interrupt path (which resumes synchronously via jumpToResume) never consumed → stale permit made the thread's NEXT `suspend()` return immediately with `wait_result==THREAD_WAITING` → panic `semaphore_convert_wait_result` (captured wr=-1 on the fork_wait_for_child retry) | consume the permit in `_handleInterruptEnterForCurrentThread` after `sigexc_enter` |
+| 3c | a stale permit-less re-dispatch (`_rerunPending` tail) of a suspended thread resumed a live wait spuriously | doWork resumes a suspended context only with a consumed permit or pending-call override |
+| 3d | wake finalized BEFORE physical suspension (`thread_block` skips suspend) left the paired permit stale → next wait fast-returned wr=-1 (captured: kernelAsyncRunner work-queue semaphore, gdb backtrace) | new dtape hook `thread_clear_resume_permit`, consumed on thread_block's skip path |
+| 3e | raw dtape mutex/condvar handoff permits crosstalk with XNU waits: a stray permit popped a `thread_block` suspension with TH_WAIT still set → psynch continuation replied -EINTR while the thread stayed LINKED → next assert panics `waitq.c "thread already waiting"` (captured: state=TH_RUN wr=-1, cvstorm2 NO_STORM; baseline HANGS on the same corruption silently) | thread_block + thread_continuation_callback RE-PARK until `thread_unblock` genuinely finalized the wait (TH_WAIT cleared) — XNU's contract enforced |
+| 3f | `_handleInterruptEnterForCurrentThread` read thread_local `currentThreadVar`/`interruptedContinuation` across suspension points; the fiber can suspend (thread_lock contention) and resume on the OTHER OS runner (main loop + 1 worker BOTH run fibers) → TLS reads dereferenced an empty shared_ptr (captured SIGSEGV at the `_handlingInterruptedCall=true` store; this was the old FIXME) | pin `self` shared_ptr at entry, re-assert TLS after suspension points, move interruptedContinuation to a fiber-stack local |
+| 4 | exec-checkin race: `_pendingReplacement` is armed by the exec-listener pipe EOF, an epoll event that can lose the race to the post-exec checkin RPC; the stale arm made the NEXT (pthread!) checkin run the replacement sweep → killed the checking-in thread itself → checkin reply `DROP-DEAD` (RPC tape smoking gun: `REPLY-DISP call=1 disp=DROP-DEAD`, 30µs after RECV) → guest thread parked in recvmsg forever = the `brew reinstall wget` freeze at the openssl@3 build (ruby cc-shim leaf, no zombies) | didExec = MAIN-thread non-fork RE-checkin (timing-independent); thread checkins can never sweep; parent fork-wait semaphore raised only by FORK checkins (thread checkins were minting spurious stored wakeups) |
+
+### Gate results (binary 886d13af = parts 1+2a+3+3b+3c+3d+3e+3f+4, ring compiled ON)
+
+- nestwait ring-OFF 4/4 OK, ring-ON 6/6 OK (baseline 835946f9: 4/4 HANG, 5/6 HANG)
+- cvstorm2 -DNO_STORM 6/6 OK (baseline: HANG; intermediate binaries: waitq panic)
+- forkwait -DEXEC_CHILD 5/5 OK; boot smoke OK (many clean boots through the batteries)
+- brew reinstall xz ring-ON: 8/8 clean 🍺 (~66-78s) — was 3/3 perma-hang
+- brew reinstall wget ring-ON: NO FREEZE end-to-end through the openssl@3 SOURCE build
+  (thousands of spawns + 4469-test suite, 858 CPU-s); brew exits 1 because openssl's OWN
+  tests fail under Darling (04-test_bio_dgram: UDP BIO gap; 20-test_mac: exit 22 early
+  crash) — FUNCTIONAL gaps, separate class, NOT hangs. Earlier "wget still hangs 3/3"
+  readings were a HARNESS artifact (stdout-silence watchdog vs brew's legitimately silent
+  multi-minute build phases); the fixed harness watches SERVER RPC PROGRESS (darling-stat
+  rpcs_serviced) instead.
+
+### Known limits (documented, out of brew's envelope)
+
+- cvstorm2 UNTHROTTLED full-storm (~240k pthread_kill/s, all-consumer) can still kill the
+  server: `dtape_thread_wait_while_user_suspended` "Cannot wait with non-current thread"
+  panic + one unsymbolized SIGSEGV — interrupt-stacking depth under artificial flood far
+  beyond brew's ~1k sig/s. Tracked as follow-up, NOT gating A0.
+- openssl@3 formula test failures above (functional, follow-up).
+
+### Permanent harness
+
+`tests/a0-repro/a0-gate.sh` — one command, ZERO-hang criterion, exit 1 on any freeze:
+`./a0-gate.sh quick|full|synth`. Synthetics carry their own stall detectors; brew legs use
+the RPC-progress watchdog; every freeze dumps a wchan/zombie snapshot + keeps logs.
+Diagnostics kept in the server (zero cost until they fire): panic() host backtraces,
+enriched semaphore/waitq panic context, RPC tape (DARLING_SERVER_AUXLOG=1).
