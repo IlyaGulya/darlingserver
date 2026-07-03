@@ -163,6 +163,13 @@ namespace DarlingServer {
 			std::optional<Message> savedReply = std::nullopt;
 			std::shared_ptr<Call> interruptedCall = nullptr;
 			StackPool::Stack savedStack;
+			// A0-ARCH stage 1b: the interrupted context's ucontext, captured at interrupt
+			// stacking time. _resumeContext is a SINGLE per-thread slot: if the interrupt
+			// fiber itself suspends mid-flight (contended thread_lock in sigexc_enter, a
+			// blocking interrupted continuation), its own park OVERWRITES _resumeContext and
+			// the later jumpToResume would setcontext into a stale/garbage context (the #114
+			// SEGV shape, fuzzer-reproducible). jumpToResume must restore THIS copy.
+			ucontext_t savedResumeContext;
 			int signal = 0;
 		};
 		std::stack<InterruptContext> _interrupts;
@@ -279,7 +286,7 @@ namespace DarlingServer {
 		void _deactivateCallLocked(std::shared_ptr<Call> expectedCall);
 
 		[[noreturn]]
-		void jumpToResume(void* stack, size_t stackSize);
+		void jumpToResume(ucontext_t* context, void* stack, size_t stackSize);
 
 		void _dispose();
 		void _scheduleRelease();
