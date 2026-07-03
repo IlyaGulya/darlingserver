@@ -524,7 +524,20 @@ void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
 	// transition matches XNU, where a signal-interrupted wait is torn down by
 	// thread_go(), not by the caller hand-clearing TH_WAIT. (perf#25a A0)
 	thread->xnu_thread.state &= ~TH_UNINT;
-	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
+	// perf#25a A0 (Part 2): do NOT pre-assign wait_result here. clear_wait_internal()
+	// -> thread_go() -> thread_unblock() writes wait_result = THREAD_INTERRUPTED itself,
+	// but ONLY when it actually finds the thread still waiting (TH_WAIT set). If a psynch
+	// grant already unblocked this thread (thread_wakeup_thread -> thread_unblock set
+	// wait_result = THREAD_AWAKENED and cleared TH_WAIT) but its microthread continuation
+	// has not yet physically run, an unconditional assignment here CLOBBERS that committed
+	// THREAD_AWAKENED grant to THREAD_INTERRUPTED. The continuation (psynch_mtxcontinue)
+	// then takes its error path and returns EINTR, discarding an already-dequeued mutex
+	// grant (kwe_psynchretval) -- the guest re-issues the wait against an empty queue and
+	// deadlocks (the intermittent brew SIGCHLD-storm hang; repro cvstorm2 -DNCONS=1 storm).
+	// Letting clear_wait_internal own the write matches XNU (clear_wait(THREAD_INTERRUPTED)
+	// only rouses a thread that is genuinely still waiting) and leaves an already-delivered
+	// wakeup intact. Paired with thread_unblock() finalizing TH_WAIT->TH_RUN so the
+	// second (racing) abort correctly sees the thread no longer waiting.
 	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
 	thread_unlock(&thread->xnu_thread);
 };
@@ -640,6 +653,25 @@ wait_result_t thread_block(thread_continue_t continuation) {
 // thread locked
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+
+	// perf#25a A0 (Part 2): finalize the wait-state transition here, matching XNU's
+	// thread_unblock() which clears TH_WAIT|TH_UNINT and sets TH_RUN. Duct-tape
+	// previously left TH_WAIT set until the microthread physically resumed and ran
+	// dtape_thread_entering(). That left a window: after a psynch grant delivered its
+	// wakeup via thread_go()->thread_unblock() (wait_result = THREAD_AWAKENED) but
+	// before the queued microthread actually ran, a racing signal abort
+	// (dtape_thread_sigexc_enter -> clear_wait_internal(THREAD_INTERRUPTED)) still saw
+	// (state & (TH_WAIT|TH_TERMINATE)) == TH_WAIT and re-fired thread_go(), CLOBBERING
+	// wait_result to THREAD_INTERRUPTED. The continuation (psynch_mtxcontinue) then took
+	// its error path and returned EINTR, THROWING AWAY an already-committed mutex grant
+	// (kwe_psynchretval, dequeued from the kwq) -- the guest re-issues the wait against a
+	// now-empty queue and deadlocks (the intermittent brew SIGCHLD-storm hang; repro
+	// cvstorm2 -DNCONS=1 storm-on). Clearing TH_WAIT here makes the second
+	// clear_wait_internal correctly return KERN_NOT_WAITING and leave the grant intact.
+	// (Do not clear TH_TERMINATE: a terminating thread must stay terminating.)
+	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
+	thread->xnu_thread.state |= TH_RUN;
+
 	thread->xnu_thread.wait_result = wresult;
 
 	// Cancel the wait timer if one was armed for a timed wait. XNU's
