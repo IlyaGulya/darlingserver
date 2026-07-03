@@ -564,7 +564,7 @@ void DarlingServer::Thread::doWork() {
 		// _running on another worker (it is mid suspend()/doneWorking transition;
 		// _running is only cleared at the doneWorking tail). We cannot run it now,
 		// but we MUST NOT silently drop it -- otherwise a wake that a waker
-		// delivered via scheduleThread() (rather than via _resumePermit) is lost
+		// delivered via scheduleThread() (rather than via a pending wake token) is lost
 		// forever and the microthread deadlocks. Record the owed re-run; the
 		// doneWorking tail will reschedule exactly once after _running clears.
 		_rerunPending = true;
@@ -583,9 +583,8 @@ void DarlingServer::Thread::doWork() {
 		goto doneWorking;
 	}
 
-	if (_suspended && _resumePermit) {
-		// This execution was scheduled by resume(); consume that wake permit.
-		_resumePermit = false;
+	if (_suspended && _consumePendingWakeLocked()) {
+		// This execution was scheduled by a matching typed wake; consume it.
 		hadResumePermit = true;
 	}
 	_running = true;
@@ -757,11 +756,11 @@ doneWorking:
 	// terminating/dead or has no context, the owed re-run is moot.
 	bool rerunPending = _rerunPending;
 	_rerunPending = false;
-	// _resumePermit only makes sense when there is a suspended context to resume.
-	// _rerunPending is a dropped dispatch (from doWork's _running guard): it must be
+	// A deliverable pending wake only makes sense when there is a suspended context to
+	// resume. _rerunPending is a dropped dispatch (from doWork's _running guard): it must be
 	// honored whether the microthread is suspended (resume its context) OR has a
 	// pending call to process -- i.e. NOT gated on _suspended. Gate only on liveness.
-	bool resumeAfterWorking = ((_resumePermit && _suspended) || rerunPending) && !_terminating && !_dead;
+	bool resumeAfterWorking = ((_hasDeliverablePendingWakeLocked() && _suspended) || rerunPending) && !_terminating && !_dead;
 	bool canRelease = false;
 	if (_dead) {
 		threadLog.debug() << *this << ": dead thread returning. active call? " << (!!_activeCall ? "true" : "false") << " terminating? " << (_terminating ? "true" : "false") << threadLog.endLog;
@@ -1067,9 +1066,8 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	}
 
 	_rwlock.lock();
-	// Consume a wake that arrived before suspend() marked us suspended.
-	if (_resumePermit) {
-		_resumePermit = false;
+	// Consume a matching wake that arrived before suspend() marked us suspended.
+	if (_consumePendingWakeLocked()) {
 		_rwlock.unlock();
 		if (unlockMe) {
 			libsimple_lock_unlock(unlockMe);
@@ -1084,9 +1082,8 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	getcontext(&_resumeContext);
 
 	_rwlock.lock();
-	// Consume a wake that arrived while the resume context was being captured.
-	if (_resumePermit) {
-		_resumePermit = false;
+	// Consume a matching wake that arrived while the resume context was being captured.
+	if (_consumePendingWakeLocked()) {
 		_suspended = false;
 		_rwlock.unlock();
 		if (unlockMeWhenSuspending) {
@@ -1128,20 +1125,121 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	}
 };
 
-void DarlingServer::Thread::resume() {
+uint64_t DarlingServer::Thread::armWake(WakeKind kind) {
+	std::unique_lock lock(_rwlock);
+	uint64_t gen = ++_wakeGenCounter;
+	const size_t k = static_cast<size_t>(kind);
+	if (_armedWakeGen[k] != 0) {
+		// the previous wait of this kind ended without its arm-site disarm running (its wake
+		// was consumed elsewhere, or the park was aborted); re-arming supersedes it
+		microthreadLog.debug() << _tid << "(" << _nstid << "): re-arming wake kind " << (int)k
+			<< " over live gen " << _armedWakeGen[k] << microthreadLog.endLog;
+	}
+	_armedWakeGen[k] = gen;
+	if (_pendingWakeGen[k] != 0) {
+		// any wake still pending for this kind was for a PREVIOUS wait -- stale by
+		// construction (gen is fresh); drop it so it cannot satisfy the new wait
+		microthreadLog.debug() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
+			<< (int)k << " gen " << _pendingWakeGen[k] << " at re-arm" << microthreadLog.endLog;
+		_pendingWakeGen[k] = 0;
+	}
+	return gen;
+};
+
+void DarlingServer::Thread::disarmWake(WakeKind kind) {
+	std::unique_lock lock(_rwlock);
+	const size_t k = static_cast<size_t>(kind);
+	_armedWakeGen[k] = 0;
+	// old Part 3d lives here now: a wake already delivered for this (concluded) wait is
+	// satisfied by definition -- drop it so it cannot go stale and spuriously satisfy the
+	// thread's NEXT suspend() while wait_result is still THREAD_WAITING.
+	_pendingWakeGen[k] = 0;
+};
+
+bool DarlingServer::Thread::_consumePendingWakeLocked() {
+	// Abort outranks everything and matches unconditionally (doWork routes a resumed dying
+	// thread into its terminating paths).
+	constexpr size_t abortIdx = static_cast<size_t>(WakeKind::Abort);
+	if (_pendingWakeGen[abortIdx] != 0) {
+		_pendingWakeGen[abortIdx] = 0;
+		return true;
+	}
+	// Prefer the innermost park kinds: a raw queue handoff belongs to the park physically on
+	// the stack right now; an XNU-wait finalization may belong to an OUTER wait (nested
+	// arming) whose early pop the loop-guarded parks tolerate by re-checking.
+	static constexpr WakeKind order[] = { WakeKind::Raw, WakeKind::Xnu, WakeKind::UserSuspension, WakeKind::Kick };
+	for (WakeKind kind : order) {
+		const size_t k = static_cast<size_t>(kind);
+		if (_pendingWakeGen[k] == 0) {
+			continue;
+		}
+		if (_pendingWakeGen[k] == _armedWakeGen[k]) {
+			// consuming clears BOTH slots: the wait is being delivered right now, so the
+			// arm-site's own disarm (which would drop a still-pending wake) becomes a no-op
+			_pendingWakeGen[k] = 0;
+			_armedWakeGen[k] = 0;
+			return true;
+		}
+		// pending no longer matches the armed wait of its kind -- its wait is gone; drop
+		microthreadLog.debug() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
+			<< (int)k << " gen " << _pendingWakeGen[k] << " (armed " << _armedWakeGen[k] << ")" << microthreadLog.endLog;
+		_pendingWakeGen[k] = 0;
+	}
+	return false;
+};
+
+bool DarlingServer::Thread::_hasDeliverablePendingWakeLocked() const {
+	if (_pendingWakeGen[static_cast<size_t>(WakeKind::Abort)] != 0) {
+		return true;
+	}
+	for (size_t k = 0; k < wakeKindCount; k++) {
+		if (_pendingWakeGen[k] != 0 && _pendingWakeGen[k] == _armedWakeGen[k]) {
+			return true;
+		}
+	}
+	return false;
+};
+
+void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
 	bool schedule = false;
 	{
 		std::unique_lock lock(_rwlock);
 		if (!_running && !_suspended) {
+			// nothing to deliver to (no parked context and no owner mid-transition);
+			// same no-op as the old untyped resume()
 			return;
 		}
-		if (_resumePermit) {
-			return;
+		if (kind == WakeKind::Abort) {
+			_pendingWakeGen[static_cast<size_t>(WakeKind::Abort)] = 1;
+		} else {
+			size_t k = static_cast<size_t>(kind);
+			if (generation == 0) {
+				// waker cannot know the generation (thread_release; kernel-thread birth
+				// unblock): target the currently-armed wait of this kind
+				generation = _armedWakeGen[k];
+				if (generation == 0 && kind == WakeKind::Xnu) {
+					// kernel_thread_create sets TH_WAIT directly without
+					// thread_mark_wait_locked, so the thread's FIRST unblock arrives
+					// untyped -- deliver it as the startup kick
+					kind = WakeKind::Kick;
+					k = static_cast<size_t>(WakeKind::Kick);
+					generation = _armedWakeGen[k];
+				}
+				if (generation == 0) {
+					microthreadLog.debug() << _tid << "(" << _nstid << "): dropping untyped wake kind "
+						<< (int)k << ": nothing armed" << microthreadLog.endLog;
+					return;
+				}
+			} else if (_armedWakeGen[k] != generation) {
+				// STALE WAKE: the wait this wake was minted for is gone (consumed early by
+				// an abort, superseded by a re-arm). This is the A0 crosstalk class -- the
+				// old untyped permit would have delivered it as a spurious resume; drop it.
+				microthreadLog.debug() << _tid << "(" << _nstid << "): dropping stale wake kind "
+					<< (int)k << " gen " << generation << " (armed " << _armedWakeGen[k] << ")" << microthreadLog.endLog;
+				return;
+			}
+			_pendingWakeGen[k] = generation;
 		}
-		// Coalesce repeated wakes into one permit. If the microthread is still
-		// running, it will either consume the permit in suspend() or reschedule
-		// itself from doWork() after physically stopping.
-		_resumePermit = true;
 		schedule = _suspended && !_running;
 	}
 
@@ -1154,17 +1252,6 @@ void DarlingServer::Thread::resume() {
 	if (schedule) {
 		Server::sharedInstance().scheduleThread(shared_from_this());
 	}
-};
-
-void DarlingServer::Thread::clearResumePermit() {
-	// perf#25a A0 (Part 3d): called by duct-tape's thread_block_parameter when the wait was
-	// finalized (thread_unblock ran: wait_result written, TH_WAIT cleared) BEFORE the microthread
-	// physically suspended -- thread_block skips the suspension, so the wake permit resume()
-	// minted for that unblock is already satisfied. Left set, it would go stale and let the
-	// thread's NEXT suspend() return immediately with wait_result still THREAD_WAITING (panics
-	// semaphore_convert_wait_result; corrupts other wait protocols silently).
-	std::unique_lock lock(_rwlock);
-	_resumePermit = false;
 };
 
 void DarlingServer::Thread::terminate() {
@@ -1207,12 +1294,16 @@ void DarlingServer::Thread::setupKernelThread(std::function<void()> startupCallb
 	std::unique_lock lock(_rwlock);
 	_continuationCallback = startupCallback;
 	_suspended = true;
+	// A0-ARCH stage 1: the birth park of a kernel thread; woken exactly once by a startup
+	// kick (startKernelThread below, or an untyped first thread_unblock for kernel threads
+	// created via kernel_thread_create -- see wake()).
+	_armedWakeGen[static_cast<size_t>(WakeKind::Kick)] = ++_wakeGenCounter;
 	getcontext(&_resumeContext);
 };
 
 void DarlingServer::Thread::startKernelThread(std::function<void()> startupCallback) {
 	setupKernelThread(startupCallback);
-	resume();
+	wake(WakeKind::Kick, 0);
 };
 
 void DarlingServer::Thread::impersonate(std::shared_ptr<Thread> thread) {
@@ -2575,7 +2666,9 @@ void DarlingServer::Thread::notifyDead() {
 	if (canRelease) {
 		_scheduleRelease();
 	} else {
-		resume();
+		// liveness abort: pop whatever park the dying thread is in, regardless of typed wait
+		// state -- doWork routes a dead thread into its terminating paths
+		wake(WakeKind::Abort, 0);
 	}
 
 	threadRegistry().unregisterEntry(shared_from_this());
@@ -2704,20 +2797,16 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 		self->_interruptedContinuation = nullptr;
 	}
 
-	// perf#25a A0 (Part 3b): sigexc_enter's clear_wait_internal -> thread_go -> thread_unblock
-	// fires the dtape thread_resume hook, which mints a _resumePermit for this (currently
-	// _running) thread. The interrupt path resumes the interrupted continuation SYNCHRONOUSLY
-	// below (jumpToResume / interruptedContinuation), so that permit is already satisfied here.
-	// If left set, it goes stale: the thread's NEXT genuine wait (e.g. the guest's retried
-	// fork_wait_for_child) has its suspend() consume the stale permit and return immediately --
-	// a spurious wakeup with wait_result still THREAD_WAITING, which panics
-	// semaphore_convert_wait_result ("semaphore_block") and, in wait paths that tolerate it,
-	// silently corrupts the wait protocol. Any permit present at this point can only refer to
-	// resuming the interrupted context (doWork already consumed pre-existing permits at
-	// dispatch), so consuming it here is exact.
+	// perf#25a A0 (Part 3b, retyped by A0-ARCH stage 1): sigexc_enter's clear_wait_internal ->
+	// thread_go -> thread_unblock fires a typed Xnu wake for the INTERRUPTED wait. The
+	// interrupt path resumes the interrupted continuation SYNCHRONOUSLY below (jumpToResume /
+	// interruptedContinuation), so that wake is already satisfied here -- drop the pending Xnu
+	// token so it is not re-delivered. Deliberately ONLY the Xnu one: a Raw wake pending here
+	// belongs to a raw park of the interrupted context (kwq lock handoff) and must SURVIVE the
+	// interrupt (the untyped permit machinery used to lose it -- one of the crosstalk faces).
 	{
 		std::unique_lock lock(self->_rwlock);
-		self->_resumePermit = false;
+		self->_pendingWakeGen[static_cast<size_t>(WakeKind::Xnu)] = 0;
 	}
 
 	self->_didSyscallReturnDuringInterrupt = false;

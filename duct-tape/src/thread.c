@@ -468,7 +468,18 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 	//         2. we can register the signalfd only when we receive a signal, since we only need to check for pending signals during sigprocess,
 	//            but this means signal processing incurs an additional delay.
 
-	while (thread->xnu_thread.suspend_count > 0) {
+	while (true) {
+		// A0-ARCH stage 1: arm BEFORE re-checking suspend_count. This closes the old FIXME
+		// race ("between notifying of waiting and actually sleeping"): a thread_release that
+		// decrements the count after our check can now deliver its wake against an armed
+		// token, which suspend() consumes instead of us parking forever on a lost wake.
+		dtape_hooks->thread_arm_wake(thread->context, dtape_wake_kind_user_suspension);
+
+		if (thread->xnu_thread.suspend_count <= 0) {
+			dtape_hooks->thread_disarm_wake(thread->context, dtape_wake_kind_user_suspension);
+			break;
+		}
+
 		dtape_log_debug("sigexc: going to sleep");
 
 		dtape_mutex_lock(&thread->suspension_mutex);
@@ -476,11 +487,11 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 		dtape_mutex_unlock(&thread->suspension_mutex);
 		dtape_condvar_signal(&thread->suspension_condvar, SIZE_MAX);
 
-		// FIXME: possible race condition here between notifying of waiting and actually sleeping
-
 		thread->xnu_thread.wait_result = THREAD_WAITING;
 
 		dtape_hooks->thread_suspend(thread->context, NULL, NULL, NULL);
+
+		dtape_hooks->thread_disarm_wake(thread->context, dtape_wake_kind_user_suspension);
 
 		dtape_log_debug("sigexc: woken up");
 
@@ -619,6 +630,12 @@ static void thread_continuation_callback(void* context) {
 		thread_lock(&thread->xnu_thread);
 	}
 
+	// A0-ARCH stage 1: the wait this continuation belonged to is finalized; disarm its token
+	// (mirrors the disarm at thread_block_parameter's exit for the inline variant).
+	thread_unlock(&thread->xnu_thread);
+	dtape_hooks->thread_disarm_wake(thread->context, dtape_wake_kind_xnu);
+	thread_lock(&thread->xnu_thread);
+
 	continuation = thread->xnu_thread.continuation;
 	thread->xnu_thread.continuation = NULL;
 
@@ -666,16 +683,16 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 				dtape_hooks->thread_suspend(thread->context, NULL, thread, NULL);
 			}
 		}
-	} else {
-		// perf#25a A0 (Part 3d): the wait was already finalized (thread_unblock cleared TH_WAIT,
-		// wrote wait_result, and had thread_resume mint a wake permit) before we could physically
-		// suspend -- the wake is delivered right here by NOT suspending. Consume the paired
-		// permit; otherwise it goes stale and spuriously satisfies this thread's NEXT suspend()
-		// while wait_result is still THREAD_WAITING (panic in semaphore_convert_wait_result;
-		// silent wait-protocol corruption elsewhere). Repro: nestwait.c SIGUSR1 storm, the
-		// kernelAsyncRunner's work-queue semaphore (captured backtrace 2026-07-03).
-		dtape_hooks->thread_clear_resume_permit(thread->context);
 	}
+
+	// A0-ARCH stage 1 (subsumes Part 3d): this wait episode is over -- either we parked and
+	// were genuinely unblocked, or the wait was finalized before we could physically suspend
+	// (the old Part-3d case: the wake is delivered right here by NOT suspending). Disarming
+	// drops the paired pending wake with it, so it cannot go stale and spuriously satisfy
+	// this thread's NEXT suspend() while wait_result is still THREAD_WAITING (panic in
+	// semaphore_convert_wait_result; silent wait-protocol corruption elsewhere).
+	// (The continuation variant never returns here; it disarms in thread_continuation_callback.)
+	dtape_hooks->thread_disarm_wake(thread->context, dtape_wake_kind_xnu);
 
 	thread_lock(&thread->xnu_thread);
 	wait_result_t wait_result = thread->xnu_thread.wait_result;
@@ -734,7 +751,16 @@ boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 		thread->xnu_thread.wait_timer_is_set = FALSE;
 	}
 
-	dtape_hooks->thread_resume(thread->context);
+	// A0-ARCH stage 1: this unblock finalizes exactly the wait that thread_mark_wait_locked
+	// armed -- name it in the wake. Clearing the slot keeps a second (buggy) unblock of the
+	// same thread from forging a matching wake. Generation 0 happens only for a kernel
+	// thread's birth TH_WAIT (kernel_thread_create sets the state directly) and is delivered
+	// by the hook as an untyped start kick.
+	{
+		uint64_t wake_gen = thread->xnu_wait_gen;
+		thread->xnu_wait_gen = 0;
+		dtape_hooks->thread_resume(thread->context, dtape_wake_kind_xnu, wake_gen);
+	}
 	return TRUE;
 };
 
@@ -749,6 +775,13 @@ wait_result_t thread_mark_wait_locked(thread_t thread, wait_interrupt_t interrup
 	thread->wait_result = THREAD_WAITING;
 	thread->block_hint = thread->pending_block_hint;
 	thread->pending_block_hint = kThreadWaitNone;
+	// A0-ARCH stage 1: arm the typed wake token for this XNU wait. Runs under the thread
+	// lock BEFORE the thread becomes findable on any waitq, so thread_unblock (the single
+	// finalizer, also under the thread lock) always reads the matching generation.
+	{
+		dtape_thread_t* dthread = dtape_thread_for_xnu_thread(thread);
+		dthread->xnu_wait_gen = dtape_hooks->thread_arm_wake(dthread->context, dtape_wake_kind_xnu);
+	}
 	return THREAD_WAITING;
 };
 
@@ -1551,7 +1584,9 @@ void thread_release(thread_t xthread) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	dtape_log_debug("sigexc: thread_release(%p)\n", xthread);
 	xthread->suspend_count--;
-	dtape_hooks->thread_resume(thread->context);
+	// A0-ARCH stage 1: the releaser cannot know the park's generation; 0 = whatever
+	// user-suspension wait is currently armed. Safe: that park re-checks suspend_count.
+	dtape_hooks->thread_resume(thread->context, dtape_wake_kind_user_suspension, 0);
 };
 
 void thread_wait(thread_t xthread, boolean_t until_not_runnable) {

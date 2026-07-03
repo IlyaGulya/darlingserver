@@ -57,6 +57,20 @@ namespace DarlingServer {
 			Uninterruptible = dtape_thread_state_uninterruptible,
 		};
 
+		// A0-ARCH stage 1: typed wake tokens (replace the old untyped resume()/_resumePermit).
+		// A wake names the WAIT it is waking via (kind, generation); the suspension machinery
+		// only consumes a wake whose pair matches a currently-armed wait, so a stale wake --
+		// the raw-handoff vs XNU-wait crosstalk family behind the A0 hangs -- is logged and
+		// dropped instead of delivered as a spurious resume.
+		enum class WakeKind : uint8_t {
+			Xnu = 0,            // XNU wait finalized by thread_unblock (wait_result written)
+			Raw = 1,            // raw dtape mutex/condvar queue handoff
+			UserSuspension = 2, // sigexc user-suspension release
+			Kick = 3,           // kernel-thread startup kick (setupKernelThread/startKernelThread)
+			Abort = 4,          // liveness abort (notifyDead): matches ANY park unconditionally
+		};
+		static constexpr size_t wakeKindCount = 5;
+
 	private:
 		enum class DeferralState: uint8_t {
 			/**
@@ -83,17 +97,31 @@ namespace DarlingServer {
 		StackPool::Stack _stack;
 		// These are orthogonal lifecycle dimensions, not one enum state:
 		// _running means a worker currently owns this microthread;
-		// _suspended means it has a resumable context; and _resumePermit is a
-		// coalesced wake request that bridges the transition between the two.
+		// _suspended means it has a resumable context.
 		bool _suspended = false;
-		bool _resumePermit = false;
+		// A0-ARCH stage 1: typed wake-token state (all under _rwlock). One armed wait and one
+		// pending wake per kind -- a thread can have at most one XNU wait, one raw queue link
+		// (mutex_link) and one user-suspension park live at a time, and they can NEST (an XNU
+		// wait armed while the thread raw-parks on a kwq lock, interrupts stacking on top), so
+		// per-kind slots rather than a single scalar. 0 = empty. A pending wake is deliverable
+		// only while it matches the armed generation of its kind; consuming a wake clears both
+		// slots of that kind (the waiter's disarm then no-ops). Abort uses only the pending
+		// slot (sentinel 1) and matches unconditionally.
+		uint64_t _wakeGenCounter = 0;
+		uint64_t _armedWakeGen[wakeKindCount] = {};
+		uint64_t _pendingWakeGen[wakeKindCount] = {};
+		// Consume one deliverable pending wake (preferring the innermost park kinds) and drop
+		// any stale pendings encountered. Returns true if a wake was consumed. _rwlock held.
+		bool _consumePendingWakeLocked();
+		// True if some pending wake is currently deliverable. _rwlock held (shared ok).
+		bool _hasDeliverablePendingWakeLocked() const;
 		// perf#25a A0: a dispatch (scheduleThread) can be popped by a worker and
 		// enter doWork() while this microthread is still _running on another worker
 		// (mid suspend()/doneWorking transition; _running clears only at the
 		// doneWorking tail). doWork() cannot run it now, but must NOT silently drop
 		// it: it records the owed re-run here, and the doneWorking tail (once
 		// _running is cleared) reschedules exactly once. This complements
-		// _resumePermit, which only bridges the wake-before-suspend direction.
+		// the pending-wake tokens, which only bridge the wake-before-suspend direction.
 		bool _rerunPending = false;
 		ucontext_t _resumeContext;
 		dtape_thread_t* _dtapeThread;
@@ -351,8 +379,15 @@ namespace DarlingServer {
 		 *       It will throw an error in all other cases.
 		 */
 		void suspend(std::function<void()> continuationCallback = nullptr, libsimple_lock_t* unlockMe = nullptr);
-		void resume();
-		void clearResumePermit();
+
+		// A0-ARCH stage 1 typed-wake API (see the WakeKind declaration at the top of the class).
+		// Arm a wait of `kind`; returns its generation. Call BEFORE becoming visible to the waker.
+		uint64_t armWake(WakeKind kind);
+		// Disarm the armed wait of `kind` (idempotent), dropping any pending wake paired with it.
+		void disarmWake(WakeKind kind);
+		// Deliver a wake for (kind, generation); generation 0 = the currently-armed one.
+		void wake(WakeKind kind, uint64_t generation);
+
 		void terminate();
 
 		void setThreadHandles(uintptr_t pthreadHandle, uintptr_t dispatchQueueAddress);
