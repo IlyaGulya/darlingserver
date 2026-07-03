@@ -50,6 +50,11 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	}
 
 	thread->context = context;
+	// perf#25a A0: mutex_link (the shared mutex/condvar wait-queue link, incl. its _dbg_queued flag) is NOT
+	// covered by the memsets below; malloc leaves it garbage. The wait-queue double-insert guard reads
+	// _dbg_queued on the first dtape_mutex_lock -- if it starts nonzero it does a bogus TAILQ_REMOVE on an
+	// unqueued link and corrupts the queue at boot. Zero it explicitly. (This uninit was the boot wedge.)
+	memset(&thread->mutex_link, 0, sizeof(thread->mutex_link));
 	thread->processing_signal = false;
 	thread->name = NULL;
 	thread->cancel_disable = false;
