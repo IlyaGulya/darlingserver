@@ -625,3 +625,25 @@ Candidate fix: let clear_wait_internal do the state transition (do not pre-clear
 ensure the thread is fully pulled + unblocked before returning. VALIDATION PLAN: the repro is deterministic —
 a correct fix must make cvstorm print RESULT=OK (0 panics) across many runs in seconds, THEN brew A/B must be
 0 hangs. Evidence: tmp/cvstorm_run_1636387.log. Prod baseline 835946f9, doctor GREEN.
+
+## UPDATE 15 — sigexc TH_WAIT fix VERIFIED to remove the panic, but the lost-wakeup livelock REMAINS (two layers). Repro now reproduces the PURE livelock deterministically in ~1s.
+
+Applied the corrected sigexc fix (commit bd7cdb9: dtape_thread_sigexc_enter clears only TH_UNINT, no longer
+pre-clears TH_WAIT, so clear_wait_internal routes through thread_go->thread_unblock and fully pulls the thread
+off its waitq). Built binary 50dea03a, ran the deterministic cvstorm repro on it:
+  BEFORE (baseline 835946f9): panic "thread already waiting" @ waitq.c:2835 within seconds.
+  AFTER  (50dea03a):          NO panic. But: RESULT=HANG — done_count freezes at 97524 after ~1s while
+                              storm_hits keeps climbing (14k->101k); consumers stall on cond_wait
+                              (per-consumer iters wildly uneven: c7=14 vs c4=44207).
+=> TWO LAYERS. The fix removed the waitq-corruption/panic layer (real correctness win). The underlying
+LOST-COND-SIGNAL WAKEUP layer is still present — the 42:1 cvwait:cvsignal livelock persists. bd7cdb9 is a
+correct partial fix, NOT the complete A0 fix.
+
+GOOD NEWS FOR DIAGNOSIS: with the panic gone, cvstorm now reproduces the PURE livelock deterministically in
+~1 SECOND (no brew, no panic masking it) — the clean fast target the investigation needed. Remaining
+hypothesis (to be INSTRUMENTED on the repro, not assumed): a psynch cond_signal hands its wakeup off to a
+specific waiter that is simultaneously being signal-aborted; the handoff is consumed by the abort and the
+signaled work item is stranded (no other waiter picks it up). NEXT: instrument cvwait/cvsignal on the repro
+(RPCTRACE auxlog under cvstorm) to catch the specific lost handoff, then fix that layer and re-verify
+0 hangs on the repro before brew A/B. Prod restore pending; fix binary 50dea03a still deployed for the next
+instrumented repro run.
