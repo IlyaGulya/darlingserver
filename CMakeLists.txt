@@ -144,6 +144,8 @@ target_link_libraries(darlingserver PRIVATE
 target_compile_options(darlingserver PRIVATE
 	-pthread
 	-std=c++17
+	# A0-ARCH: debug info for live crash triage (same -O2 codegen; inline frames + lines in gdb)
+	-g
 )
 target_link_options(darlingserver PRIVATE
 	-pthread
