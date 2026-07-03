@@ -1535,6 +1535,9 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 					Server::sharedInstance().sendMessage(std::move(*_deferredReply));
 				}
 				_deferredReply = std::nullopt;
+				// A0 RPC TRACE: the STASH-DEFERRED[s2c] reply is now flushed. Its absence for a tid that
+				// logged STASH-DEFERRED is the stall signature (deferred reply never flushed).
+				DarlingServer::__rpctrace("FLUSH-DEFERRED htid=%d nstid=%lld", id(), (long long)nsid());
 			}
 		}
 	}
@@ -2253,6 +2256,20 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 		_deactivateCallLocked(expectedCall);
 	}
 
+	// A0 RPC TRACE: name the disposition of this reply. Four outcomes, keyed by tid/nsid so it lines up
+	// with the RECV line and the guest-capture /proc/<tid>. A stall reads directly off the tape: a RECV
+	// whose reply ends in STASH-SAVED or STASH-DEFERRED with no later FLUSH-* line, or a RECV that never
+	// produces any REPLY-* line, names the stuck call + drop site. (call number from expectedCall.)
+	{
+		unsigned callnum = expectedCall ? (unsigned)expectedCall->number() : 0u;
+		const char* disp = _interruptedForSignal ? "STASH-SAVED[interrupt]"
+			: _deferReplyForS2C ? "STASH-DEFERRED[s2c]"
+			: _dead ? "DROP-DEAD"
+			: "SEND";
+		DarlingServer::__rpctrace("REPLY-DISP htid=%d nstid=%lld call=%u disp=%s",
+			id(), (long long)nsid(), callnum, disp);
+	}
+
 	if (_interruptedForSignal) {
 		if (_interrupts.top().savedReply) {
 			throw std::runtime_error("New reply would overwrite existing saved reply");
@@ -2268,9 +2285,11 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 	} else if (!_dead) {
 #ifdef DSERVER_RING_TRANSPORT
 		if (_publishReplyToRingLocked(reply)) {
+			DarlingServer::__rpctrace("SENT-RING htid=%d nstid=%lld", id(), (long long)nsid());
 			return;
 		}
 #endif
+		DarlingServer::__rpctrace("SENT-UDS htid=%d nstid=%lld", id(), (long long)nsid());
 		Server::sharedInstance().sendMessage(std::move(reply));
 	}
 };
@@ -2507,6 +2526,9 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 
 			currentThreadVar->_interrupts.top().savedReply = std::move(*currentThreadVar->_pendingSavedReply);
 			currentThreadVar->_pendingSavedReply = std::nullopt;
+			// A0 RPC TRACE: pendingSaved -> interruptTop promotion at interrupt_enter; the reply is now on
+			// the interrupt stack and will flush at interrupt_exit (FLUSH-SAVED). Not sent here.
+			DarlingServer::__rpctrace("PENDINGSAVED->INTERRUPTTOP htid=%d nstid=%lld", currentThreadVar->id(), (long long)currentThreadVar->nsid());
 		}
 
 		currentThreadVar->_interruptedForSignal = true;
