@@ -404,3 +404,69 @@ to freeze (not the cascade) and its exact last call + whether that call got a RE
 read its full RPCTRACE tail to see if its last request got a RECV+reply or vanished. Prod byte-identical
 baseline 835946f9, doctor GREEN, guest torn down. Evidence: tmp/a0_guest_recvq_procnet.txt,
 tmp/a0_baseline_ab.sh output (baseline ring-OFF 4/6 HUNG).
+
+## UPDATE 10 — ROOT CAUSE PINNED TO ONE DROP SITE: a `psynch_mutexwait` reply stranded in `_pendingSavedReply` by an interrupt_exit/push_reply/interrupt_enter ordering race
+
+The first-to-freeze capture (documented next step from UPDATE 9) plus SUDO kernel stacks + full RPCTRACE
+tail nailed A0 to **one stranded reply**, not a broad/unknown cause. This SUPERSEDES both the ring
+hypothesis (UPDATE 9, still correct that it's exonerated) AND the fork-wait-semaphore hypothesis (the
+`dar-gwn.6.5` sticky flag is a real but DIFFERENT bug — it is present in the deployed baseline 835946f9 and
+the hang still reproduces WITH it, exactly as that PR draft's own "Note" predicted a deeper residual).
+
+HARNESSES (job tmp, instrumented binary b600271b @ branch fix/a0-kqchan-auxlog HEAD 4e04fe4, ring ON):
+  - a0_firstfreeze2.sh: poll wchan 1s; declare a DURABLE freezer only after >=45 continuous polls in
+    __skb_wait (v1 a0_firstfreeze.sh fired at poll 3 on a TRANSIENT work-burst wait — too eager; a real A0
+    hang is permanent). Records per-tid entry poll + streak, snapshots originator, leaves auxlog intact.
+  - a0_sudostacks.sh: same, but SUDO-reads /proc/<tid>/{syscall,stack,fd} for every parked mldr thread
+    (non-root reads came back EMPTY = needs CAP_SYS_PTRACE on the guest procs). This gave the kernel stacks.
+
+KERNEL STACKS AT A DURABLE 40s FREEZE (a0_sudostacks_1629201.txt): the ~8-thread cascade splits two ways:
+  - MOST parked threads: recvmsg on the guest RPC socket (fd 8189/8191) via __unix_dgram_recvmsg ->
+    __skb_wait_for_more_packets. Waiting for a server RPC reply.
+  - one thread in accept()/fd3 (unix_accept -> __sys_accept4): a fork parent whose last call was
+    fork_wait_for_child (call=11), now waiting to accept a child that never connects back.
+  - one thread (nstid 370) whose last call was psynch_mutexwait (call=73) — blocked acquiring a pthread
+    mutex a now-stuck sibling holds.
+
+THE DECISIVE TRACE (nstid 370's final 660us, from the auxlog):
+  1629215.095805  call=14 (interrupt_enter)   disp=SEND   <- an interrupt episode ENTERS
+  1629215.096061  call=15 (interrupt_exit)    disp=SEND   <- ...and EXITS/tears down 256us later
+  1629215.096339  call=73 (psynch_mutexwait)  disp=SEND   <- the interrupted call's reply computed as SEND
+  1629215.096464  PUSHREPLY-STASH slot=pendingSaved       <- but push_reply STASHES it into _pendingSavedReply
+  (no PENDINGSAVED->INTERRUPTTOP, no FLUSH-SAVED ever follows -> stranded forever)
+
+GLOBAL ACCOUNTING PROVING IT IS THIS ONE SLOT (whole run, 1.8M/12.7M trace lines):
+  PUSHREPLY-STASH pendingSaved = 1   (nstid 370, the mutexwait, at 1629215.096464 — its LAST line)
+  PENDINGSAVED->INTERRUPTTOP   = 0   (the promotion that would rescue it NEVER RAN)
+  PUSHREPLY-STASH interruptTop = 4 } all matched
+  REPLY-DISP disp=STASH-SAVED  = 5 } by
+  FLUSH-SAVED                  = 9 } FLUSH-SAVED (>= stashes) — every OTHER interrupt-stash flushed cleanly.
+Exactly one reply in the run is stranded, and it is the psynch_mutexwait for the thread the whole tree
+cascades behind.
+
+MECHANISM (the residual bug, call.cpp:296-330 + thread.cpp:2516-2532):
+  When a call is interrupted by a signal after the server already sent a provisional reply, the guest bounces
+  that reply back via push_reply. The handler at call.cpp:298 checks `_pendingCall->number()==InterruptEnter`;
+  if a (new) interrupt_enter is pending it PARKS the reply in `_pendingSavedReply` (line 302), trusting a
+  future `_handleInterruptEnterForCurrentThread` (thread.cpp:2522) to PROMOTE it onto `_interrupts.top().savedReply`
+  (-> flushed at interrupt_exit). Under brew make-check's SIGCHLD/fork storm the three events
+  interrupt_exit + push_reply + next interrupt_enter interleave such that the pending-enter that was detected
+  is torn down (or returns via a path) WITHOUT running the promotion — so `_pendingSavedReply` is never
+  promoted, never flushed, never sent. The guest's recvmsg for that reply blocks forever; the mutex it was
+  acquiring is never released; every peer needing that mutex/that process's progress piles into __skb_wait.
+  Intermittent (~33-67%) because it needs the exact 3-way ordering coincidence; transport-independent because
+  it is entirely in the signal-interrupt/reply-stash layer ABOVE ring/UDS (hence ring-OFF hangs identically).
+
+WHY THE STICKY-FLAG FIX DOESN'T COVER IT: dar-gwn.6.5 fixes a LOST fork-wait SEMAPHORE edge (parent starves
+in waitForChildAfterFork). This hang is a LOST REPLY in the `_pendingSavedReply` interrupt slot for an
+arbitrary interrupted call (here psynch_mutexwait) — a different object, a different code path. Both are
+children of the same disease: a signal-forced wait/interrupt teardown racing a wakeup/reply handoff.
+
+STATUS: root cause NAMED and observable. NO fix written yet (the interrupt/reply-stash path is boot-critical
+duct-tape; a fix must be surgical + gated on BOTH boot smoke AND brew A/B in BOTH ring modes). Candidate
+directions (not yet chosen): (a) at push_reply, if a matching interrupt_enter promotion cannot be guaranteed,
+send the reply directly instead of parking (mirror the `_interrupts.empty()` direct-resend branch at
+call.cpp:305-322); (b) on interrupt_exit teardown, drain any orphaned `_pendingSavedReply`; (c) make the
+enter-detected park + promotion atomic under `_rwlock` so an exit can't slip between them. Prod restored
+byte-identical to baseline 835946f9 after capture; doctor GREEN. Evidence: tmp/a0_firstfreeze2_1628865.txt,
+tmp/a0_sudostacks_1629201.txt, auxlog nstid=370 tail.
