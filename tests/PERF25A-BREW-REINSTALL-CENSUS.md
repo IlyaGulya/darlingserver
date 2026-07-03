@@ -301,3 +301,64 @@ gated, like AUXLOG): for the launchd/compiler tids, log every call received (num
 sent (number+target address), so at the hang we see whether the server ever received the parked thread's
 last call and whether it sent/dropped/mis-routed the reply. That names the call and the exact drop site.
 Prod byte-identical baseline 835946f9, doctor GREEN, guest torn down. Evidence + harnesses in job tmp.
+
+## UPDATE 8 — per-tid RPC trace BUILT + RUN: it is NOT a lost RPC reply and NOT a missed listener edge. UPDATE 7 was WRONG on two counts.
+Built the env-gated per-tid RPC trace (commit darlingserver 8cb1c4e, branch fix/a0-kqchan-auxlog, same
+DARLING_SERVER_AUXLOG=1 gate + same dserver-auxlog.txt file so RPCTRACE + kqchan AUXLOG interleave):
+RECV at callFromMessage; REPLY-DISP naming the 4 pushCallReply dispositions; SENT-UDS/SENT-RING at the
+real send; SENT-FALLBACK at the Call::sendReply funnel; FLUSH-SAVED/FLUSH-DEFERRED at both stash flushes;
+PUSHREPLY-* at the push_reply subpaths. Built clean (b600271b), deployed, boot-verified (clean lifecycle
+trace, all replies terminal SENT-UDS/RING, zero STASH during boot). Reverted to baseline after.
+Harnesses: tmp/a0_rpctrace_{capture,loop}.sh, tmp/a0_launchd_anatomy.sh, tmp/a0_listener_recvq.sh (+loops).
+Evidence: tmp/a0_rpctrace_snapshot.txt, tmp/a0_launchd_anatomy.txt, tmp/a0_listener_recvq.txt.
+
+THREE captures at three reproduced hangs (ring ON / FAST_OPS=1, instrumented srv b600271b):
+
+(1) RPCTRACE at hang (tmp/a0_rpctrace_snapshot.txt): for EVERY parked guest thread (launchd x3, memberd,
+    securityd, shellspawn, a compiler leaf), the thread's LAST server event is a COMPLETED
+    `REPLY-DISP ... disp=SEND` immediately followed by `SENT-UDS`. There is NO RECV-without-reply, NO
+    STASH-without-FLUSH anywhere (whole run: 36 total stash/flush/fallback events, all resolved; the 16
+    SENT-FALLBACK are call=2/code=0 checkin-class, benign). So the server did NOT drop or strand a reply.
+
+(2) SERVER NOT FROZEN (corrects UPDATE 7's "server idle/frozen"): across two snapshots 3-4s apart
+    replies_sent / messages_received ADVANCE (e.g. 473161->473163, 476637->476639). memberd runs a 5s
+    `semaphore_timedwait` (call 62) + `mach_msg_overwrite` (call 38) poll loop that the server services
+    every 5s. UPDATE 7 read "frozen" off too short a window against memberd's slow cadence — an artifact.
+
+(3) LISTENER Recv-Q = 0 (falsifies the missed-edge hypothesis): the server's DGRAM listener
+    (.darlingserver.sock, fd 3) has Recv-Q=0 at the hang (ss -x AND /proc/net/unix rx_queue=00000000).
+    The listener is registered EPOLLET (server.cpp:562), so a missed edge WOULD leave the guest's request
+    unread in this Recv-Q — it is empty. The guest's request is NOT sitting unread on the server.
+    (receiveMany drains to EAGAIN correctly; not the leak.)
+
+(4) launchd anatomy (tmp/a0_launchd_anatomy.txt): ALL 3 launchd threads blocked in `recvmsg` (nr 47) on
+    the DGRAM RPC band fds 8191/8190/8189, kernel stack __unix_dgram_recvmsg -> __skb_wait_for_more_packets,
+    each Recv-Q=0 (empty "fds with Recv-Q>0" list). launchd has ONLY these 3 threads — no separate kevent
+    thread visible; whichever thread runs the kqueue loop is one of these 3, all parked in RPC recvmsg.
+
+(5) kqchan SEQPACKET backlog PERSISTS but VARIES: 2 channels at Send-Q=768 this hang (fd 93, fd 18), 6-7 in
+    the baseline UPDATE-7 hang. = server pushed 64 x 12B EVFILT_PROC notifications the guest never drained
+    (guest kevent loop can't run — its thread is stuck in RPC recvmsg). Still downstream, still varies.
+
+(6) INTERMITTENT ~50%: under the instrumented binary, brew reinstall xz COMPLETED cleanly once (🍺 built in
+    1 minute, full configure+make+make-check+install) then hung on the next attempt. So this is a TIMING
+    RACE, not a deterministic deadlock — consistent with a lost-wakeup, not a structural cycle.
+
+NEW ROOT CLASS (evidence-locked, replacing UPDATE 7): NOT the ring (counters advance, ring-OFF historically
+clean), NOT the kqchan notification gate (fixed c7ea6d9; still hangs), NOT a lost/dropped RPC reply (every
+stuck thread's reply was SENT-UDS; no stash stranded), NOT a missed listener edge (listener Recv-Q=0). The
+guest thread's LAST RPC completed and it is parked in recvmsg for a reply to its NEXT request — but the
+server has NO RECV for that next request AND the request is NOT in the listener Recv-Q. Two survivors:
+  (B') GUEST-SIDE lost reply-wakeup: server SENT-UDS the reply, it left the server, but the guest's own
+       recvmsg never woke (reply datagram lost/unconsumed on the GUEST socket). Need the guest DGRAM-band
+       Recv-Q at the hang — the dual-ns ss lookup keeps returning '?' for fds 8189-8191 (inode not
+       resolving in the guest netns dump), the ONE gap blocking a clean B' verdict.
+  (C') kqchan-drain circular wait: the launchd thread that must recv() the SEQPACKET notification (to run
+       the kevent loop) is itself blocked in an RPC recvmsg whose reply depends on the guest making
+       progress that needs the kqueue drained. The Send-Q=768 backlog every hang keeps C' alive.
+NEXT (no build; pure capture): resolve the guest DGRAM-band Recv-Q at the hang (fix the inode->ss mapping,
+e.g. read the guest socket's rx_queue directly from the guest-netns /proc/net/unix by matching the fd's
+inode, since `ss -x` mis-resolves autobind abstract names). Recv-Q>0 on a parked DGRAM fd => B' (guest
+lost-wakeup, fix on the guest recv side). Recv-Q==0 everywhere + Send-Q=768 kqchan => C' (kqchan-drain
+circular, fix by making the kqchan notification/read not depend on a thread that can be RPC-blocked, or by
+a server-side timeout/kick). Prod byte-identical baseline 835946f9, doctor GREEN, guest torn down.
