@@ -1,6 +1,7 @@
 # A0-ARCH stages 0–1: fuzzer, typed wake tokens, interrupt-desync survival
 
-Status: IN PROGRESS (2026-07-03). Branch `fix/a0-arch-redesign`. Spec: tests/A0-ARCH-REDESIGN-SPEC.md.
+Status: **LANDED 2026-07-03** (deployed a889e85f = new doctor baseline). Branch
+`fix/a0-arch-redesign`. Spec: tests/A0-ARCH-REDESIGN-SPEC.md.
 Commits: 2037e24 (stage 0), ef1454f (stage 1), fc69f19 (1b), 27649c8 (-g), 7ae5e05 (1c).
 
 ## Stage 0 — scheduling-order fuzzer (DSERVER_SCHED_FUZZ)
@@ -88,7 +89,25 @@ Fixes so far:
   positive on the pre-existing kqchan "dropping new kqchan" messages.) The typed tokens
   are behaviorally transparent under real brew load; the freeze is NOT a token drop.
   Stage-1c wget record so far: 4 clean / 1 freeze in 5 runs.
-- **Baseline freeze-rate A/B RUNNING**: 886d13af redeployed, 4× wget legs — if the
-  baseline also freezes, the wget-1 freeze is the pre-existing residual class (stage 2/3
-  target) and stage 1 is no-worse; if baseline is 4/4 clean, suspicion returns to stage 1
-  and the hunt continues with the RPC auxlog.
+- **Baseline freeze-rate A/B: VERDICT = PRE-EXISTING CLASS, stage 1 lands.**
+  886d13af (prod baseline, a3de8c2): froze on run 9 of 11 total wget runs (~1/10 rate).
+  Stage-1c: 2 freezes in 7 runs. Rates statistically indistinguishable. **The freeze
+  fingerprint is IDENTICAL and deterministic**: the openssl-test-phase guest thread does a
+  pthread_canceled storm — 57,398 calls (stage-1c) vs 57,400 (baseline)! — over ~5.6s at
+  ~10k/s after an interrupt_enter, its process forking ~10/s (launchd kqchan spam), then
+  the whole guest parks: ruby in psynch_cvwait (unreplied — legitimately waiting), launchd
+  in mach_msg, an early service in semaphore_timedwait that NEVER TIMES OUT (timer-loss
+  suspicion!), zombies pile up unreaped. Server fully idle (main loop epoll, worker futex).
+- **Stage-1 machinery EXONERATED in the captured stage-1c freeze**: zero wake-token drops,
+  zero 1c desync-guard firings, interrupt enter/exit 8/8 balanced, every RPC of the
+  storming thread replied. The wedge runs entirely through pre-existing classes
+  (cancellation livelock dar-gwn.6.3 family + suspected lost timer on semaphore_timedwait).
+
+## WGET-RESIDUAL-FREEZE known issue (both baseline and stage 1, ~1/10 wget runs)
+
+Repro: `brew reinstall wget` (openssl@3 make test phase), RPC-progress watchdog catches it.
+Diagnostics captured (job tmp hunt_*/huntBASE_*): freeze trees, gdb server bts, auxlogs.
+Key open questions for stage 2/3: (a) why does the canceled-storm thread's syscall EINTR
+forever (pending-signal state stuck?); (b) why does semaphore_timedwait's deadline never
+fire (wait-timer cancel/arm race — Part-2 family); (c) who owes ruby's cvwait signal.
+gdb microthread state walker ready: job tmp thread_state_walker.py (needs the -g build).
