@@ -658,6 +658,8 @@ boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 		thread->xnu_thread.wait_timer_is_set = FALSE;
 	}
 
+	dtape_log_error("A0 UNBLOCK nstid=%llu wresult=%d (about to thread_resume)",
+		(unsigned long long)thread->xnu_thread.thread_id, (int)wresult);
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;
 };

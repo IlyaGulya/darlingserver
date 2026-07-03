@@ -479,6 +479,7 @@ void DarlingServer::Thread::doWork() {
 	_rwlock.lock();
 
 	if (_deferralState != DeferralState::NotDeferred) {
+		threadLog.error() << "A0 DOWORK nstid=" << _nstid << " EARLY-RETURN deferred(state=" << (int)_deferralState << ") permit=" << _resumePermit << " -> DeferredPending" << threadLog.endLog;
 		microthreadLog.debug() << _tid << "(" << _nstid << "): execution was deferred" << microthreadLog.endLog;
 		_deferralState = DeferralState::DeferredPending;
 		_rwlock.unlock();
@@ -487,6 +488,7 @@ void DarlingServer::Thread::doWork() {
 
 	if (_running) {
 		// this is probably an error
+		threadLog.error() << "A0 DOWORK nstid=" << _nstid << " EARLY-RETURN already-running permit=" << _resumePermit << threadLog.endLog;
 		microthreadLog.warning() << _tid << "(" << _nstid << "): attempt to re-run already running microthread on another thread" << microthreadLog.endLog;
 		_rwlock.unlock();
 		return;
@@ -1003,9 +1005,11 @@ void DarlingServer::Thread::resume() {
 	{
 		std::unique_lock lock(_rwlock);
 		if (!_running && !_suspended) {
+			threadLog.error() << "A0 RESUME nstid=" << _nstid << " DROPPED(not running, not suspended) permit=" << _resumePermit << threadLog.endLog;
 			return;
 		}
 		if (_resumePermit) {
+			threadLog.error() << "A0 RESUME nstid=" << _nstid << " coalesced(permit already set) running=" << _running << " susp=" << _suspended << threadLog.endLog;
 			return;
 		}
 		// Coalesce repeated wakes into one permit. If the microthread is still
@@ -1013,6 +1017,7 @@ void DarlingServer::Thread::resume() {
 		// itself from doWork() after physically stopping.
 		_resumePermit = true;
 		schedule = _suspended && !_running;
+		threadLog.error() << "A0 RESUME nstid=" << _nstid << " set-permit running=" << _running << " susp=" << _suspended << " schedule=" << schedule << threadLog.endLog;
 	}
 
 	if (schedule) {
