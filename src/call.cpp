@@ -1045,6 +1045,16 @@ void DarlingServer::Call::InterruptExit::processCall() {
 	{
 		std::unique_lock lock(thread->_rwlock);
 
+		// A0-ARCH stage 1c: an interrupt_exit must pop the frame its MATCHING interrupt_enter
+		// pushed. Under an RPC-stream desync an exit can arrive while the enter is still
+		// mid-flight (_interruptedForSignal) or with no frame at all; popping then yanks the
+		// frame out from under the enter fiber (top()-UB, jumpToResume(0x2) SIGSEGV) or pops
+		// an OUTER interrupt's frame. Refuse loudly and keep the server alive.
+		if (thread->_interrupts.empty() || thread->_interruptedForSignal) {
+			callLog.error() << *thread << ": interrupt_exit " << (thread->_interrupts.empty() ? "with EMPTY interrupt stack" : "while interrupt_enter is still in flight") << " (desync); ignoring pop" << callLog.endLog;
+			return;
+		}
+
 		auto tmp = std::move(thread->_interrupts.top());
 
 		thread->_interrupts.pop();
