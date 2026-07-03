@@ -603,6 +603,22 @@ static void thread_continuation_callback(void* context) {
 	wait_result_t wait_result;
 
 	thread_lock(&thread->xnu_thread);
+
+	// perf#25a A0 (Part 3e): XNU semantics -- a blocked thread's continuation only runs once
+	// thread_unblock finalized the wait (TH_WAIT cleared, wait_result written). A stray resume
+	// permit (raw dtape mutex/condvar handoff crosstalk, stale re-runs) can pop the suspension
+	// early; running the continuation then would deliver wait_result == THREAD_WAITING (psynch
+	// continuations reply -EINTR to the guest and leave the thread linked on its waitq -> the
+	// next assert panics "thread already waiting" / silently corrupts the queue on release
+	// builds). Re-park instead: the genuine wakeup will resume us again. If the re-suspend
+	// parks, the genuine resume re-enters this callback fresh; if it fast-returns on yet
+	// another stray permit, the loop re-checks.
+	while (thread->xnu_thread.state & TH_WAIT) {
+		thread_unlock(&thread->xnu_thread);
+		dtape_hooks->thread_suspend(thread->context, thread_continuation_callback, thread, NULL);
+		thread_lock(&thread->xnu_thread);
+	}
+
 	continuation = thread->xnu_thread.continuation;
 	thread->xnu_thread.continuation = NULL;
 
@@ -631,6 +647,34 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 
 	if (waiting) {
 		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, NULL);
+		// perf#25a A0 (Part 3e): for the inline (no-continuation) variant, enforce XNU's
+		// contract that thread_block only returns once the wait was finalized by
+		// thread_unblock. A stray resume permit (raw dtape mutex/condvar handoff crosstalk)
+		// can fast-return the suspension while TH_WAIT is still set and wait_result is still
+		// THREAD_WAITING; returning that to the caller corrupts the wait protocol
+		// (semaphore_convert_wait_result panics; psynch waits strand their waitq links).
+		// Re-park until genuinely unblocked. (The continuation variant re-checks in
+		// thread_continuation_callback and never returns here.)
+		if (!continuation) {
+			while (true) {
+				thread_lock(&thread->xnu_thread);
+				bool still_waiting = (thread->xnu_thread.state & TH_WAIT) != 0;
+				thread_unlock(&thread->xnu_thread);
+				if (!still_waiting) {
+					break;
+				}
+				dtape_hooks->thread_suspend(thread->context, NULL, thread, NULL);
+			}
+		}
+	} else {
+		// perf#25a A0 (Part 3d): the wait was already finalized (thread_unblock cleared TH_WAIT,
+		// wrote wait_result, and had thread_resume mint a wake permit) before we could physically
+		// suspend -- the wake is delivered right here by NOT suspending. Consume the paired
+		// permit; otherwise it goes stale and spuriously satisfies this thread's NEXT suspend()
+		// while wait_result is still THREAD_WAITING (panic in semaphore_convert_wait_result;
+		// silent wait-protocol corruption elsewhere). Repro: nestwait.c SIGUSR1 storm, the
+		// kernelAsyncRunner's work-queue semaphore (captured backtrace 2026-07-03).
+		dtape_hooks->thread_clear_resume_permit(thread->context);
 	}
 
 	thread_lock(&thread->xnu_thread);

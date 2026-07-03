@@ -476,6 +476,15 @@ void DarlingServer::Thread::doWork() {
 	//       this method is actually major UB because the compiler is free to do whatever it likes with the stack,
 	//       but we know what reasonable compilers (i.e. GCC and Clang) do with it and we're specifically targeting Clang, so it's okay for us.
 
+	// perf#25a A0 (Part 3c): whether THIS dispatch consumed a genuine resume() wake permit.
+	// Only such a dispatch (or a pending-call override) may resume a suspended context: every
+	// legitimate waker goes through resume() (thread_unblock finalizes wait_result first), so a
+	// dispatch that finds the thread suspended WITHOUT a permit is a stale re-run (e.g. an owed
+	// _rerunPending whose wake was already consumed) and must not touch the parked wait --
+	// resuming it would deliver a spurious wakeup with wait_result == THREAD_WAITING.
+	bool hadResumePermit = false;
+	bool preserveWaitState = false;
+
 	_rwlock.lock();
 
 	if (_deferralState != DeferralState::NotDeferred) {
@@ -509,13 +518,45 @@ void DarlingServer::Thread::doWork() {
 		goto doneWorking;
 	}
 
-	if (_suspended) {
+	if (_suspended && _resumePermit) {
 		// This execution was scheduled by resume(); consume that wake permit.
 		_resumePermit = false;
+		hadResumePermit = true;
 	}
 	_running = true;
 	currentThreadVar = shared_from_this();
-	dtape_thread_entering(_dtapeThread);
+	// perf#25a A0 (Part 3): an interrupt_enter that stacks onto an in-flight call must NOT run
+	// dtape_thread_entering(). The interrupted call may be suspended on a waitq with TH_WAIT set
+	// (e.g. fork_wait_for_child parked in waitForChildAfterFork's semaphore, or a psynch cv/mutex
+	// wait), and entering's unconditional "entering => cannot be waiting" clear half-tears that
+	// wait: dtape_thread_sigexc_enter's clear_wait_internal(THREAD_INTERRUPTED) then sees no
+	// TH_WAIT, returns KERN_NOT_WAITING, and SKIPS the real teardown -- no waitq unlink, no
+	// wait_result write, no wait-timer cancel. The thread stays linked on the waitq while its
+	// microthread unwinds, so the next semaphore_signal/wakeup on that waitq is consumed by a
+	// thread that is no longer waiting and the GENUINE waiter never wakes: zombie child + parent
+	// parked forever in recvmsg (the brew reinstall / nestwait.c hang). With the Part 2a fix (no
+	// wait_result pre-write) the same clobber is loud instead: the resumed continuation reads
+	// wait_result == THREAD_WAITING and panics in semaphore_convert_wait_result (captured live on
+	// nestwait ring-OFF). Preserving the wait state here lets clear_wait_internal perform the
+	// full, correct abort exactly like XNU. Fresh calls (no in-flight call to stack onto) keep
+	// the normal entering transition.
+	preserveWaitState =
+		// an interrupt_enter stacking onto an in-flight (possibly waitq-parked) call...
+		(_pendingCall && _pendingCall->number() == Call::Number::InterruptEnter
+			&& !_pendingCallOverride && (_activeCall || _suspended || _continuationCallback))
+		// ...or ANY dispatch that resumes a suspended context (matches the resume branch
+		// below) rather than starting a fresh call. A genuine wake already had
+		// thread_unblock clear TH_WAIT and write wait_result; a stray wake (raw
+		// mutex/condvar handoff crosstalk, stale re-run) left TH_WAIT set and the Part 3e
+		// re-park guard in thread_block/thread_continuation_callback needs to SEE it --
+		// entering's unconditional TH_WAIT clear here would launder the stray wake into a
+		// spurious wait_result == THREAD_WAITING return (stranded waitq link -> "thread
+		// already waiting" panic / silent lost wakeup). dtape_thread_entering is only for
+		// fresh call dispatches, where the guest thread is by definition not blocked here.
+		|| (_suspended && (_pendingCallOverride || !_pendingCall));
+	if (!preserveWaitState) {
+		dtape_thread_entering(_dtapeThread);
+	}
 
 	returningToThreadTop = false;
 	_rwlock.unlock();
@@ -564,7 +605,11 @@ void DarlingServer::Thread::doWork() {
 			throw std::runtime_error("Thread has both a pending call and a pending continuation");
 		}
 
-		if (_suspended && (_pendingCallOverride || !_pendingCall)) {
+		// perf#25a A0 (Part 3c): resume the suspended context only for a dispatch that carried a
+		// real wake (permit consumed above) or an explicit override; a permit-less dispatch of a
+		// suspended thread is stale and falls through to the else-branch, which parks it again
+		// (no pending call -> doneWorking) instead of spuriously resuming a live wait.
+		if (_suspended && (_pendingCallOverride || (!_pendingCall && hadResumePermit))) {
 			if (_pendingCallOverride) {
 				microthreadLog.info() << _tid << "(" << _nstid << "): thread was suspended with a pending call override and is now resuming with a pending call" << microthreadLog.endLog;
 			}
@@ -1038,6 +1083,17 @@ void DarlingServer::Thread::resume() {
 	if (schedule) {
 		Server::sharedInstance().scheduleThread(shared_from_this());
 	}
+};
+
+void DarlingServer::Thread::clearResumePermit() {
+	// perf#25a A0 (Part 3d): called by duct-tape's thread_block_parameter when the wait was
+	// finalized (thread_unblock ran: wait_result written, TH_WAIT cleared) BEFORE the microthread
+	// physically suspended -- thread_block skips the suspension, so the wake permit resume()
+	// minted for that unblock is already satisfied. Left set, it would go stale and let the
+	// thread's NEXT suspend() return immediately with wait_result still THREAD_WAITING (panics
+	// semaphore_convert_wait_result; corrupts other wait protocols silently).
+	std::unique_lock lock(_rwlock);
+	_resumePermit = false;
 };
 
 void DarlingServer::Thread::terminate() {
@@ -2531,68 +2587,106 @@ void DarlingServer::Thread::_scheduleRelease() {
 	});
 };
 
-static thread_local std::function<void()> interruptedContinuation = nullptr;
-
 void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
-	// FIXME: this currently does not work properly if the thread was suspended waiting for a lock
+	// perf#25a A0 (Part 3f, replaces the old "FIXME: does not work if suspended waiting for a
+	// lock"): this function's fiber can SUSPEND mid-flight -- dtape_thread_sigexc_enter takes
+	// thread_lock (a dtape mutex whose contention raw-suspends the microthread), and the
+	// interrupted continuation resumed below can block again. When the fiber suspends, the OS
+	// thread's doneWorking clears the thread_local currentThreadVar; when the fiber resumes
+	// (possibly on a DIFFERENT OS thread: the main loop and the worker both run fibers), code
+	// here that re-reads currentThreadVar dereferences an empty shared_ptr (captured SIGSEGV:
+	// null + offsetof(_handlingInterruptedCall), cvstorm2 storm). Pin the thread in a local
+	// `self` at entry, use it throughout, and re-assert the TLS after every potentially
+	// suspending call so downstream TLS readers (dtape hooks) stay correct too.
+	std::shared_ptr<Thread> self = currentThreadVar;
 
 	{
-		std::unique_lock lock(currentThreadVar->_rwlock);
+		std::unique_lock lock(self->_rwlock);
 
-		if (currentThreadVar->_pendingSavedReply) {
-			if (currentThreadVar->_interrupts.top().savedReply) {
+		if (self->_pendingSavedReply) {
+			if (self->_interrupts.top().savedReply) {
 				throw std::runtime_error("Pending saved reply would overwrite saved reply");
 			}
 
-			currentThreadVar->_interrupts.top().savedReply = std::move(*currentThreadVar->_pendingSavedReply);
-			currentThreadVar->_pendingSavedReply = std::nullopt;
+			self->_interrupts.top().savedReply = std::move(*self->_pendingSavedReply);
+			self->_pendingSavedReply = std::nullopt;
 			// A0 RPC TRACE: pendingSaved -> interruptTop promotion at interrupt_enter; the reply is now on
 			// the interrupt stack and will flush at interrupt_exit (FLUSH-SAVED). Not sent here.
-			DarlingServer::__rpctrace("PENDINGSAVED->INTERRUPTTOP htid=%d nstid=%lld", currentThreadVar->id(), (long long)currentThreadVar->nsid());
+			DarlingServer::__rpctrace("PENDINGSAVED->INTERRUPTTOP htid=%d nstid=%lld", self->id(), (long long)self->nsid());
 		}
 
-		currentThreadVar->_interruptedForSignal = true;
-
-		interruptedContinuation = currentThreadVar->_interruptedContinuation;
-		currentThreadVar->_interruptedContinuation = nullptr;
+		self->_interruptedForSignal = true;
 	}
 
-	dtape_thread_sigexc_enter(currentThreadVar->_dtapeThread);
+	dtape_thread_sigexc_enter(self->_dtapeThread);
+	currentThreadVar = self; // may have suspended+migrated inside (thread_lock contention)
 
-	currentThreadVar->_didSyscallReturnDuringInterrupt = false;
-	getcontext(&currentThreadVar->_syscallReturnHereDuringInterrupt);
+	// Extract the interrupted continuation into a LOCAL (fiber-stack) variable, not the old
+	// thread_local: a fiber that suspends and migrates OS threads keeps its stack but not the
+	// previous OS thread's TLS, and the syscall-return re-entry below must not read/clobber
+	// whatever unrelated value the current OS thread's TLS happens to hold. Locals assigned
+	// before getcontext() are restored consistently by the setcontext() re-entry.
+	std::function<void()> localInterruptedContinuation = nullptr;
+	{
+		std::unique_lock lock(self->_rwlock);
+		localInterruptedContinuation = self->_interruptedContinuation;
+		self->_interruptedContinuation = nullptr;
+	}
 
-	if (!currentThreadVar->_didSyscallReturnDuringInterrupt) {
-		if (interruptedContinuation) {
-			interruptedContinuation();
-		} else if (currentThreadVar->_interrupts.top().interruptedCall) {
-			currentThreadVar->_handlingInterruptedCall = true;
-			currentThreadVar->_pendingCallOverride = true;
-			currentThreadVar->jumpToResume(currentThreadVar->_interrupts.top().savedStack.base, currentThreadVar->_interrupts.top().savedStack.size);
+	// perf#25a A0 (Part 3b): sigexc_enter's clear_wait_internal -> thread_go -> thread_unblock
+	// fires the dtape thread_resume hook, which mints a _resumePermit for this (currently
+	// _running) thread. The interrupt path resumes the interrupted continuation SYNCHRONOUSLY
+	// below (jumpToResume / interruptedContinuation), so that permit is already satisfied here.
+	// If left set, it goes stale: the thread's NEXT genuine wait (e.g. the guest's retried
+	// fork_wait_for_child) has its suspend() consume the stale permit and return immediately --
+	// a spurious wakeup with wait_result still THREAD_WAITING, which panics
+	// semaphore_convert_wait_result ("semaphore_block") and, in wait paths that tolerate it,
+	// silently corrupts the wait protocol. Any permit present at this point can only refer to
+	// resuming the interrupted context (doWork already consumed pre-existing permits at
+	// dispatch), so consuming it here is exact.
+	{
+		std::unique_lock lock(self->_rwlock);
+		self->_resumePermit = false;
+	}
+
+	self->_didSyscallReturnDuringInterrupt = false;
+	getcontext(&self->_syscallReturnHereDuringInterrupt);
+
+	// re-entered here either directly or via the interrupted call's syscall-return setcontext;
+	// in the latter case the executing OS thread's TLS is already self (the fiber only runs
+	// inside a doWork stint), but re-assert for the direct path after suspensions above.
+	currentThreadVar = self;
+
+	if (!self->_didSyscallReturnDuringInterrupt) {
+		if (localInterruptedContinuation) {
+			localInterruptedContinuation();
+		} else if (self->_interrupts.top().interruptedCall) {
+			self->_handlingInterruptedCall = true;
+			self->_pendingCallOverride = true;
+			self->jumpToResume(self->_interrupts.top().savedStack.base, self->_interrupts.top().savedStack.size);
 		}
-	} else if (currentThreadVar->_handlingInterruptedCall) {
+	} else if (self->_handlingInterruptedCall) {
 #if DSERVER_ASAN
 		const void* dummy;
 		size_t dummy2;
 		__sanitizer_finish_switch_fiber(nullptr, &dummy, &dummy2);
 #endif
 
-		currentThreadVar->_handlingInterruptedCall = false;
-		currentThreadVar->_pendingCallOverride = false;
+		self->_handlingInterruptedCall = false;
+		self->_pendingCallOverride = false;
 	}
-
-	interruptedContinuation = nullptr;
 
 	{
-		std::unique_lock lock(currentThreadVar->_rwlock);
+		std::unique_lock lock(self->_rwlock);
 
-		if (currentThreadVar->_interrupts.top().savedStack.isValid()) {
-			stackPool.free(currentThreadVar->_interrupts.top().savedStack);
+		if (self->_interrupts.top().savedStack.isValid()) {
+			stackPool.free(self->_interrupts.top().savedStack);
 		}
 
-		currentThreadVar->_interruptedForSignal = false;
-		currentThreadVar->_interrupts.top().interruptedCall = nullptr;
+		self->_interruptedForSignal = false;
+		self->_interrupts.top().interruptedCall = nullptr;
 	}
 
-	dtape_thread_sigexc_enter2(currentThreadVar->_dtapeThread);
+	dtape_thread_sigexc_enter2(self->_dtapeThread);
+	currentThreadVar = self;
 };
