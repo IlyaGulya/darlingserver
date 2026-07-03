@@ -86,6 +86,10 @@ void dtape_mutex_lock(dtape_mutex_t* mutex) {
 		}
 
 		// lock not acquired; let's wait
+		if (thread->mutex_link._dbg_queued) {
+			dtape_log_error("perf#25a A0: dtape_mutex_lock DOUBLE-INSERT of mutex_link %p (already queued) thread=%p mutex=%p", &thread->mutex_link, thread, mutex);
+		}
+		thread->mutex_link._dbg_queued = 1;
 		TAILQ_INSERT_TAIL(&mutex->dtape_queue_head, &thread->mutex_link, link);
 
 		// this call drops the lock
@@ -149,6 +153,7 @@ void dtape_mutex_unlock(dtape_mutex_t* mutex) {
 	// contended case
 	// one or more microthreads are waiting; wake the oldest waiter (the one at the head of queue).
 	TAILQ_REMOVE(&mutex->dtape_queue_head, link, link);
+	link->_dbg_queued = 0;
 	dtape_thread_t* thread = __container_of(link, dtape_thread_t, mutex_link);
 	dtape_hooks->thread_resume(thread->context);
 
