@@ -1,6 +1,7 @@
 #include <darlingserver/duct-tape/condvar.h>
 #include <darlingserver/duct-tape/thread.h>
 #include <darlingserver/duct-tape/hooks.internal.h>
+#include <darlingserver/duct-tape/log.h>
 
 // an extremely unoptimized (and honestly, half-assed) implementation of condition variables for duct-taped code
 
@@ -18,6 +19,7 @@ void dtape_condvar_signal(dtape_condvar_t* condvar, size_t count) {
 		}
 
 		TAILQ_REMOVE(&condvar->queue_head, link, link);
+		link->_dbg_queued = 0;
 		dtape_thread_t* thread = __container_of(link, dtape_thread_t, mutex_link);
 		dtape_hooks->thread_resume(thread->context);
 
@@ -38,6 +40,10 @@ void dtape_condvar_wait(dtape_condvar_t* condvar, dtape_mutex_t* mutex) {
 	dtape_mutex_unlock(mutex);
 
 	// add ourselves to the wait queue
+	if (thread->mutex_link._dbg_queued) {
+		dtape_log_error("perf#25a A0: dtape_condvar_wait DOUBLE-INSERT of mutex_link %p (already queued) thread=%p condvar=%p", &thread->mutex_link, thread, condvar);
+	}
+	thread->mutex_link._dbg_queued = 1;
 	TAILQ_INSERT_TAIL(&condvar->queue_head, &thread->mutex_link, link);
 
 	// now let's suspend ourselves to wait;
