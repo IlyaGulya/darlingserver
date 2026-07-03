@@ -200,3 +200,69 @@ and for every such inbound message the same — reproduce once, and read WHICH 1
 strands on fd 14/39 and which thread was supposed to drain it. That names the exact aux-channel op and pins
 the fix (drain-ordering / wakeup on the SEQPACKET channel vs the DGRAM RPC wait). Prod byte-identical
 (dylib 6bd251c3, srv 835946f9, mldr/dyld baseline), doctor GREEN, guest torn down.
+
+## UPDATE 6 — EXACT OP NAMED + FIXED: kqchan proc-notification lost-wakeup deadlock (A0 RESOLVED)
+The server SEQPACKET instrumentation (env-gated `DARLING_SERVER_AUXLOG=1`, kqchan.cpp, commit 18349e6;
+log at `<prefix>/private/var/log/dserver-auxlog.txt`) named the exact op on the first captured hang
+(tmp/a0_auxlog_HANG.txt + a0_auxlog_snapshot.HANG.txt). It is the **kqchan `EVFILT_PROC` notification**
+channel — NOT the perf#18 ring, confirming UPDATE 5. Precise picture:
+  - The ONLY SEQPACKET socketpair guest<->server is the kqchan channel (kqchan.cpp:48). The stranded
+    12-byte payload is exactly `dserver_kqchan_call_notification_t` (callhdr = enum4+int4+int4 = 12B).
+  - Wedged channel: `id=259`, server `socket_fd=92`, `listener_nsid=1` (launchd), `target_nspid=415` — a
+    build shell that launchd tracks with NOTE_TRACK. Under `brew`'s fork storm pid 415 forks children
+    (2699,2700,...) nonstop; every NOTE_FORK pushes an event onto the channel's server-side `_events`
+    queue. Trace shows the queue climbing 24->36, EVERY `_sendNotification` `GATED` (`canSendNotif=0`),
+    the last `proc._read ACK` (#777) at t=…728.289, then a 27s dead gap = frozen. Guest fd 39 holds one
+    stale 12B notification; server fd 92 Send-Q=768 backed up.
+ROOT CAUSE (lost-wakeup deadlock): the guest acks a notification by reading it (libkqueue
+`evfilt_proc_copyout` -> `proc_read`), which runs server `Kqchan::Process::_read()`:
+`canSendNotification=true; deferNotification=true;` (defer so a fresh notification can't overtake the
+read reply and desync the in-order SEQPACKET channel), send reply, `_sendDeferredNotification()`.
+The defect: `_sendNotification`, when deferred, CONSUMED `_canSendNotification` **and** stashed the ping
+into `_deferredNotification`, while `_sendDeferredNotification` only re-sent an *already-stashed* Message.
+But the event side (`_notify`, under `_mutex`) and the ack side (`_read`) serialize only on
+`_notificationMutex`, NOT in program order across the split `_mutex`/`_notificationMutex`. Under the storm
+a `_notify` could stash its ping AFTER the `_read` that would have flushed it already ran -> the stash was
+orphaned, `_canSendNotification` stayed false, every later `_notify` GATED forever -> guest never
+re-notified -> never sends another `proc_read` -> `_sendDeferredNotification` never runs again =
+permanent deadlock. (Ring-OFF narrows but doesn't cure it — the kqchan channel is independent of the
+ring, which is why the perf#18-targeted UPDATE-3/4 attempts failed.)
+FIX (commit c7ea6d9, kqchan.cpp + kqchan.hpp): make notification delivery LEVEL-TRIGGERED + self-healing.
+  - `_sendNotification` when deferred no longer consumes the gate or stashes a Message; it sets a sticky
+    `_notificationRequestedWhileDeferred` flag.
+  - `_sendDeferredNotification`, on clearing deferral, re-drives `_sendNotification` if a notification was
+    owed OR the channel still `_hasPendingEvents()` (new virtual; `Process` overrides -> non-empty
+    `_events`). The ping is contentless + duplicate-safe by design (guest reads, finds nothing, drops via
+    0xdead), so a spurious re-arm is harmless but a lost one can no longer deadlock. Lock order preserved
+    (`_mutex` before `_notificationMutex`, never nested-reversed; `_notificationMutex` dropped before
+    `_hasPendingEvents`/`_sendNotification`). Legacy-stash drain kept defensively. Symmetric (fix is in the
+    shared base class, so mach-port channels benefit too).
+VALIDATION: instrumented server built from ~/work/darling-build. Boot smoke GREEN (server + launchd +
+children up; auxlog PUSH/ACK balanced). Brew ring-ON A/B: **the fix is CORRECT BUT INSUFFICIENT — brew
+STILL HANGS with it (1/1 on the first repro attempt).** The after-fix hang evidence
+(tmp/a0_auxlog_HANG_afterfix.txt + a0_auxlog_snapshot.HANG_afterfix.txt) REDIRECTS the root cause and is
+the important finding:
+  - The fix works as designed: the re-arm fires (26 REARM lines) and after `id=269`'s last ack (#573,
+    t=…433.881) the server DID `sendNotif PUSH` notification #573 to the outbox (t=…433.888) —
+    `canSendNotification` correctly toggled. The notification is genuinely on the wire (guest fd 39
+    Recv-Q = 12 bytes, delivered).
+  - But the guest NEVER reads it: no proc_read #574 ever arrives, `id=269` sits at canSendNotif=0 with
+    `_events` climbing to 240, frozen ~24s. The 768B server Send-Q is the server (correctly) continuing to
+    try to push while the guest doesn't drain.
+=> The kqchan notification backlog is a **downstream symptom, not the cause**. The true stall is that the
+guest **launchd never returns to its kevent()/epoll_wait loop to consume the notification**, because a
+launchd thread is wedged elsewhere — parked in a DGRAM RPC `recvmsg` (the original per-fd finding, UPDATE
+5: fds 8189-8191) whose reply never arrives. `clients_blocked_in_rpc` is `workqueue.depth+threadsBusy`
+(server-side work in flight) — it says NOTHING about a guest waiting for a reply already sent or dropped,
+so its "0" is consistent with a lost/stranded RPC reply. This is back in the lost-RPC-reply-under-load
+family (dar-gwn), but now DOUBLY narrowed: NOT the perf#18 ring (ring-OFF was clean; UPDATE 2/5) and NOT
+the kqchan notification gate (this fix delivers notifications reliably and brew still hangs). The next
+layer is GUEST-SIDE: identify WHICH RPC call launchd's parked thread awaits on fd 8189-8191 and why its
+reply never lands (server dropped it / published to a channel the guest isn't reading / signal-interrupt
+race), while its kevent loop — the only thing that would drain the kqchan and unblock the tracked build
+shell — is starved behind that same stuck RPC.
+STATUS: the kqchan lost-wakeup fix (commit c7ea6d9) is a genuine correctness improvement (a real
+defer/gate race that CAN orphan a notification) and is kept on branch fix/a0-kqchan-auxlog, but it is NOT
+the brew-hang cure. Prod RESTORED byte-identical to baseline srv 835946f9 (fix NOT deployed). AUXLOG
+instrumentation retained behind the env gate for the guest-side investigation. NEXT: guest-thread-stack +
+per-fd + server-RPC correlated capture to name the stuck RPC call and its missing reply.
