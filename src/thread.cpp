@@ -1132,14 +1132,14 @@ uint64_t DarlingServer::Thread::armWake(WakeKind kind) {
 	if (_armedWakeGen[k] != 0) {
 		// the previous wait of this kind ended without its arm-site disarm running (its wake
 		// was consumed elsewhere, or the park was aborted); re-arming supersedes it
-		microthreadLog.debug() << _tid << "(" << _nstid << "): re-arming wake kind " << (int)k
+		microthreadLog.info() << _tid << "(" << _nstid << "): re-arming wake kind " << (int)k
 			<< " over live gen " << _armedWakeGen[k] << microthreadLog.endLog;
 	}
 	_armedWakeGen[k] = gen;
 	if (_pendingWakeGen[k] != 0) {
 		// any wake still pending for this kind was for a PREVIOUS wait -- stale by
 		// construction (gen is fresh); drop it so it cannot satisfy the new wait
-		microthreadLog.debug() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
+		microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
 			<< (int)k << " gen " << _pendingWakeGen[k] << " at re-arm" << microthreadLog.endLog;
 		_pendingWakeGen[k] = 0;
 	}
@@ -1181,7 +1181,7 @@ bool DarlingServer::Thread::_consumePendingWakeLocked() {
 			return true;
 		}
 		// pending no longer matches the armed wait of its kind -- its wait is gone; drop
-		microthreadLog.debug() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
+		microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
 			<< (int)k << " gen " << _pendingWakeGen[k] << " (armed " << _armedWakeGen[k] << ")" << microthreadLog.endLog;
 		_pendingWakeGen[k] = 0;
 	}
@@ -1226,7 +1226,7 @@ void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
 					generation = _armedWakeGen[k];
 				}
 				if (generation == 0) {
-					microthreadLog.debug() << _tid << "(" << _nstid << "): dropping untyped wake kind "
+					microthreadLog.info() << _tid << "(" << _nstid << "): dropping untyped wake kind "
 						<< (int)k << ": nothing armed" << microthreadLog.endLog;
 					return;
 				}
@@ -1234,7 +1234,7 @@ void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
 				// STALE WAKE: the wait this wake was minted for is gone (consumed early by
 				// an abort, superseded by a re-arm). This is the A0 crosstalk class -- the
 				// old untyped permit would have delivered it as a spurious resume; drop it.
-				microthreadLog.debug() << _tid << "(" << _nstid << "): dropping stale wake kind "
+				microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale wake kind "
 					<< (int)k << " gen " << generation << " (armed " << _armedWakeGen[k] << ")" << microthreadLog.endLog;
 				return;
 			}
