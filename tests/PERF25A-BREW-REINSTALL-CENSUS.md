@@ -714,3 +714,37 @@ the link a stable owning-queue back-pointer and a single dequeue helper invoked 
 smoke is the FIRST gate, then cvstorm RESULT=OK 0-panic, then brew A/B 0 hangs. Commits bd7cdb9 (TH_WAIT, boots
 + removes panic, KEEP), 5766b1d (this boot-breaking attempt, on branch — do NOT deploy). Prod baseline
 835946f9, doctor GREEN.
+
+## UPDATE 18 — HONEST CHECKPOINT: init fixed the boot wedge (boot OK), but the full fix STILL panics on the repro; the layers interact more deeply than modeled. Stop-and-reassess.
+
+Progress this round: (a) found the boot wedge = uninitialized mutex_link (dtape_thread_create malloc's, memsets
+only some fields; _dbg_queued started garbage -> bogus TAILQ_REMOVE at boot). Committed the init (65038e3).
+(b) With init, the full fix (binary 307fbedd = TH_WAIT bd7cdb9 + mutex-queue 5766b1d + init 65038e3) BOOTS
+cleanly (FIXINIT_BOOT_OK). First gate passed.
+
+BUT the decisive repro FAILED: cvstorm on 307fbedd panics again with "thread already waiting" @ waitq.c:2835 --
+the SAME first-layer panic that bd7cdb9 alone had removed. Verified bd7cdb9 IS an ancestor and sigexc_enter
+DOES only clear TH_UNINT in this binary. So the TH_WAIT fix that worked in isolation is DEFEATED once the
+mutex-queue changes are also present. => the waitq / dtape_mutex / condvar / signal-abort layers interact in a
+way my model does not capture; fixing one surfaces or re-arms another.
+
+HONEST ASSESSMENT: this is deep cooperative-microthread + XNU-waitq + custom-mutex/condvar + signal-interrupt
+concurrency in the duct-tape. The ROOT CAUSE CLASS is solid and proven (signal-abort resumes a mid-wait
+microthread without dequeuing it; the shared mutex_link double-inserts -> corruption -> lost wakeup ->
+livelock; deterministic cvstorm repro + 7 DOUBLE-INSERT hits). But a COMPLETE, CORRECT, BOOT-SAFE fix has not
+been achieved in 3 attempts, and each attempt reveals another interacting layer. I have repeatedly modeled
+the mechanism ahead of verifying it and been wrong (falsified: ring, pendingSaved, stale-timer; boot-broke
+twice; now a fix-combination that re-arms an earlier panic).
+
+WHAT IS DURABLE AND CORRECT TO KEEP: bd7cdb9 (TH_WAIT: boots, and in isolation removed the waitq panic) and
+65038e3 (mutex_link init: a real uninitialized-field bug fix, correct regardless). WHAT IS NOT READY: the
+mutex-queue double-insert fix (5766b1d) — its logic addresses a proven bug but it does not compose cleanly
+with the rest yet.
+
+NEXT (do NOT spin another quick fix): the cvstorm repro is the asset — it reproduces deterministically in ~1s.
+The right next step is to instrument the repro to trace, per abort, the EXACT sequence: which queue the link is
+on, whether thread_go runs, whether waitq_pull happens, and where thread->waitq is left non-NULL when
+307fbedd re-panics — i.e. understand WHY bd7cdb9's routing is defeated by the mutex-queue change BEFORE
+touching code again. Consider whether the correct model is that the signal-abort must dequeue from the
+condvar/mutex queues too (not just the XNU waitq), unified at one abort/unblock point. Prod restored
+byte-identical baseline 835946f9, doctor GREEN. Repro: tmp/cvstorm.c + cvstorm_run.sh. Binaries in job tmp.
