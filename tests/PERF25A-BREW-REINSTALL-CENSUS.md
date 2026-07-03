@@ -362,3 +362,45 @@ inode, since `ss -x` mis-resolves autobind abstract names). Recv-Q>0 on a parked
 lost-wakeup, fix on the guest recv side). Recv-Q==0 everywhere + Send-Q=768 kqchan => C' (kqchan-drain
 circular, fix by making the kqchan notification/read not depend on a thread that can be RPC-blocked, or by
 a server-side timeout/kick). Prod byte-identical baseline 835946f9, doctor GREEN, guest torn down.
+
+## UPDATE 9 — B' FALSIFIED (guest Recv-Q=0) AND the ring is EXONERATED: ring-OFF hangs 4/6 on the PURE baseline binary. The memory's "RING_OFF clean / A0 = ring split-brain" is WRONG.
+Fixed the guest-side Recv-Q lookup (read guest-netns /proc/net/unix rx_queue by inode from /proc/<tid>/fd,
+NOT `ss -x` which mis-resolved the autobind abstract names) and caught a hang (tmp/a0_guest_recvq_procnet.txt,
+harness tmp/a0_guest_recvq_procnet.sh + loop). Then ran the ring A/B on the PURE baseline binary
+(tmp/a0_baseline_ab.sh). Results:
+
+(1) B' FALSIFIED: at the hang, EVERY parked guest DGRAM RPC socket (fds 8189/8191) has GUEST-side Recv-Q=0
+    — confirmed BOTH via ss -x (now correct) AND /proc/net/unix rx_queue=00000000. The reply is NOT sitting
+    unread on the guest. No guest-side lost-wakeup on the DGRAM band. (The only Recv-Q>0 socket in the whole
+    guest ns was /dev/log at 108B — journald, unrelated.)
+
+(2) REPLY ACCOUNTING IS CLEAN: per-tid RPCTRACE at the hang shows every reply accounted for and SENT —
+    e.g. launchd tid nstid=1: 1349 REPLY-DISP = 1314 SENT-UDS + 35 SENT-RING, 0 stranded; nstid=23: 14090
+    SEND = 14085 UDS + 5 RING + 1 STASH-SAVED w/ 3 FLUSH-SAVED (interrupt path, resolved). Each frozen
+    thread's ABSOLUTE last event is a completed SENT-UDS. So the server did not drop/strand any reply.
+
+(3) THE RING IS EXONERATED (the big correction): DARLING_SERVER_FAST_OPS=0 (ring fully OFF) on the
+    INSTRUMENTED binary hung 4/6; on the PURE BASELINE binary 835946f9 (no AUXLOG, prod byte-for-byte) it
+    ALSO hung 4/6 (2 clean 51-52s, 4 WATCHDOG). ring-ON hangs at a similar ~33-50%. => the hang is
+    TRANSPORT-INDEPENDENT and reproduces with the ring disabled. The memory bead (perf#25a #113 correction:
+    "A/B on deployed baseline = RING_OFF 2/2 CLEAN 🍺54s", root cause = ring<->UDS split-brain perf#8) was
+    based on a 2-SAMPLE ring-OFF run that got lucky. At n=6 ring-OFF is NOT clean. The ring split-brain
+    (gr_wait_reply guard-exhaust vs _publishReplyToRingLocked) is NOT the brew hang. DO NOT pursue the
+    "symmetric ring/UDS reply" fix for A0 — it targets a non-cause.
+
+(4) INSTRUMENTATION IS NOT A CONFOUND: baseline (no trace) and instrumented (AUXLOG write on every reply)
+    hang at the SAME 4/6 rate. The trace is a faithful observer; its added latency does not induce the hang.
+
+WHAT SURVIVES (transport-independent, shared by ring-ON and ring-OFF): the hang lives in machinery common to
+BOTH paths — candidates now (a) the single-threaded server event loop (server.cpp:739 receiveMany + inline
+doWork, EPOLLET listener), (b) the signal-interrupt protocol (interrupt_enter/exit + push_reply saved-reply)
+which fires under brew make-check's SIGCHLD/fork storm regardless of transport, (c) a guest-side psynch /
+semaphore_timedwait wait (the frozen threads' last calls are 31=pthread_canceled, 38=mach_msg_overwrite,
+62=semaphore_timedwait — the psynch/signal path). The cascade is broad: one hang showed 16 threads across
+many pids all parked in __skb_wait_for_more_packets = everything waiting behind one stuck party (a daemon).
+NEXT: since it is NOT the ring and NOT a dropped reply, the highest-value probe is to catch the FIRST thread
+to freeze (not the cascade) and its exact last call + whether that call got a RECV — i.e. add a monotonic
+"freeze order" to the capture (poll wchan every 1s, record the first tid to enter __skb_wait and STAY), then
+read its full RPCTRACE tail to see if its last request got a RECV+reply or vanished. Prod byte-identical
+baseline 835946f9, doctor GREEN, guest torn down. Evidence: tmp/a0_guest_recvq_procnet.txt,
+tmp/a0_baseline_ab.sh output (baseline ring-OFF 4/6 HUNG).
