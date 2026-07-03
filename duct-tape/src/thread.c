@@ -502,6 +502,26 @@ void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
 	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
 	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
+	// Cancel any armed wait timer before aborting the wait. This mirrors the
+	// cancel already done in thread_unblock() (normal wakeup) and
+	// dtape_thread_destroy() (teardown); the signal-abort path was the one
+	// clear_wait_internal() site that left the timer armed. A timed psynch
+	// wait (e.g. pthread_cond_timedwait / a cvwait carrying a deadline) arms
+	// wait_timer; a SIGCHLD delivered to the parent microthread during a
+	// brew `make -j` fork storm aborts the wait here with THREAD_INTERRUPTED
+	// but, without this cancel, leaves the timer armed. The guest re-issues
+	// the wait after -EINTR, and the stale timer then fires
+	// thread_timer_expire() -> clear_wait_internal(THREAD_TIMED_OUT), which
+	// delivers a SPURIOUS timeout to the *re-issued* wait, aborts it with
+	// ETIMEDOUT, and strands the condvar/mutex handoff -- the intermittent
+	// psynch lost-wakeup livelock (many cvwaits vs few cvsignals) observed
+	// under `brew reinstall`. (perf#25a A0)
+	if (thread->xnu_thread.wait_timer_is_set) {
+		if (timer_call_cancel(&thread->xnu_thread.wait_timer)) {
+			thread->xnu_thread.wait_timer_active--;
+		}
+		thread->xnu_thread.wait_timer_is_set = FALSE;
+	}
 	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
 	thread_unlock(&thread->xnu_thread);
 };
