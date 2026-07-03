@@ -647,3 +647,40 @@ signaled work item is stranded (no other waiter picks it up). NEXT: instrument c
 (RPCTRACE auxlog under cvstorm) to catch the specific lost handoff, then fix that layer and re-verify
 0 hangs on the repro before brew A/B. Prod restore pending; fix binary 50dea03a still deployed for the next
 instrumented repro run.
+
+## UPDATE 16 — DEEPER LAYER PINNED: signal-abort resumes a microthread inside dtape_mutex_lock's retry loop, which re-inserts an already-queued mutex_link -> TAILQ corruption (locks.c:151). This is the lost-wakeup/livelock engine.
+
+With the sigexc TH_WAIT fix (bd7cdb9) removing the waitq panic, the instrumented cvstorm repro drove the fault
+one layer deeper and exposed a DIFFERENT, sharper panic:
+    darlingserver duct-tape panic: "Bad tailq elm 0x... prev->next != elm @151" @ duct-tape/src/locks.c:151
+locks.c:151 is TAILQ_REMOVE(&mutex->dtape_queue_head, link, link) inside dtape_mutex_unlock -- the server's
+internal duct-tape MICROTHREAD MUTEX waiter queue is corrupted.
+
+MECHANISM (dtape_mutex_lock, locks.c:77-93):
+    while (true) {
+        lock queue; if free -> take & return;
+        TAILQ_INSERT_TAIL(&mutex->dtape_queue_head, &thread->mutex_link, link);   // line 89
+        thread_suspend(... drops queue lock ...);                                 // line 92 (blocks here)
+    }                                                                             // on resume -> loops
+A microthread blocked here has its mutex_link in the queue. When a SIGNAL aborts it (dtape_thread_sigexc_enter
+-> clear_wait_internal -> thread_go -> thread_resume), the microthread RESUMES INSIDE THIS LOOP. If the mutex
+is still owned, it falls through to line 89 and TAILQ_INSERT_TAIL's the SAME mutex_link AGAIN while it is still
+linked from the first insert -> the tailq now has a self-referential / double-linked element -> the next
+dtape_mutex_unlock TAILQ_REMOVE trips "prev->next != elm". In a release build this is not a clean panic but a
+corrupted waiter queue: the unlocker wakes a stale/garbage link instead of a real waiter -> the cond/mutex
+wakeup is effectively LOST -> the 42:1 cvwait:cvsignal livelock. (The interrupt reply-stash accounting is
+healthy here: 278 STASH-SAVED balanced across all 8 consumers' interruptTop slots, 1 pendingSaved -- NOT the
+driver; the driver is this mutex_link double-insert.)
+
+ROOT CAUSE (unified across all the symptoms): the signal-abort path resumes a microthread that was suspended
+MID-WAIT (in dtape_mutex_lock, and analogously other suspend points) WITHOUT removing it from the wait
+structure it was parked on, and the resumed code re-enqueues / re-waits assuming it was never queued. Two sites
+seen: (a) waitq (fixed direction in bd7cdb9 -- route through thread_go so waitq_pull happens), (b) the
+dtape_mutex queue (this update -- mutex_link left in dtape_queue_head across a signal-resume, then re-inserted).
+
+CANDIDATE FIX (to be TESTED on the repro, not assumed -- three prior claims were falsified): on resume inside
+dtape_mutex_lock, TAILQ_REMOVE our own mutex_link before re-evaluating / before any re-insert, so a
+signal-resumed microthread cannot double-link. Equivalent: only INSERT if not already linked, and always
+REMOVE on wake. Must hold dtape_queue_lock for the remove. Verify: cvstorm RESULT=OK with zero panics across
+many runs (deterministic, seconds), THEN brew A/B zero hangs. Prod restored byte-identical baseline 835946f9,
+doctor GREEN. Evidence: tmp/cvstorm_trace_1636756.log.
