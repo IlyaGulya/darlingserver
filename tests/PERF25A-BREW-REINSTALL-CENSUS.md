@@ -778,3 +778,40 @@ understanding why clear_wait_internal returns NOT_WAITING with TH_WAIT set (thre
 from its waitq) -- likely the psynch/ksyn wait queue and the XNU thread->waitq are out of sync under the
 duct-tape. That is the next thing to pin. KEEP bd7cdb9 + 65038e3 (correct). 5766b1d (mutex-queue) is a real
 but insufficient fix. Trace commit is temporary. Prod baseline 835946f9, doctor GREEN.
+
+## UPDATE 20 — THE SIGNAL STORM IS A RED HERRING. The hang is a plain lost cond_signal wakeup, no signals needed.
+
+Two decisive measurements on the PRISTINE baseline binary (835946f9, no instrumentation):
+
+(1) st_before is TH_RUN, not TH_WAIT. The UPDATE 19 trace read `st_before=0x4` as "TH_WAIT set". WRONG:
+    TH_WAIT=0x01, TH_RUN=0x04 (thread.h:274-276). So st=0x4 = TH_RUN. ALL 51,508 sigexc aborts in a
+    run hit a TH_RUN (already-running) thread; clear_wait_internal CORRECTLY returns KERN_NOT_WAITING(48)
+    because the thread genuinely is not waiting. A PULL-fail trace in waitq_pull_thread_locked showed
+    FAIL=0 OK=60: the pull NEVER fails. So the sigexc path is doing nothing wrong — it is just noise on
+    running threads. The double-insert / TH_WAIT-routing / re-abort-limbo models were all chasing a
+    phantom. (A blocked-in-psynch consumer is SUSPENDED and cannot send interrupt_enter, so it never
+    appears in the sigexc trace at all — that's why we only ever saw TH_RUN.)
+
+(2) cvstorm variant matrix (tmp/cvstorm2.c compile-time knobs, tmp/a0_matrix.sh) on baseline:
+      full        => (killed, no verdict)
+      NO_STORM    => HANG stuck=821371  (storm_hits=0, work=0)   <-- NO SIGNALS AT ALL, still hangs
+      NCONS=1     => HANG stuck=8842     work climbs to 434,000,000, consumer c0 asleep
+      SA_RESTART  => (killed, no verdict)
+      NO_BCAST    => HANG stuck=206013
+    The 1-consumer case is the smoking gun: producer spins work++ to 434M (work>0 the whole time),
+    calls pthread_cond_signal millions of times, yet the SINGLE consumer stays blocked in
+    pthread_cond_wait and never wakes. That is a LOST COND_SIGNAL, pure and simple. No storm, no
+    signal, no EINTR, no abort. NO_STORM (8 consumers, zero signals) also hangs -> the signal-abort
+    race is NOT the mechanism.
+
+=> ROOT CAUSE REFRAMED: a plain pthread_cond_signal/pthread_cond_wait lost-wakeup in Darling's psynch
+   (guest libpthread __psynch_cvwait/cvsignal <-> server duct-tape _psynch_cvwait in
+   duct-tape/xnu/.../pthread kext, ksyn prepost/generation machinery) under sustained load in the
+   single-threaded cooperative server. Deterministic, seconds-fast, signal-free repro = cvstorm2 -DNCONS=1.
+
+CONSEQUENCE: bd7cdb9 (TH_WAIT routing) and 5766b1d (mutex double-insert) target the WRONG layer. 65038e3
+   (uninit mutex_link) is still a correct standalone bugfix. The A0 fix is in the cond_signal/cond_wait
+   path, NOT the sigexc path. NEXT: instrument _psynch_cvwait / psynch_cvsignal (kwq generation counters
+   cvlsgen/cvugen, ksyn_wqfind, the prepost/preposted-signal accounting, and how a cvsignal's
+   ksyn_wakeup finds vs misses a just-parked waiter) on the cvstorm2 -DNCONS=1 repro to catch the exact
+   dropped wakeup. Prod baseline 835946f9, doctor GREEN.
