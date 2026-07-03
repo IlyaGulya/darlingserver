@@ -70,6 +70,12 @@ Fixes so far:
 
 ## Gate/perf status
 
-- Stage-1c synth gate: pending (running at write time; update below).
-- Perf A/B vs 886d13af baselines: pending (after synth green).
-- Full gate (brew legs): pending — stage-1 landing criterion.
+- **Stage-1c synth gate (binary d5daa0ed): ALL 13 GATING LEGS GREEN** — boot, nestwait-off
+  4/4, nestwait-on 4/4 (the interim nestwait-on flake is gone), forkwait,
+  cvstorm-nostorm 3/3. Known-limit storm legs still red (#114, stage 3). Fuzz survival:
+  baseline 5/6 RED → stage-1c **4/6 RED** (fuzz-cvstorm 1/3 red, fuzz-nestwait 3/3 red =
+  the unlocked-_interrupts/stack-borrowing shape, stage 3's target).
+- **Perf A/B vs 886d13af: NO REGRESSION.** nestwait NO_STORM 3627/3644/3635 jobs/15s
+  (mean ~3635 vs fix-baseline ~3679, −1.2%, within historical run spread 3609–3688 and
+  under the 3% stop threshold); 300× /usr/bin/true = 2s (identical).
+- Full gate (brew xz strict + wget no-freeze): RUNNING — stage-1 landing criterion.
