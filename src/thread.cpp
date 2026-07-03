@@ -80,6 +80,58 @@ static thread_local std::function<void()> currentContinuation = nullptr;
  */
 static thread_local uint64_t interruptDisableCount = 0;
 
+// A0-ARCH stage 0: scheduling-order fuzzer. Every A0 wake/wait bug was a 2-event reorder
+// (dispatch vs wake, wake-before-suspend, stale re-run); this injects exactly that class of
+// reorders on purpose so the a0-gate synth legs can find protocol holes in minutes instead
+// of waiting for brew to hit them. Enabled ONLY when DSERVER_SCHED_FUZZ=<seed> is set in the
+// server's environment (seed 0 disables); DSERVER_SCHED_FUZZ_RATE=<N> tunes the per-site
+// injection probability to 1/N (default 16). Zero cost when disabled: one predictable branch
+// on a plain bool per site.
+static bool schedFuzzEnabled = false;
+static uint64_t schedFuzzRate = 16;
+static std::atomic<uint64_t> schedFuzzState = 0;
+
+static void schedFuzzInit() {
+	const char* seedStr = getenv("DSERVER_SCHED_FUZZ");
+	if (!seedStr || !*seedStr) {
+		return;
+	}
+	uint64_t seed = strtoull(seedStr, nullptr, 0);
+	if (seed == 0) {
+		return;
+	}
+	const char* rateStr = getenv("DSERVER_SCHED_FUZZ_RATE");
+	if (rateStr && *rateStr) {
+		uint64_t rate = strtoull(rateStr, nullptr, 0);
+		if (rate >= 2) {
+			schedFuzzRate = rate;
+		}
+	}
+	schedFuzzState.store(seed, std::memory_order_relaxed);
+	schedFuzzEnabled = true;
+	fprintf(stderr, "darlingserver: sched-fuzz ENABLED seed=%llu rate=1/%llu\n",
+		(unsigned long long)seed, (unsigned long long)schedFuzzRate);
+}
+static const bool schedFuzzInitDone = (schedFuzzInit(), true);
+
+// deterministic per-seed xorshift64*; thread-safe via CAS so concurrent runners draw from
+// one stream (cross-thread interleaving makes exact replay approximate, but the DIVERSITY
+// of orderings per seed is the point, not exact replay).
+static bool schedFuzzChance() {
+	if (!schedFuzzEnabled) {
+		return false;
+	}
+	uint64_t x = schedFuzzState.load(std::memory_order_relaxed);
+	uint64_t next;
+	do {
+		next = x;
+		next ^= next >> 12;
+		next ^= next << 25;
+		next ^= next >> 27;
+	} while (!schedFuzzState.compare_exchange_weak(x, next, std::memory_order_relaxed));
+	return ((next * 0x2545f4914f6cdd1dULL) >> 33) % schedFuzzRate == 0;
+}
+
 #if DSERVER_ASAN
 	static thread_local void* asanOldFakeStack = nullptr;
 	static thread_local const void* asanOldStackBottom = nullptr;
@@ -472,6 +524,19 @@ void DarlingServer::Thread::doWork() {
 	// resuming it would deliver a spurious wakeup with wait_result == THREAD_WAITING.
 	bool hadResumePermit = false;
 	bool preserveWaitState = false;
+
+	// A0-ARCH stage 0 fuzzer: reorder this dispatch behind whatever else is queued (models the
+	// dispatch-vs-wake races), and/or inject an extra permit-less dispatch (models stale re-runs).
+	// Both are events the protocol MUST tolerate; compiled-in but dormant unless DSERVER_SCHED_FUZZ set.
+	if (schedFuzzEnabled) {
+		if (schedFuzzChance()) {
+			Server::sharedInstance().scheduleThread(shared_from_this());
+			return;
+		}
+		if (schedFuzzChance()) {
+			Server::sharedInstance().scheduleThread(shared_from_this());
+		}
+	}
 
 	_rwlock.lock();
 
@@ -1055,6 +1120,12 @@ void DarlingServer::Thread::resume() {
 		// running, it will either consume the permit in suspend() or reschedule
 		// itself from doWork() after physically stopping.
 		schedule = microthreadRecordResume(_running, _suspended, _resumePermit);
+	}
+
+	// A0-ARCH stage 0 fuzzer: occasionally force a dispatch even though the thread is still
+	// running / not yet parked -- models the wake-while-running reorder (_rerunPending path).
+	if (schedFuzzEnabled && !schedule && schedFuzzChance()) {
+		schedule = true;
 	}
 
 	if (schedule) {
