@@ -543,6 +543,7 @@ void DarlingServer::Thread::doWork() {
 	// resuming it would deliver a spurious wakeup with wait_result == THREAD_WAITING.
 	bool hadResumePermit = false;
 	bool preserveWaitState = false;
+	bool preDispatchParked = false;
 
 	// A0-ARCH stage 0 fuzzer: reorder this dispatch behind whatever else is queued (models the
 	// dispatch-vs-wake races), and/or inject an extra permit-less dispatch (models stale re-runs).
@@ -566,10 +567,10 @@ void DarlingServer::Thread::doWork() {
 		return;
 	}
 
-	if (_running) {
+	if (_isRunningLocked()) {
 		// perf#25a A0: this dispatch was popped while the microthread is still
-		// _running on another worker (it is mid suspend()/doneWorking transition;
-		// _running is only cleared at the doneWorking tail). We cannot run it now,
+		// running on another worker (it is mid suspend()/doneWorking transition;
+		// the running view only clears at the doneWorking tail). We cannot run it now,
 		// but we MUST NOT silently drop it -- otherwise a wake that a waker
 		// delivered via scheduleThread() (rather than via a pending wake token) is lost
 		// forever and the microthread deadlocks. Record the owed re-run; the
@@ -591,13 +592,17 @@ void DarlingServer::Thread::doWork() {
 		goto doneWorking;
 	}
 
-	if (_suspended && _consumePendingWakeLocked()) {
+	// A0-ARCH stage 2b: whether this dispatch found a parked (resumable) context. Captured
+	// BEFORE the transition to Running because the dispatch-decision logic below needs the
+	// pre-dispatch view (the state field is authoritative now; there is no lingering
+	// _suspended residue to read). Parking is impossible here (the running guard above).
+	preDispatchParked = _isSuspendedLocked();
+	if (preDispatchParked && _consumePendingWakeLocked()) {
 		// This execution was scheduled by a matching typed wake; consume it.
 		hadResumePermit = true;
 	}
-	_running = true;
 	_mstateTransitionLocked(MicroState::Running,
-		hadResumePermit ? "dispatch-resume" : (_suspended ? "dispatch-stale" : "dispatch-fresh"));
+		hadResumePermit ? "dispatch-resume" : (preDispatchParked ? "dispatch-stale" : "dispatch-fresh"));
 	currentThreadVar = shared_from_this();
 	// perf#25a A0 (Part 3): an interrupt_enter that stacks onto an in-flight call must NOT run
 	// dtape_thread_entering(). The interrupted call may be suspended on a waitq with TH_WAIT set
@@ -617,7 +622,7 @@ void DarlingServer::Thread::doWork() {
 	preserveWaitState =
 		// an interrupt_enter stacking onto an in-flight (possibly waitq-parked) call...
 		(_pendingCall && _pendingCall->number() == Call::Number::InterruptEnter
-			&& !_pendingCallOverride && (_activeCall || _suspended || _continuationCallback))
+			&& !_pendingCallOverride && (_activeCall || preDispatchParked || _continuationCallback))
 		// ...or ANY dispatch that resumes a suspended context (matches the resume branch
 		// below) rather than starting a fresh call. A genuine wake already had
 		// thread_unblock clear TH_WAIT and write wait_result; a stray wake (raw
@@ -627,7 +632,7 @@ void DarlingServer::Thread::doWork() {
 		// spurious wait_result == THREAD_WAITING return (stranded waitq link -> "thread
 		// already waiting" panic / silent lost wakeup). dtape_thread_entering is only for
 		// fresh call dispatches, where the guest thread is by definition not blocked here.
-		|| (_suspended && (_pendingCallOverride || !_pendingCall));
+		|| (preDispatchParked && (_pendingCallOverride || !_pendingCall));
 	if (!preserveWaitState) {
 		dtape_thread_entering(_dtapeThread);
 	}
@@ -650,9 +655,9 @@ void DarlingServer::Thread::doWork() {
 
 		_rwlock.lock();
 
-		if (!_suspended || _continuationCallback) {
+		if (_microState != MicroState::Parking || _continuationCallback) {
 			// we discard the old stack when either:
-			//   * we exit normally (i.e. without suspending); this includes syscall returns.
+			//   * we exit normally (i.e. without suspending -- state stayed Running);
 			//   * or when we suspend with a continuation callback.
 			stackPool.free(_stack);
 		}
@@ -688,12 +693,11 @@ void DarlingServer::Thread::doWork() {
 		// real wake (permit consumed above) or an explicit override; a permit-less dispatch of a
 		// suspended thread is stale and falls through to the else-branch, which parks it again
 		// (no pending call -> doneWorking) instead of spuriously resuming a live wait.
-		if (_suspended && (_pendingCallOverride || (!_pendingCall && hadResumePermit))) {
+		if (preDispatchParked && (_pendingCallOverride || (!_pendingCall && hadResumePermit))) {
 			if (_pendingCallOverride) {
 				microthreadLog.info() << _tid << "(" << _nstid << "): thread was suspended with a pending call override and is now resuming with a pending call" << microthreadLog.endLog;
 			}
 			// we were in the middle of processing a call and we need to resume now
-			_suspended = false;
 			_resumeContext.uc_link = &backToThreadTopContext;
 			_rwlock.unlock();
 
@@ -723,7 +727,6 @@ void DarlingServer::Thread::doWork() {
 				// if we don't actually have a pending call, we have nothing to do
 				goto doneWorking;
 			}
-			_suspended = false;
 			_rwlock.unlock();
 
 			// we might've had a valid stack if we're overwriting a previous suspension, so handle that.
@@ -754,31 +757,33 @@ void DarlingServer::Thread::doWork() {
 
 doneWorking:
 	// we must be holding `_rwlock` when we get here
-	if (_running) {
+	if (_microState == MicroState::Running || _microState == MicroState::Parking) {
+		// this stint actually ran the microthread (vs. a goto from the guards above)
 		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
-		_running = false;
 		_mstateTransitionLocked(
-			_suspended ? (_hasDeliverablePendingWakeLocked() ? MicroState::Ready : MicroState::Parked) : MicroState::Idle,
-			_suspended ? "park-committed" : "done");
+			_microState == MicroState::Parking
+				? (_hasDeliverablePendingWakeLocked() ? MicroState::Ready : MicroState::Parked)
+				: MicroState::Idle,
+			_microState == MicroState::Parking ? "park-committed" : "done");
 	}
 	// A wake can arrive after suspend()'s final permit check but before it
-	// physically switches back here. Now that _running is false, rescheduling
+	// physically switches back here. Now that the running view is clear, rescheduling
 	// is safe and cannot race another worker running this microthread.
 	//
 	// perf#25a A0: also honor a dispatch that a worker popped and deferred while
-	// we were still _running (doWork() set _rerunPending instead of dropping it).
-	// Now that _running is false it is safe to reschedule; consume the flag so we
+	// we were still running (doWork() set _rerunPending instead of dropping it).
+	// Now that the running view is clear it is safe to reschedule; consume the flag so we
 	// reschedule exactly once. Only reschedule if the microthread is actually
-	// parked with a resumable context (_suspended) and still alive -- if it is
+	// parked with a resumable context and still alive -- if it is
 	// terminating/dead or has no context, the owed re-run is moot.
 	bool rerunPending = _rerunPending;
 	_rerunPending = false;
 	// A deliverable pending wake only makes sense when there is a suspended context to
-	// resume. _rerunPending is a dropped dispatch (from doWork's _running guard): it must be
+	// resume. _rerunPending is a dropped dispatch (from doWork's running guard): it must be
 	// honored whether the microthread is suspended (resume its context) OR has a
-	// pending call to process -- i.e. NOT gated on _suspended. Gate only on liveness.
-	bool resumeAfterWorking = ((_hasDeliverablePendingWakeLocked() && _suspended) || rerunPending) && !_terminating && !_dead;
+	// pending call to process -- i.e. NOT gated on the suspended view. Gate only on liveness.
+	bool resumeAfterWorking = ((_hasDeliverablePendingWakeLocked() && _isSuspendedLocked()) || rerunPending) && !_terminating && !_dead;
 	bool canRelease = false;
 	if (_dead) {
 		threadLog.debug() << *this << ": dead thread returning. active call? " << (!!_activeCall ? "true" : "false") << " terminating? " << (_terminating ? "true" : "false") << threadLog.endLog;
@@ -841,20 +846,18 @@ bool DarlingServer::Thread::doWorkInline() {
 		_deferralState = DeferralState::DeferredPending;
 		return false;
 	}
-	if (_running) {
+	if (_isRunningLocked()) {
 		microthreadLog.warning() << _tid << "(" << _nstid << "): doWorkInline on already-running microthread" << microthreadLog.endLog;
 		return false;
 	}
-	if (_terminating || (_dead && !_activeCall) || _suspended || _continuationCallback || !_pendingCall) {
+	if (_terminating || (_dead && !_activeCall) || _isSuspendedLocked() || _continuationCallback || !_pendingCall) {
 		// any of these means this is NOT the simple "fresh non-blocking call" case the inline
 		// path is for; let the caller fall back to the full doWork() which handles them.
 		return false;
 	}
 
-	_running = true;
 	currentThreadVar = shared_from_this();
 	dtape_thread_entering(_dtapeThread);
-	_suspended = false;
 	_mstateTransitionLocked(MicroState::Running, "inline-dispatch");
 	lock.unlock();
 	_runningCondvar.notify_all();
@@ -907,18 +910,17 @@ bool DarlingServer::Thread::doWorkInline() {
 	bool canRelease = false;
 	{
 		std::unique_lock<std::shared_mutex> relock(_rwlock);
-		if (_suspended) {
+		if (_microState == MicroState::Parking) {
 			// Should be impossible for an allowlisted op. The microthread "suspended" without a
-			// fiber to resume onto -> we cannot honor it. Log; leave _running cleared so the
-			// thread isn't wedged. (The guest will time out on this op and UDS-fall-back.)
+			// fiber to resume onto -> we cannot honor it. Log; the Idle transition below
+			// recovers (the one legal Parking->Idle edge) so the thread isn't wedged.
+			// (The guest will time out on this op and UDS-fall-back.)
 			microthreadLog.error() << *this << ": doWorkInline call suspended -- not fast-path eligible!" << microthreadLog.endLog;
 			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
-			_suspended = false;
 		}
 		_activeCall = nullptr;
 		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
-		_running = false;
 		_mstateTransitionLocked(MicroState::Idle, "inline-done");
 
 		if (_dead && !_activeCall && !_terminating) {
@@ -964,21 +966,19 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 		_deferralState = DeferralState::DeferredPending;
 		return false;
 	}
-	if (_running) {
+	if (_isRunningLocked()) {
 		microthreadLog.warning() << _tid << "(" << _nstid << "): doMachReplyPortInline on already-running microthread" << microthreadLog.endLog;
 		return false;
 	}
-	if (_terminating || _dead || _suspended || _continuationCallback || _pendingCall || _activeCall) {
+	if (_terminating || _dead || _isSuspendedLocked() || _continuationCallback || _pendingCall || _activeCall) {
 		// Not the simple "fresh, idle thread servicing a no-arg trap" case. There is no Call to run
 		// here (we bypass callFromMessage), so a _pendingCall/_activeCall would be left dangling --
 		// decline and let the caller take the generic step-1 path which handles all of these.
 		return false;
 	}
 
-	_running = true;
 	currentThreadVar = shared_from_this();
 	dtape_thread_entering(_dtapeThread);
-	_suspended = false;
 	_mstateTransitionLocked(MicroState::Running, "inline-mrp-dispatch");
 	lock.unlock();
 	_runningCondvar.notify_all();
@@ -1023,15 +1023,14 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 	bool canRelease = false;
 	{
 		std::unique_lock<std::shared_mutex> relock(_rwlock);
-		if (_suspended) {
-			// Impossible for mach_reply_port (it never blocks). Log loudly; clear so we don't wedge.
+		if (_microState == MicroState::Parking) {
+			// Impossible for mach_reply_port (it never blocks). Log loudly; the Idle
+			// transition below recovers so we don't wedge.
 			microthreadLog.error() << *this << ": doMachReplyPortInline suspended -- mach_reply_port must never block!" << microthreadLog.endLog;
 			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
-			_suspended = false;
 		}
 		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
-		_running = false;
 		_mstateTransitionLocked(MicroState::Idle, "inline-mrp-done");
 
 		if (_dead && !_activeCall && !_terminating) {
@@ -1099,7 +1098,6 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 		}
 		return;
 	}
-	_suspended = true;
 	{
 		// tape the armed-kind mask so a stuck park names what it is waiting for
 		uint64_t armedMask = 0;
@@ -1119,7 +1117,6 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	_rwlock.lock();
 	// Consume a matching wake that arrived while the resume context was being captured.
 	if (_consumePendingWakeLocked()) {
-		_suspended = false;
 		// this check runs on BOTH getcontext paths: a genuine park race (state Parking) and
 		// a spurious-but-legal consume right after a real resume (state already Running via
 		// doWork's dispatch-resume transition; the caller's wait loop re-checks its predicate)
@@ -1133,7 +1130,7 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 		}
 		return;
 	}
-	if (_suspended) {
+	if (_microState == MicroState::Parking) {
 		if (continuationCallback) {
 			// when suspendeding with a continuation, the current continuation and call are discarded (since they can no longer be safely returned to)
 			currentContinuation = nullptr;
@@ -1175,6 +1172,14 @@ static bool mstateAbortInit() {
 	return value && value[0] && value[0] != '0';
 };
 static const bool mstateAbortInitDone = (mstateAbortOnViolation = mstateAbortInit(), true);
+
+bool DarlingServer::Thread::_isRunningLocked() const {
+	return _microState == MicroState::Running || _microState == MicroState::Parking || _impersonationPin;
+};
+
+bool DarlingServer::Thread::_isSuspendedLocked() const {
+	return _microState == MicroState::Parking || _microState == MicroState::Parked || _microState == MicroState::Ready;
+};
 
 const char* DarlingServer::Thread::microStateName(MicroState state) {
 	switch (state) {
@@ -1260,18 +1265,12 @@ void DarlingServer::Thread::_mstateTransitionLocked(MicroState to, const char* r
 	_microState = to;
 	_mstateRecordLocked(StateEvent::Transition, from, to, reason, aux8, aux64);
 
-	// legality + view-consistency assertions. The views are checked POSITIVELY only:
-	// impersonate() latches _running=true on a non-running thread as a lockout, so
-	// "_running implies Running" does not hold (stage 2b untangles that latch).
+	// legality assertion. (Stage 2b flipped authority: the old _running/_suspended flags
+	// are now derived views of this field, so the 2a flag-consistency checks are
+	// tautological and gone; the from->to table is the contract.)
 	const char* violation = nullptr;
 	if (!mstateLegalTransition(from, to)) {
 		violation = "illegal transition";
-	} else if ((to == MicroState::Running || to == MicroState::Parking) && !_running) {
-		violation = "Running/Parking without _running";
-	} else if ((to == MicroState::Parking || to == MicroState::Parked || to == MicroState::Ready) && !_suspended) {
-		violation = "park state without _suspended";
-	} else if (to == MicroState::Idle && _suspended) {
-		violation = "Idle with _suspended";
 	}
 	if (violation) {
 		microthreadLog.error() << _tid << "(" << _nstid << "): MSTATE VIOLATION: " << violation
@@ -1403,7 +1402,7 @@ void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
 	bool schedule = false;
 	{
 		std::unique_lock lock(_rwlock);
-		if (!_running && !_suspended) {
+		if (!_isRunningLocked() && !_isSuspendedLocked()) {
 			// nothing to deliver to (no parked context and no owner mid-transition);
 			// same no-op as the old untyped resume()
 			_mstateEventLocked(StateEvent::WakeDropped, "no-park", (uint8_t)kind, generation);
@@ -1448,7 +1447,7 @@ void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
 			// the park is committed and this wake matches it: the thread now owes a dispatch
 			_mstateTransitionLocked(MicroState::Ready, "wake-deliverable", (uint8_t)kind, generation);
 		}
-		schedule = _suspended && !_running;
+		schedule = _isSuspendedLocked() && !_isRunningLocked();
 	}
 
 	// A0-ARCH stage 0 fuzzer: occasionally force a dispatch even though the thread is still
@@ -1485,7 +1484,7 @@ void DarlingServer::Thread::terminate() {
 	} else {
 		// if it's not the current thread and it's not currently running, just tell it died;
 		// it should die once the caller releases their reference(s) on us
-		if (!_running) {
+		if (!_isRunningLocked()) {
 			_rwlock.unlock();
 			notifyDead();
 		} else {
@@ -1502,7 +1501,6 @@ std::shared_ptr<DarlingServer::Thread> DarlingServer::Thread::currentThread() {
 void DarlingServer::Thread::setupKernelThread(std::function<void()> startupCallback) {
 	std::unique_lock lock(_rwlock);
 	_continuationCallback = startupCallback;
-	_suspended = true;
 	// A0-ARCH stage 1: the birth park of a kernel thread; woken exactly once by a startup
 	// kick (startKernelThread below, or an untyped first thread_unblock for kernel threads
 	// created via kernel_thread_create -- see wake()).
@@ -1527,7 +1525,10 @@ void DarlingServer::Thread::impersonate(std::shared_ptr<Thread> thread) {
 		{
 			std::unique_lock lock(thread->_rwlock);
 			thread->_deferLocked(true, lock);
-			thread->_running = true;
+			// A0-ARCH stage 2b: the lockout is its own field now (it used to be smuggled
+			// through `_running = true` on a non-running thread); _isRunningLocked folds
+			// it in so defer/waitUntil* readers see the same "busy" they always did
+			thread->_impersonationPin = true;
 			thread->_mstateEventLocked(StateEvent::ImpersonatePin, "impersonate");
 		}
 		thread->_runningCondvar.notify_all();
@@ -1542,7 +1543,7 @@ void DarlingServer::Thread::impersonate(std::shared_ptr<Thread> thread) {
 	if (oldThread) {
 		{
 			std::unique_lock lock(oldThread->_rwlock);
-			oldThread->_running = false;
+			oldThread->_impersonationPin = false;
 			oldThread->_mstateEventLocked(StateEvent::ImpersonateUnpin, "impersonate-end");
 			oldThread->_undeferLocked(lock);
 		}
@@ -2614,14 +2615,14 @@ void DarlingServer::Thread::syncMemory(uintptr_t address, size_t size, int sync_
 void DarlingServer::Thread::waitUntilRunning() {
 	std::shared_lock lock(_rwlock);
 	_runningCondvar.wait(lock, [&]() {
-		return _running;
+		return _isRunningLocked();
 	});
 };
 
 void DarlingServer::Thread::waitUntilNotRunning() {
 	std::shared_lock lock(_rwlock);
 	_runningCondvar.wait(lock, [&]() {
-		return !_running;
+		return !_isRunningLocked();
 	});
 };
 
@@ -2632,7 +2633,7 @@ void DarlingServer::Thread::_deferLocked(bool wait, std::unique_lock<std::shared
 
 	if (wait) {
 		_runningCondvar.wait(lock, [&]() {
-			return !_running;
+			return !_isRunningLocked();
 		});
 	}
 };
@@ -2768,11 +2769,11 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 };
 
 bool DarlingServer::Thread::isCurrentlySuspended() const {
-	// perf #2b: read the same _suspended flag doWork()/suspend() maintain. A microthread
-	// that ran to completion inline never set _suspended; one that blocked has it set
-	// (until a resume clears it). Shared-lock is enough -- this is a single-bool read.
+	// perf #2b: read the same suspended view doWork()/suspend() maintain. A microthread
+	// that ran to completion inline never parked; one that blocked reads suspended
+	// (until a resume). Shared-lock is enough -- this is a single-field read.
 	std::shared_lock lock(_rwlock);
-	return _suspended;
+	return _isSuspendedLocked();
 };
 
 DarlingServer::Thread::RunState DarlingServer::Thread::getRunState() const {
