@@ -1,7 +1,7 @@
 # A0-ARCH stage 2: one run-state machine per thread (kills the dual-view disease)
 
-Status: **2a LANDED 2026-07-04** (deployed e50a3450 = new doctor baseline);
-2b/2c in progress. Branch `fix/a0-arch-redesign`.
+Status: **2a + 2b LANDED 2026-07-04** (deployed 47ac175d = new doctor baseline);
+2c in progress. Branch `fix/a0-arch-redesign`.
 Spec: tests/A0-ARCH-REDESIGN-SPEC.md stage 2. Prior stage: tests/A0-ARCH-STAGE1.md.
 
 Stage 2 is landed as three independently-gated sub-steps:
@@ -129,7 +129,13 @@ repark discriminator LOST the untouched parked context that the old
   recurrence gets the tape+gdb treatment.
 - cvstorm2-throttled (#114 known-limit) went GREEN this run — first time; storm
   legs shift with timing, not claiming improvement.
-- Landing battery (quick gate + perf A/B): see below.
+- **Landing battery: quick gate 15/15 gating GREEN** (nestwait-off 4/4 — watch
+  item did not recur; brew xz 2/2 strict), zero mstate violations. Perf A/B:
+  nestwait NO_STORM 3626/3674/3644 jobs/15s + 300x true 2s — inside the
+  3609–3692 baseline corridor. **2b LANDED, deployed 47ac175d = new baseline.**
+  (Ops note: the stage-1 perf script wedged once on its in-guest `| tail` pipe
+  with a plain `timeout` that the launcher ignores — replaced by
+  job-tmp s2b_perf2.sh: `timeout -k 5`, file redirect only, no in-guest pipes.)
 
 ## 2c — XNU side becomes derived (planned)
 
