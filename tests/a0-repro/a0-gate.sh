@@ -74,9 +74,14 @@ verdict() { # name ok
 run_synth() { # name src cflags secs [ring]
 	local name="$1" src="$2" cf="$3" secs="$4" ring="${5:-$RING}"
 	cleanboot
+	# A0-ARCH stage 2a: surface shadow state-machine violations. Fuzz legs run with
+	# DSERVER_MSTATE_ABORT=1 (violation = crash = RED); all legs also log at err level
+	# and grep the server log for MSTATE VIOLATION afterwards (log-and-survive mode).
+	local DLOG="$PREFIX/private/var/log/dserver.log"
+	: > "$DLOG" 2>/dev/null || true
 	cp "$SELFDIR/$src" "$PREFIX/Users/ilyagulya/$src" 2>/dev/null || cp "$SELFDIR/$src" "$PREFIX/Users/"*"/$src"
 	local G="$WORK/$name.log" HARD=$((secs+50)) W=0
-	DARLING_SERVER_FAST_OPS="$ring" DSERVER_SCHED_FUZZ="${FUZZ:-}" timeout "$HARD" "$L" shell /bin/bash --login -c \
+	DARLING_SERVER_FAST_OPS="$ring" DSERVER_SCHED_FUZZ="${FUZZ:-}" DSERVER_MSTATE_ABORT="${A0_MSTATE_ABORT:-${FUZZ:+1}}" DSERVER_LOG_LEVEL="${DSERVER_LOG_LEVEL:-err}" timeout "$HARD" "$L" shell /bin/bash --login -c \
 		"cd /Users/ilyagulya; $CLANG -isysroot $SDK -O2 $cf -o bin_$name $src 2>&1 && ./bin_$name $secs 2>&1; echo RUN_DONE" \
 		</dev/null > "$G" 2>&1 &
 	local GP=$!
@@ -88,6 +93,10 @@ run_synth() { # name src cflags secs [ring]
 	kill -9 $GP 2>/dev/null; wait $GP 2>/dev/null
 	grep -q "RESULT=OK" "$G"; local ok=$((1-$?))
 	grep -q "duct-tape panic" "$G" && ok=0
+	if grep -q "MSTATE VIOLATION" "$DLOG" 2>/dev/null; then
+		note "$name" "mstate violations: $(grep -c 'MSTATE VIOLATION' "$DLOG")"
+		ok=0
+	fi
 	verdict "$name" "$ok"
 }
 
