@@ -1125,9 +1125,12 @@ void DarlingServer::Call::TaskIs64Bit::processCall() {
 };
 
 void DarlingServer::Call::InterruptEnter::processCall() {
-	Thread::_handleInterruptEnterForCurrentThread();
-
-	_sendReply(0);
+	// A0-ARCH stage 3: when a call was in flight, our reply is DEFERRED -- pushCallReply
+	// sends it the moment the cancelled call's reply is stashed on the interrupt frame
+	// (same guest ordering the old synchronous unwind provided).
+	if (Thread::_handleInterruptEnterForCurrentThread()) {
+		_sendReply(0);
+	}
 };
 
 void DarlingServer::Call::InterruptExit::processCall() {
@@ -1140,12 +1143,15 @@ void DarlingServer::Call::InterruptExit::processCall() {
 	{
 		std::unique_lock lock(thread->_rwlock);
 
-		// A0-ARCH stage 1c: an interrupt_exit must pop the frame its MATCHING interrupt_enter
-		// pushed. Under an RPC-stream desync an exit can arrive while the enter is still
-		// mid-flight (_interruptedForSignal) or with no frame at all; popping then yanks the
-		// frame out from under the enter fiber (top()-UB, jumpToResume(0x2) SIGSEGV) or pops
+		// A0-ARCH stage 1c (rekeyed by stage 3): an interrupt_exit must pop the frame its
+		// MATCHING interrupt_enter pushed. Under an RPC-stream desync an exit can arrive
+		// while the enter is still in flight -- now visible as an armed-but-unrestored frame
+		// (cancellationArmed) or an enter reply still owed (replyOwed) -- or with no frame at
+		// all; popping then yanks the frame out from under the cancellation machinery or pops
 		// an OUTER interrupt's frame. Refuse loudly and keep the server alive.
-		if (thread->_interrupts.empty() || thread->_interruptedForSignal) {
+		if (thread->_interrupts.empty()
+				|| thread->_interrupts.top().cancellationArmed
+				|| thread->_interrupts.top().replyOwed) {
 			callLog.error() << *thread << ": interrupt_exit " << (thread->_interrupts.empty() ? "with EMPTY interrupt stack" : "while interrupt_enter is still in flight") << " (desync); ignoring pop" << callLog.endLog;
 			return;
 		}
