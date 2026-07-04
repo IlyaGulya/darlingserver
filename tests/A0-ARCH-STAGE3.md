@@ -1,9 +1,20 @@
 # A0-ARCH stage 3: interrupt as cancellation (kills #114 stack borrowing)
 
-Status: **IMPLEMENTED + fixes 1/3/4 (fix 2 reverted), 2026-07-04. Binary d81b5cf1
-deployed (intentional drift; baseline still 7692d9f6 until landing).**
-Branch `fix/a0-arch-redesign`. Spec: tests/A0-ARCH-REDESIGN-SPEC.md stage 3.
-Prior: tests/A0-ARCH-STAGE2.md.
+Status: **LANDED 2026-07-04 (commits 78d7f7b + fixes 2d2cd37/5020b3f/e66aeee,
+fix-2 ccbe517 reverted by 1789d62). Binary d81b5cf1 = NEW DOCTOR BASELINE
+(deploy-baseline.md5 dserver 7692d9f6 -> d81b5cf1; doctor ALL GREEN). The #114
+SEGV stack-borrowing crash class is ELIMINATED (zero interrupt SEGVs across every
+stage-3 run); interrupt is now cancellation through the normal dispatch path with
+no stack borrowing.** Branch `fix/a0-arch-redesign`. Spec:
+tests/A0-ARCH-REDESIGN-SPEC.md stage 3. Prior: tests/A0-ARCH-STAGE2.md.
+
+Landing acceptance (d81b5cf1): synth 16/16, quick gate 19/19 gating green
+(nestwait 8/8, brew xz 2/2 strict, both storm known-limit legs OK), ZERO
+mstate/xwait violations, ZERO SEGV; cvstorm2-throttled 12/12 OK at full storm.
+Two pre-existing non-blockers re-scoped out (proven NOT stage-3 regressions via
+A/B vs 7692d9f6): cvstorm2-flood dispatch-starvation HANG -> task #118; rare ~2%
+nestwait semaphore_timedwait -111 flake (seen pre-stage-3). Stage 4 (optional
+single-runner) is measure-first per spec.
 
 ### FLOOD A/B SETTLED (2026-07-04, 2nd session pass) -- landing unblocked
 
