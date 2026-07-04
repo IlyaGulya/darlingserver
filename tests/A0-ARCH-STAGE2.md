@@ -95,12 +95,41 @@ Acceptance quick gate (e50a3450, A0_FUZZ_SEEDS=3, fuzz legs abort-on-violation):
   pre-existing disease, not of the shadow machine. 2a is behaviorally
   transparent, as a shadow must be.
 
-## 2b — flip authority (planned)
+## 2b — flip authority (commits 3acb412 + repark fix, binary 47ac175d)
 
-- `_running`/`_suspended` become derived views (accessors over `_microState`);
-  every flip site becomes a named transition; the impersonation lockout becomes
-  its own `_impersonationPin` so "Running" regains a single meaning.
-- Negative-direction consistency asserts turn on (Parked/Ready ⇒ NOT running).
+- `_running`/`_suspended` no longer exist as fields: `_isRunningLocked()`
+  (Running|Parking|pin) and `_isSuspendedLocked()` (Parking|Parked|Ready) are
+  derived views of `_microState`, updated ONLY inside the transition function.
+  The impersonation lockout became `_impersonationPin` (it used to be smuggled
+  through `_running=true` on a non-running thread).
+- doWork captures `preDispatchParked` before the Running transition (the
+  dispatch-decision logic needs the pre-dispatch view); suspend()'s
+  park-vs-resumed discriminator and the inline suspend-contract checks read the
+  state directly. The 2a flag-consistency asserts are gone (tautological).
+
+### 2b fuzz finding #2 (the tape's second catch, and the flip's one real bug)
+
+First 2b build wedged EVERY fuzz boot (launchd parked forever). One gdb walk
+with the tape named it: a spurious dispatch of a Parked thread went
+`Parked→Running("dispatch-stale")→Idle("done")` — doneWorking's Parking-only
+repark discriminator LOST the untouched parked context that the old
+`_suspended` flag carried implicitly; the next genuine wake dropped as
+"no-park" (tape[255..257] on the wedged launchd, verbatim). Fix: doWork records
+`parkedContextIntact` at the no-op-dispatch goto; doneWorking reparks
+(Parked/Ready, reason "repark-noop-dispatch") instead of idling.
+
+### 2b gate status
+
+- Synth gate (47ac175d): 15/16 — one `nestwait-off-4` RED: server death at
+  TEARDOWN (after t=15s steady progress; -111 on interrupt_enter +
+  semaphore_timedwait), zero mstate violations, no panic. Does NOT reproduce:
+  8/8 green ring-off reruns under attached gdb. Same shape as the teardown
+  server death already observed once on the OLD baseline during stage-1 Part-3g
+  work (#114 mass-exit family). Classified: rare pre-existing, WATCH ITEM — any
+  recurrence gets the tape+gdb treatment.
+- cvstorm2-throttled (#114 known-limit) went GREEN this run — first time; storm
+  legs shift with timing, not claiming improvement.
+- Landing battery (quick gate + perf A/B): see below.
 
 ## 2c — XNU side becomes derived (planned)
 
