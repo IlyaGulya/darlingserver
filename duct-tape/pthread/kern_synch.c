@@ -811,17 +811,6 @@ psynch_mtxcontinue(void *parameter, wait_result_t result)
 	if (error != 0) {
 		if (kwe->kwe_kwqqueue) {
 			ksyn_queue_remove_item(kwq, &kwq->kw_ksynqueues[KSYN_QUEUE_WRITE], kwe);
-		} else if (kwe->kwe_psynchretval != 0) {
-			// Darling (A0-ARCH stage 3): the wait was aborted (sigexc cancellation clears
-			// TH_UNINT, so even mutex waits abort on signals here, unlike XNU) but a grant
-			// was ALREADY committed to us -- dequeued from the kwq with kwe_psynchretval
-			// written -- before the abort could win. Honor the grant exactly like
-			// psynch_cvcontinue's "woken up as we were granting" path; discarding it loses
-			// the mutex handoff forever (every later waiter parks against a queue whose
-			// grant went nowhere -- the cvstorm2-throttled wedge, jobs frozen).
-			uint32_t updatebits = kwe->kwe_psynchretval & ~PTH_RWL_MTX_WAIT;
-			pthread_kern->uthread_set_returnval(uth, updatebits);
-			error = 0;
 		}
 	} else {
 		uint32_t updatebits = kwe->kwe_psynchretval & ~PTH_RWL_MTX_WAIT;
@@ -854,11 +843,6 @@ _psynch_rw_continue(ksyn_wait_queue_t kwq, kwq_queue_type_t kqi,
 	if (error != 0) {
 		if (kwe->kwe_kwqqueue) {
 			ksyn_queue_remove_item(kwq, &kwq->kw_ksynqueues[kqi], kwe);
-		} else if (kwe->kwe_psynchretval != 0) {
-			// Darling (A0-ARCH stage 3): abort raced an already-committed grant -- honor
-			// it (see psynch_mtxcontinue)
-			pthread_kern->uthread_set_returnval(uth, kwe->kwe_psynchretval);
-			error = 0;
 		}
 	} else {
 		pthread_kern->uthread_set_returnval(uth, kwe->kwe_psynchretval);
