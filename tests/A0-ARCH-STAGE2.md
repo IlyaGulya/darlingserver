@@ -55,7 +55,20 @@ Notable modeled edges (why the table looks the way it does):
 
 ### 2a gate results
 
-(pending — synth gate with A0_FUZZ_SEEDS=3 running)
+First synth gate (binary fc64f739, A0_FUZZ_SEEDS=3):
+- **ALL 13 gating legs GREEN with ZERO mstate violations** — the shadow model is
+  exact for normal operation, at storm-free load, first try.
+- cvstorm2-throttled (known-limit #114 leg): 4 violations (expected territory).
+- Every fuzz leg: exactly 1 violation then abort (DSERVER_MSTATE_ABORT=1) — the
+  tape dump identified it in one read: **model gap, not server bug**. A fuzzer
+  spurious dispatch of a Parked thread reparks as Parked→Running("dispatch-stale")
+  →Parked("park-committed") WITHOUT re-traversing Parking (suspend() never ran,
+  the park was never un-committed). Fixed by legalizing Running→Parked/Ready as
+  the "no-op-dispatch repark" edges (binary e50a3450). This is precisely the
+  workflow the spec wanted: the tape replaces printf archaeology.
+
+Probe pass (e50a3450, abort OFF to collect ALL violations per run):
+(pending)
 
 ## 2b — flip authority (planned)
 
