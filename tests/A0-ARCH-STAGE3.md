@@ -100,14 +100,14 @@ the syscallReturn/microthreadWorker/microthreadContinuation setcontext detours, 
 ## Debugging chronicle (2026-07-04, the tape earned its keep 3 more times)
 
 Commits on `fix/a0-arch-redesign`: 78d7f7b (implementation), 2d2cd37 (fix 1),
-ccbe517 (fix 2, REVERTED by 9cbde1e), 5020b3f (fix 3), fix 4 (atomic consume).
+ccbe517 (fix 2, REVERTED by 1789d62), 5020b3f (fix 3), e66aeee (fix 4, atomic consume).
 
 - **fix 1** (2d2cd37): first synth gate wedged nestwait -- a nested interrupt_enter
   dispatching ONTO the Parked restored context consumed the cancellation wake as its
   resume permit, then took the stacking branch; the nested sigexc_enter finds the
   wait already finalized and mints no replacement. Gated the consume on
   `!_pendingCall`. Gate went 15/15... but see fix 4.
-- **fix 2** (ccbe517) was WRONG and is REVERTED (9cbde1e): psynch mtx/rw
+- **fix 2** (ccbe517) was WRONG and is REVERTED (1789d62): psynch mtx/rw
   continuations discarding a committed grant on THREAD_INTERRUPTED is DELIBERATE --
   unlike the cv path, the mutex/rw DROP side compensates a KERN_NOT_WAITING signal
   itself (`_kwq_mark_interruped_wakeup` "interrupt post" / the firstfit redrive in
