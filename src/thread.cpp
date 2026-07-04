@@ -1215,7 +1215,15 @@ static bool mstateLegalTransition(DarlingServer::Thread::MicroState from, Darlin
 			// Terminated = died with nothing left to run
 			return to == MS::Running || to == MS::Parked || to == MS::Terminated;
 		case MS::Running:
-			return to == MS::Parking || to == MS::Idle || to == MS::Terminated;
+			// Running->Parked is the no-op-dispatch repark: a stale/permit-less dispatch of a
+			// Parked thread takes ownership (Parked->Running "dispatch-stale"), never touches
+			// the parked context (no pending call, no consumable wake), and doneWorking reparks
+			// it directly -- the park was never un-committed, so suspend()/Parking is not
+			// re-traversed. (First 2a fuzz finding: every fuzz leg tripped exactly this edge.)
+			// Running->Ready is the same repark with a wake that landed DURING the no-op
+			// dispatch window (wake() only records a pending while the state is Running;
+			// doneWorking's tail then resolves the repark to Ready instead of Parked).
+			return to == MS::Parking || to == MS::Parked || to == MS::Ready || to == MS::Idle || to == MS::Terminated;
 		case MS::Parking:
 			// Parked/Ready = doneWorking committed the park; Running = a wake raced the park
 			// (suspend()'s post-getcontext check); Idle = inline-path suspend contract
