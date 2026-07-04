@@ -47,6 +47,7 @@ namespace DarlingServer {
 		friend class Process;
 		friend class Call; // HACK, see call.cpp
 		friend class Registry<Thread>;
+		friend struct ThreadWakeTestAdapter;
 
 	public:
 		enum class RunState {
@@ -129,10 +130,17 @@ namespace DarlingServer {
 		Address _address;
 		mutable std::shared_mutex _rwlock;
 		StackPool::Stack _stack;
-		// These are orthogonal lifecycle dimensions, not one enum state:
-		// _running means a worker currently owns this microthread;
-		// _suspended means it has a resumable context.
-		bool _suspended = false;
+		// A0-ARCH stage 2b: the old `_running`/`_suspended` bools are DERIVED VIEWS of
+		// `_microState` now (see _isRunningLocked/_isSuspendedLocked); the only remaining
+		// orthogonal bit is the impersonation lockout, which used to be smuggled through
+		// `_running = true` on a non-running thread.
+		bool _impersonationPin = false;
+		// "a worker currently owns this microthread" (Running/Parking), or the
+		// impersonation lockout is held -- exactly what the old `_running` flag meant to
+		// its readers (doWork re-run guard, defer/waitUntil* predicates).
+		bool _isRunningLocked() const;
+		// "has a resumable context" (Parking/Parked/Ready) -- the old `_suspended`.
+		bool _isSuspendedLocked() const;
 		// A0-ARCH stage 1: typed wake-token state (all under _rwlock). One armed wait and one
 		// pending wake per kind -- a thread can have at most one XNU wait, one raw queue link
 		// (mutex_link) and one user-suspension park live at a time, and they can NEST (an XNU
@@ -147,6 +155,10 @@ namespace DarlingServer {
 		// Consume one deliverable pending wake (preferring the innermost park kinds) and drop
 		// any stale pendings encountered. Returns true if a wake was consumed. _rwlock held.
 		bool _consumePendingWakeLocked();
+		// The two production suspend() consume windows.  Kept as locked helpers so
+		// deterministic tests exercise the exact implementation, not a model.
+		bool _consumeWakeBeforeSuspendLocked();
+		bool _consumeWakeAfterContextCaptureLocked();
 		// True if some pending wake is currently deliverable. _rwlock held (shared ok).
 		bool _hasDeliverablePendingWakeLocked() const;
 		// A0-ARCH stage 2a: shadow run-state + transition tape (all writes under _rwlock).
@@ -181,7 +193,6 @@ namespace DarlingServer {
 		ucontext_t _resumeContext;
 		dtape_thread_t* _dtapeThread;
 		std::function<void()> _continuationCallback = nullptr;
-		bool _running = false;
 		bool _terminating = false;
 		std::shared_ptr<Call> _activeCall = nullptr;
 		std::shared_ptr<Thread> _impersonating = nullptr;
@@ -433,7 +444,7 @@ namespace DarlingServer {
 		// RPCs inline via doWork() instead of paying a worker-thread wakeup. After an inline
 		// doWork() returns, this reports whether the microthread is still suspended (i.e. the
 		// call blocked and will be resumed on the worker pool) vs ran to completion.
-		// Cheap, lock-protected read of the same _suspended flag doWork() itself consults.
+		// Cheap, lock-protected read of the same suspended view doWork() itself consults.
 		bool isCurrentlySuspended() const;
 
 		/**
