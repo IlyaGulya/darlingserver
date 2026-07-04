@@ -59,6 +59,14 @@ typedef uint64_t (*dtape_hook_thread_arm_wake_f)(void* thread_context, dtape_wak
 typedef void (*dtape_hook_thread_disarm_wake_f)(void* thread_context, dtape_wake_kind_t kind);
 // Deliver a wake for the wait (kind, generation); generation 0 = the currently-armed one.
 typedef void (*dtape_hook_thread_resume_f)(void* thread_context, dtape_wake_kind_t kind, uint64_t generation);
+// A0-ARCH stage 2c: every write of the XNU wait state (TH_WAIT/TH_RUN/TH_UNINT/TH_TERMINATE
+// bits and wait_result) is routed through ONE dtape-side funnel, which reports each named
+// transition here. The server records it on the thread's run-state transition tape; when
+// flags carry DTAPE_XWAIT_VIOLATION it additionally logs an MSTATE VIOLATION, dumps the tape,
+// and aborts under DSERVER_MSTATE_ABORT=1 (same policy as MicroState violations).
+#define DTAPE_XWAIT_VIOLATION 0x1
+#define DTAPE_XWAIT_WROTE_RESULT 0x2
+typedef void (*dtape_hook_thread_xwait_transition_f)(void* thread_context, const char* reason, uint32_t old_state, uint32_t new_state, int32_t wait_result, uint8_t flags);
 typedef void (*dtape_hook_thread_terminate_f)(void* thread_context);
 typedef dtape_thread_t* (*dtape_hook_thread_create_kernel_f)(void);
 typedef void (*dtape_hook_thread_setup_f)(void* thread_context, dtape_thread_continuation_callback_f continuation_callback, void* continuation_context);
@@ -113,6 +121,7 @@ typedef struct dtape_hooks {
 	dtape_hook_thread_resume_f thread_resume;
 	dtape_hook_thread_arm_wake_f thread_arm_wake;
 	dtape_hook_thread_disarm_wake_f thread_disarm_wake;
+	dtape_hook_thread_xwait_transition_f thread_xwait_transition;
 	dtape_hook_thread_terminate_f thread_terminate;
 	dtape_hook_thread_create_kernel_f thread_create_kernel;
 	dtape_hook_thread_setup_f thread_setup;

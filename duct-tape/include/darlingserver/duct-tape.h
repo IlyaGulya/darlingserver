@@ -59,7 +59,15 @@ dtape_semaphore_t* dtape_semaphore_create(dtape_task_t* owning_task, int initial
 void dtape_kqchan_mach_port_destroy(dtape_kqchan_mach_port_t* kqchan);
 void dtape_semaphore_destroy(dtape_semaphore_t* semaphore);
 
-void dtape_thread_entering(dtape_thread_t* thread);
+/**
+ * A0-ARCH stage 2c: dtape_thread_entering() is GONE. Its unconditional "entering => cannot be
+ * waiting" TH_WAIT clobber was the A0 disease (it half-tore committed waits; see the Part 3
+ * history in thread.cpp). A fresh-call dispatch is asserted NOT to be waiting instead: this
+ * recovery helper checks for a stranded TH_WAIT and clears it exactly like entering used to
+ * (returning true so the caller can report the violation). Lock-free read/write, same as the
+ * old entering (callers hold the server-side Thread lock, never the XNU thread_lock).
+ */
+bool dtape_thread_clear_stranded_wait(dtape_thread_t* thread);
 void dtape_thread_exiting(dtape_thread_t* thread);
 void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, uintptr_t dispatch_qaddr);
 
