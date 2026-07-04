@@ -1,7 +1,7 @@
 # A0-ARCH stage 2: one run-state machine per thread (kills the dual-view disease)
 
-Status: **2a + 2b LANDED 2026-07-04** (deployed 47ac175d = new doctor baseline);
-2c in progress. Branch `fix/a0-arch-redesign`.
+Status: **2a + 2b + 2c LANDED 2026-07-04** (deployed 7692d9f6 = new doctor baseline).
+Stage 2 COMPLETE. Branch `fix/a0-arch-redesign`.
 Spec: tests/A0-ARCH-REDESIGN-SPEC.md stage 2. Prior stage: tests/A0-ARCH-STAGE1.md.
 
 Stage 2 is landed as three independently-gated sub-steps:
@@ -137,12 +137,68 @@ repark discriminator LOST the untouched parked context that the old
   with a plain `timeout` that the launcher ignores — replaced by
   job-tmp s2b_perf2.sh: `timeout -k 5`, file redirect only, no in-guest pipes.)
 
-## 2c — XNU side becomes derived (planned)
+## 2c — XNU wait-state writes through one funnel (commit 5cf6081, binary 7692d9f6)
 
-- `TH_WAIT`/`wait_result` writes at thread_mark_wait_locked / thread_unblock /
-  clear_wait_internal / dtape_thread_dying route through named transitions;
-  `dtape_thread_entering` DELETES (the preserveWaitState hack disappears);
-  Part-3 skip-conditions become assertions.
+Recon first, and it shrank the problem decisively: in the COMPILED duct-tape set
+(sched_prim.c / thread_act.c / kern/locks.c are NOT built; src/thread.c holds the
+live copies), **no code outside duct-tape/src/thread.c touches the TH_* state
+bits at all**, TH_RUN and block_hint are write-only diagnostics, and exactly one
+external site writes wait_result (waitq.c's prepost early-out).
+
+- `xnu_wait_state_write(thread, new_state, write_wresult, wresult, reason,
+  violation)` in duct-tape/src/thread.c is THE funnel; all nine write sites route
+  through it as named transitions: `xwait-destroy`, `xwait-sigexc-abort`,
+  `xwait-dying` (its pre-clear/skip-thread_go semantics documented, kept as-is),
+  `xwait-unblock`, `xwait-mark-wait`, `xwait-kthread-birth`,
+  `xwait-start-assert-wait`, `xwait-user-suspension-wait`, and
+  `xwait-prepost-awakened` (helper called from the patched waitq.c site).
+  Birth init in dtape_thread_create stays outside (owning Thread mid-construction).
+- New hook `thread_xwait_transition` -> `Thread::recordXnuWaitTransition`: tape
+  event `StateEvent::XnuWait` (aux8 = new TH_* bits, aux64 = old bits<<32 |
+  wait_result); a violation gets the full MSTATE VIOLATION treatment (error log,
+  tape dump, abort under DSERVER_MSTATE_ABORT=1 -- the existing gate grep catches
+  it with zero gate changes). Modeled violations: thread_unblock on a non-waiting
+  thread; mark-wait double-mark or on a terminating thread (whose full-overwrite
+  would silently erase TH_TERMINATE -- kept, now visible).
+- **`dtape_thread_entering` DELETED** -- its unconditional "entering => cannot be
+  waiting" TH_WAIT clobber was the A0 disease, and doWork's preserveWaitState
+  skip-dance existed only to dodge it. The skip-condition became the assertion the
+  spec asked for: an unambiguous fresh-call dispatch (doWork + doWorkInline +
+  doMachReplyPortInline) asserts the guest thread is NOT waiting;
+  `dtape_thread_clear_stranded_wait` recovery-clears a stranded TH_WAIT exactly
+  like entering used to, but reports it via `_strandedWaitViolationLocked`
+  (loud instead of silent laundering; release builds stay as robust as before).
+- Part-3e re-park loop iterations are taped (`xwait-repark-still-waiting`, both
+  the inline thread_block loop and thread_continuation_callback's).
+- Lock discipline audited per site: the hook takes the Thread rwlock (established
+  order thread_lock -> rwlock, same as the arm/resume hooks these sites already
+  fire); dtape_thread_exiting keeps its TH_RUN clear UN-hooked (doneWorking holds
+  the rwlock there); the two inline dispatch sites tape the assertion themselves
+  under their held lock.
+
+### 2c gate results (all first-try on the first 2c build)
+
+- Synth gate: **ALL 16 gating legs GREEN, ZERO mstate/xwait violations** across
+  the battery -- the funnel's legality claims (unblock-implies-waiting,
+  no-double-mark) hold under fuzz immediately, and the fresh-dispatch stranded-
+  wait assertion never fired. Fuzz survival 4 RED / 6, same count as the 2a/2b
+  baseline, all red causes = catalogued pre-existing classes (s1 legs: UDS
+  reply-stream desync BAD RECEIVE cascade; s2/s3 nestwait: server death at
+  interrupt_enter, the #114 stage-3 family). Storm legs shifted greener
+  (cvstorm2-throttled OK; flood red that run), as they do with timing.
+- Perf A/B: nestwait NO_STORM **3627/3662/3625** jobs/15s + 300x true **1s** --
+  inside the 3609-3692 corridor; the two extra hook calls per wait episode
+  (mark-wait + unblock) are free at RPC granularity.
+- Landing battery quick gate: **19/19 gating GREEN** (boot, nestwait 8/8,
+  forkwait, cvstorm-nostorm 3/3, BOTH storm known-limit legs, brew xz 2/2
+  strict), zero violations anywhere including real brew load.
+  **2c LANDED, deployed 7692d9f6 = new baseline.**
+
+Stage 2 is COMPLETE: one MicroState machine owns the C++ run-state (2a/2b) and
+every XNU wait-state write is a named, taped, legality-checked transition (2c).
+Next: stage 3 interrupt-as-cancellation (kills jumpToResume stack borrowing;
+closes #114 + the EDEADLK self-rwlock face + the remaining fuzz reds;
+acceptance = `A0_STRICT=1 a0-gate full` GREEN).
 
 ## ASAN leg (stage-0 leftover, folded in here)
 
