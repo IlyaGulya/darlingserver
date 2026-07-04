@@ -98,6 +98,12 @@ struct DTapeHooks {
 		DarlingServer::Thread::dumpCurrentThreadStateTape();
 	};
 
+	// A0-ARCH stage 2c: named XNU wait-state transitions (duct-tape's single write funnel)
+	// land on the owning thread's run-state tape; violations get the full MSTATE treatment.
+	static void dtape_hook_thread_xwait_transition(void* thread_context, const char* reason, uint32_t old_state, uint32_t new_state, int32_t wait_result, uint8_t flags) {
+		static_cast<DarlingServer::Thread*>(thread_context)->recordXnuWaitTransition(reason, old_state, new_state, wait_result, flags);
+	};
+
 	static dtape_task_t* dtape_hook_current_task(void) {
 		auto thread = DarlingServer::Thread::currentThread();
 		if (!thread) {
@@ -432,6 +438,7 @@ struct DTapeHooks {
 		.thread_resume = dtape_hook_thread_resume,
 		.thread_arm_wake = dtape_hook_thread_arm_wake,
 		.thread_disarm_wake = dtape_hook_thread_disarm_wake,
+		.thread_xwait_transition = dtape_hook_thread_xwait_transition,
 		.thread_terminate = dtape_hook_thread_terminate,
 		.thread_create_kernel = dtape_hook_thread_create_kernel,
 		.thread_setup = dtape_hook_thread_setup,
