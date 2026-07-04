@@ -1,6 +1,7 @@
 # A0-ARCH stage 2: one run-state machine per thread (kills the dual-view disease)
 
-Status: **IN PROGRESS** (2026-07-04). Branch `fix/a0-arch-redesign`.
+Status: **2a LANDED 2026-07-04** (deployed e50a3450 = new doctor baseline);
+2b/2c in progress. Branch `fix/a0-arch-redesign`.
 Spec: tests/A0-ARCH-REDESIGN-SPEC.md stage 2. Prior stage: tests/A0-ARCH-STAGE1.md.
 
 Stage 2 is landed as three independently-gated sub-steps:
@@ -119,7 +120,15 @@ Acceptance quick gate (e50a3450, A0_FUZZ_SEEDS=3, fuzz legs abort-on-violation):
   perf#2b inline-dispatch path even with the __sanitizer fiber annotations —
   locals of the interrupted frame read back as garbage. Instrumentation
   incompatibility, not a server bug; FSUAR off boots and runs green.
-- Reduced synth battery under ASAN: see results below.
+- Reduced synth battery under ASAN (A0_NEST_RUNS=2 A0_CV_RUNS=1 A0_FUZZ_SEEDS=2):
+  **ALL 9 gating legs GREEN — no memory errors on the healthy paths.**
+- One ASAN report on a red fuzz leg (fuzz-s1-nestwait): stack-buffer-underflow
+  WRITE in `shared_from_this()` inside doMachReplyPortInline on the MAIN loop —
+  a function with no fiber switches of its own. Most plausibly the main stack's
+  ASAN shadow left poisoned by earlier fiber switches (same instrumentation
+  family as the FSUAR boot crash), NOT conclusively a real bug; a fiber-
+  annotation audit would settle it, but stage 3 removes the stack borrowing
+  entirely, which is the real fix. Catalogued, not chased.
 
 Perf A/B (e50a3450 vs 886d13af/stage-1 numbers): nestwait NO_STORM
 3642/3614/3692 jobs/15s (mean ~3649 vs stage-1 ~3635 / baseline ~3679, within
