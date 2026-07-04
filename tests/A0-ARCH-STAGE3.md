@@ -1,6 +1,10 @@
 # A0-ARCH stage 3: interrupt as cancellation (kills #114 stack borrowing)
 
-Status: DESIGN (2026-07-04, stage 2 complete at 7692d9f6). Branch `fix/a0-arch-redesign`.
+Status: **IMPLEMENTED + fixes 1/3/4 (fix 2 reverted), 2026-07-04. Binary d81b5cf1
+deployed (intentional drift; baseline still 7692d9f6 until landing).
+cvstorm2-throttled repro: 6/6 GREEN with the storm at full rate (~14.8k hits/20s)
+-- the #114 acceptance grain is solved. REMAINING: the gate ladder (see HANDOFF
+at the bottom).** Branch `fix/a0-arch-redesign`.
 Spec: tests/A0-ARCH-REDESIGN-SPEC.md stage 3. Prior: tests/A0-ARCH-STAGE2.md.
 Acceptance: `A0_STRICT=1 tests/a0-repro/a0-gate.sh full` GREEN (cvstorm2 throttled AND
 flood legs stop crashing) = the #114 close-out criterion.
@@ -92,3 +96,75 @@ the syscallReturn/microthreadWorker/microthreadContinuation setcontext detours, 
 3. call.cpp: InterruptEnter::processCall deferred reply; stash path in pushCallReply.
 4. Gate ladder: build -> boot smoke -> synth+fuzz (abort-on-violation) -> probe ->
    quick + perf -> then the acceptance run `A0_STRICT=1 full` (storm legs gating).
+
+## Debugging chronicle (2026-07-04, the tape earned its keep 3 more times)
+
+Commits on `fix/a0-arch-redesign`: 78d7f7b (implementation), 2d2cd37 (fix 1),
+ccbe517 (fix 2, REVERTED by 9cbde1e), 5020b3f (fix 3), fix 4 (atomic consume).
+
+- **fix 1** (2d2cd37): first synth gate wedged nestwait -- a nested interrupt_enter
+  dispatching ONTO the Parked restored context consumed the cancellation wake as its
+  resume permit, then took the stacking branch; the nested sigexc_enter finds the
+  wait already finalized and mints no replacement. Gated the consume on
+  `!_pendingCall`. Gate went 15/15... but see fix 4.
+- **fix 2** (ccbe517) was WRONG and is REVERTED (9cbde1e): psynch mtx/rw
+  continuations discarding a committed grant on THREAD_INTERRUPTED is DELIBERATE --
+  unlike the cv path, the mutex/rw DROP side compensates a KERN_NOT_WAITING signal
+  itself (`_kwq_mark_interruped_wakeup` "interrupt post" / the firstfit redrive in
+  `_psynch_mutexdrop_internal`). Honoring the retval waiter-side DOUBLE-GRANTS and
+  desyncs the mutex seq protocol. Keep this asymmetry in mind: cv = waiter-side
+  carve-out, mutex/rw = signaller-side compensation.
+- **fix 3** (5020b3f): the timerfd read handler left the just-fired deadline in
+  `_currentTimerDeadline`; every non-override `timer_arm` until dtape_timer_fired's
+  re-arm compared against the PAST and was skipped -- a 1ms wait timer armed in the
+  window never fired until an unrelated event re-armed the fd (the stormer's usleep
+  latching to the 5s ring-duplex fail-closed metronome, storm at ~2/s instead of
+  ~750/s). Pre-existing hole; reset the deadline on read. Also added
+  TIMER-ARM/-SKIP/-FIRED rpctrace lines (DARLING_SERVER_AUXLOG=1).
+- **fix 4**: the REAL form of the fix-1 class. The consume lived in doWork's FIRST
+  locked section; the resume-vs-stack branch lives in the SECOND; an interrupt_enter
+  landing between the unlocked windows ate the permit and stacked anyway -- the
+  restored context reparked forever HOLDING A COMMITTED GRANT (tape verbatim:
+  wake-consumed gen 844 -> interrupt-push -> sigexc-abort(NOT_WAITING) ->
+  repark-interrupt-cancel -> dispatch-stale -> repark-noop-dispatch; open drained
+  frame, armed=[0...]). The consume now happens in the second section immediately
+  before the branch: consume iff resume. Section-1 transition reasons are now
+  "dispatch-fresh"/"dispatch-onto-parked" (resume fact = the wake-consumed event).
+
+### Debug-harness pitfalls burned into this chronicle (do not repeat)
+
+- `pgrep -x darlingserver | head -1` attaches gdb to a STALE server from the
+  previous run; use `--newest` AND verify the walked registry contains the workload
+  nstids. Hours were lost reading coherent-looking tapes of leftover container
+  daemons (nstid 1/3/6/7 = launchd-era threads, NOT the workload).
+- cvstorm2 self-exits at stall>=6 and the gdb attach freezes the server for
+  seconds: trigger the walk at stall=2, or the workload teardown destroys the
+  interesting threads before the walk reads them.
+- The auxlog (dserver-auxlog.txt) is O_APPEND across boots with CLOCK_MONOTONIC
+  stamps: rm it BEFORE the run you intend to analyze, or cross-run garbage will
+  tell convincing lies.
+- The walker (job-tmp thread_state_walker.py) now: uses `_map`, prints the top
+  InterruptContext frame {armed/owed/icall/ecall/sstk}, decodes StateEvent::XnuWait,
+  dumps 32 tape entries. REG_OFF must be re-checked per binary
+  (`nm darlingserver | grep threadRegistryEvE8registry`; 0x187a70 for the whole
+  d81b5cf1 lineage). runner_state.py prints kernelAsync queue depth/available.
+
+## HANDOFF: remaining ladder to land stage 3 (task #116)
+
+Deployed binary d81b5cf1 (= fixes 1+3+4, fix-2 reverted) passed: boot smoke,
+echo smoke, cvstorm2-throttled 6/6 GREEN at full storm rate. NOT yet run on it:
+
+1. `A0_FUZZ_SEEDS=3 ./a0-gate.sh synth` -- expect 16/16 gating green; compare fuzz
+   survival vs the 4-red baseline (stage 3 should IMPROVE it: the interrupt crashes
+   are gone; residual reds should be UDS desync only).
+2. Perf A/B (job-tmp s2c_perf.sh pattern): nestwait NO_STORM x3 + 300x true;
+   corridor 3609-3692 / 1-2s. Note fix 4 moved the consume but adds no locking.
+3. `./a0-gate.sh quick` (brew xz strict) -- landing battery.
+4. **Acceptance: `A0_STRICT=1 ./a0-gate.sh full` GREEN** -- storm legs gating.
+   That closes #114. If cvstorm2-flood still reds: it is a HANG now, not a SEGV;
+   same walker treatment (the crash class is dead -- zero interrupt SEGVs seen
+   across every stage-3 run).
+5. Land: bump deploy-baseline.md5 to the landing binary, update this doc + memory
+   (dar-a0arch-stage1-typed-wake-tokens.md) + task #116, `west dw handoff`, close
+   #114 with a pointer here.
+6. Then stage 4 measurement (single-runner go/no-go writeup) or stop per spec.
