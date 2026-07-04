@@ -591,21 +591,16 @@ void DarlingServer::Thread::doWork() {
 	// pre-dispatch view (the state field is authoritative now; there is no lingering
 	// _suspended residue to read). Parking is impossible here (the running guard above).
 	preDispatchParked = _isSuspendedLocked();
-	// A0-ARCH stage 3: only consume a pending wake when this dispatch can actually RESUME
-	// the parked context (no pending call in the way). With interrupt-as-cancellation the
-	// thread is genuinely Parked while an interrupt window is open, so a storm's nested
-	// interrupt_enter can dispatch ONTO the parked context -- that dispatch takes the
-	// interrupt-stacking branch, and consuming the wake here would EAT the cancellation
-	// resume permit (sigexc_enter of the nested enter finds the wait already finalized and
-	// fires no replacement -- captured live as the nestwait storm wedge, jobs frozen while
-	// storm_hits grow). The unconsumed wake survives in its pending slot and dispatches the
-	// restored context after the nested enter completes.
-	if (preDispatchParked && !_pendingCall && _consumePendingWakeLocked()) {
-		// This execution was scheduled by a matching typed wake; consume it.
-		hadResumePermit = true;
-	}
+	// A0-ARCH stage 3 (fix 4): the wake-consume moved DOWN into the second locked section,
+	// atomically with the resume-vs-stack branch. Consuming here (the old shape, partially
+	// gated by fix 1) left a hole: between this section's unlock and the second lock an
+	// interrupt_enter can become the pending call, so the dispatch that consumed the permit
+	// takes the interrupt-STACKING branch instead of resuming -- the permit is eaten, the
+	// nested cancel finds the wait already finalized (fires no replacement wake), and the
+	// restored context reparks forever holding a committed grant (captured verbatim on the
+	// tape: wake-consumed gen N -> interrupt-push -> repark-interrupt-cancel -> wedge).
 	_mstateTransitionLocked(MicroState::Running,
-		hadResumePermit ? "dispatch-resume" : (preDispatchParked ? "dispatch-stale" : "dispatch-fresh"));
+		preDispatchParked ? "dispatch-onto-parked" : "dispatch-fresh");
 	currentThreadVar = shared_from_this();
 	// A0-ARCH stage 2c: dtape_thread_entering() is GONE, and with it the whole
 	// preserveWaitState dance that existed only to keep its unconditional TH_WAIT clobber away
@@ -674,6 +669,14 @@ void DarlingServer::Thread::doWork() {
 		if (_continuationCallback && _pendingCall) {
 			// we can only have one of the two
 			throw std::runtime_error("Thread has both a pending call and a pending continuation");
+		}
+
+		// A0-ARCH stage 3 (fix 4): consume the resume permit HERE, under the same lock as the
+		// branch decision -- a dispatch consumes a wake if and only if it actually resumes the
+		// parked context. An interrupt_enter that became pending in the meantime takes the
+		// stacking branch above and the wake SURVIVES for the post-restore dispatch.
+		if (preDispatchParked && !_pendingCall && _consumePendingWakeLocked()) {
+			hadResumePermit = true;
 		}
 
 		// perf#25a A0 (Part 3c): resume the suspended context only for a dispatch that carried a
