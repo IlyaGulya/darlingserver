@@ -67,8 +67,23 @@ First synth gate (binary fc64f739, A0_FUZZ_SEEDS=3):
   the "no-op-dispatch repark" edges (binary e50a3450). This is precisely the
   workflow the spec wanted: the tape replaces printf archaeology.
 
-Probe pass (e50a3450, abort OFF to collect ALL violations per run):
-(pending)
+Probe pass (e50a3450, abort OFF to collect ALL violations per run --
+fuzz-nestwait s1/s2, fuzz-cvstorm s1, cvstorm2-throttled):
+- **ZERO mstate violations on all four legs.** The shadow model now holds under
+  fuzz AND storm; every remaining red is a PRE-EXISTING class, now cleanly
+  separable from model gaps:
+  - fuzz-nestwait s2: the documented UDS reply-stream desync cascade (guest
+    aborts on BAD RECEIVE; server survives) — post-stage-2 transport fix.
+  - cvstorm2-throttled: silent server SEGV, the #114 shape — stage 3.
+  - fuzz-nestwait s1: **new face of the stage-3 family**: server death via
+    `std::terminate` on `std::system_error EDEADLK` ("Resource deadlock
+    avoided") thrown from callFromMessage — a fiber re-locking the `_rwlock`
+    its own thread already holds (fiber suspended/migrated while the OS thread
+    still held the lock, or a re-entrant call path). Same single-owner-violation
+    disease jumpToResume has; the interrupt-as-cancellation redesign owns it.
+    (SIGSEGV deaths do NOT trigger the panic-funnel tape dump — that only fires
+    on duct-tape panic(); wiring the dump into a fatal-signal handler is a
+    possible stage-3 triage improvement.)
 
 ## 2b — flip authority (planned)
 
