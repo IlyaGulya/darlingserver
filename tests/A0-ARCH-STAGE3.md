@@ -39,6 +39,15 @@ stage-3 run), the throttled grain is 12/12 solid, and the residual flood
 slow-wedge is pre-existing (present identically on 2c). #114's SEGV is closed;
 the flood throughput-starvation HANG is spun out as a follow-up.
 
+### Landing gate results on d81b5cf1 (2026-07-04)
+
+- **synth gate** (A0_FUZZ_SEEDS=3 DSERVER_MSTATE_ABORT=1): **PASS=16 FAIL=0 ALL
+  GREEN**, ZERO mstate/xwait violations, ZERO SEGV/crash markers. Both #114
+  known-limit legs GREEN this run (flood landed on the OK side of its coin-flip).
+  Fuzz reds all the pre-existing UDS-desync class ("pre-redesign hole -- not
+  gating"); no new failure class, no interrupt crashes.
+- **quick/brew gate**: (in progress -- final landing check, brew xz strict).
+
 Acceptance (original): `A0_STRICT=1 tests/a0-repro/a0-gate.sh full` GREEN. NOTE:
 the flood-KNOWNLIMIT leg will still coin-flip RED under A0_STRICT=1 as a HANG (not
 a crash) -- that is the pre-existing starvation bug, not a stage-3 failure. Land
