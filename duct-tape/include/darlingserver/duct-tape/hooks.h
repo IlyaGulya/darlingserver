@@ -75,6 +75,7 @@ typedef void (*dtape_hook_current_thread_interrupt_disable_f)(void);
 typedef void (*dtape_hook_current_thread_interrupt_enable_f)(void);
 typedef void (*dtape_hook_current_thread_syscall_return_f)(int return_code);
 typedef void (*dtape_hook_current_thread_set_bsd_retval_f)(uint32_t retval);
+typedef void (*dtape_hook_current_thread_dump_state_tape_f)(void);
 
 typedef bool (*dtape_hook_task_read_memory_f)(void* task_context, uintptr_t remote_address, void* local_buffer, size_t length);
 typedef bool (*dtape_hook_task_write_memory_f)(void* task_context, uintptr_t remote_address, const void* local_buffer, size_t length);
@@ -128,6 +129,9 @@ typedef struct dtape_hooks {
 	dtape_hook_current_thread_interrupt_enable_f current_thread_interrupt_enable;
 	dtape_hook_current_thread_syscall_return_f current_thread_syscall_return;
 	dtape_hook_current_thread_set_bsd_retval_f current_thread_set_bsd_retval;
+	// A0-ARCH stage 2a: best-effort dump of the current microthread's run-state transition
+	// tape from the duct-tape panic funnel (no locks; the process is dying)
+	dtape_hook_current_thread_dump_state_tape_f current_thread_dump_state_tape;
 
 	dtape_hook_task_read_memory_f task_read_memory;
 	dtape_hook_task_write_memory_f task_write_memory;
