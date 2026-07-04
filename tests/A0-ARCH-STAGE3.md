@@ -64,6 +64,17 @@ the flood throughput-starvation HANG is spun out as a follow-up.
   known-limit legs GREEN this run (flood landed on the OK side of its coin-flip).
   Fuzz reds all the pre-existing UDS-desync class ("pre-redesign hole -- not
   gating"); no new failure class, no interrupt crashes.
+- **perf A/B** (added post-landing 2026-07-04 -- I had skipped it before the baseline
+  bump; the spec requires perf A/B per stage since the transition/dispatch path is
+  hot). job-tmp s3_perf_ab.sh, nestwait -DNO_STORM x3 + 300x true, d81b5cf1 vs 2c
+  baseline 7692d9f6 (robust busy-file swap):
+    2c 7692d9f6: 3640/3565/3613 jobs/15s (mean 3606), 300x true 2s
+    stage3 d81b5cf1: 3594/3586/3589 jobs/15s (mean 3590), 300x true 1s
+  **NO REGRESSION**: -0.4% mean, well inside 2c's own +/-2% run spread (3565-3640);
+  stage-3 runs are tighter. Confirms fix 4 (moved the consume, added no locking) is
+  perf-neutral. NOTE for the record: the baseline was bumped BEFORE this A/B ran --
+  the check came out clean, but the ordering was wrong; run perf A/B before the bump
+  next time.
 - **quick/brew gate** (1st run): PASS=16 FAIL=2 -- brew-xz 2/2 GREEN, but two
   gating nestwait legs (nestwait-off-4, nestwait-on-3) RED with
   `semaphore_timedwait failed (internally): -111`. NOT a hang or crash: both legs
