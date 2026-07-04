@@ -149,6 +149,36 @@ ccbe517 (fix 2, REVERTED by 1789d62), 5020b3f (fix 3), e66aeee (fix 4, atomic co
   (`nm darlingserver | grep threadRegistryEvE8registry`; 0x187a70 for the whole
   d81b5cf1 lineage). runner_state.py prints kernelAsync queue depth/available.
 
+### Instrument validation + two more corrections (2026-07-04, second pass)
+
+- **Validated the walker against a KNOWN-GOOD boot before trusting it on a wedge**
+  (job-tmp s3_walker_selftest.sh): a clean idle boot walks 18 threads, 0 errors,
+  real mstate/frames/tapes/armed-pend. Do this first each session -- if the
+  instrument can't read a known signal, no wedge walk is trustworthy. All the
+  walker's struct reads go through gdb's type system (self-correcting to the live
+  layout), so the only per-binary knob is REG_OFF.
+- **`dtape=opaque` is PERMANENT, not a regression**: `struct dtape_thread` has zero
+  structure_type DWARF in the build (duct-tape TU emits typedefs/functions only).
+  So the walker cannot decode xnu.state / wait_result / xnu_wait_gen / mutex_link
+  from the C++ `_dtapeThread` pointer -- ever. Do NOT sink time into hand-offset
+  math to recover it (variable-layout members = a convincing-lie generator). The
+  C++ side (mstate + frames + tape + armed/pend) is sufficient to classify these
+  wedges -- the fix-4 wedge was diagnosed entirely from the tape.
+- **Tape/auxlog timestamps are MICROSECONDS; do the division.** A 101856-unit gap
+  is 0.102s, not 102s. An off-by-1000 misread turns a healthy 100ms idle window
+  into a phantom 100s stall. Every "long stall" must be `/1e6` before you believe it.
+- **HANG-detection must let the run FINISH.** s3_cap_v2.sh triggers a walk at
+  stall=2 and kills the guest -- but in the FLOOD grain stall=2 is TRANSIENT
+  (recovers to stall=0 next second; it is slow, not wedged). Walking + killing at
+  stall=2 destroys the RESULT line and walks a healthy-but-slow server. To get an
+  honest OK/HANG verdict, run WITHOUT the walk (job-tmp s3_flood_verdict.sh, runs
+  to completion); only walk when stall actually climbs to STALL_LIMIT (5). The two
+  #114 grains are separate gate legs: `cvstorm2-throttled` (-DNCONS=1
+  -DSTORM_THROTTLE_US=1000) = **12/12 OK on d81b5cf1, solid**; `cvstorm2-flood`
+  (-DNCONS=1, no throttle = pathological storm) = under verdict test. Both are
+  run_knownlimit -> non-gating by default, HARD-GATING under A0_STRICT=1 (that is
+  the #114 close-out criterion).
+
 ## HANDOFF: remaining ladder to land stage 3 (task #116)
 
 Deployed binary d81b5cf1 (= fixes 1+3+4, fix-2 reverted) passed: boot smoke,
