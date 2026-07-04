@@ -213,11 +213,11 @@ namespace DarlingServer {
 		std::condition_variable_any _runningCondvar;
 		DeferralState _deferralState = DeferralState::NotDeferred;
 		uint32_t _bsdReturnValue = 0;
-		bool _interruptedForSignal = false;
-		std::function<void()> _interruptedContinuation = nullptr;
-		ucontext_t _syscallReturnHereDuringInterrupt;
-		bool _didSyscallReturnDuringInterrupt = false;
-		bool _handlingInterruptedCall = false;
+		// A0-ARCH stage 3: the interrupt machinery no longer borrows stacks or detours
+		// syscall returns. The old _interruptedForSignal/_interruptedContinuation/
+		// _syscallReturnHereDuringInterrupt/_didSyscallReturnDuringInterrupt/
+		// _handlingInterruptedCall members are gone -- everything an open interrupt window
+		// needs lives in its InterruptContext frame below.
 		dtape_semaphore_t* _s2cInterruptEnterSemaphore = nullptr;
 		dtape_semaphore_t* _s2cInterruptExitSemaphore = nullptr;
 		bool _deferReplyForS2C = false;
@@ -238,13 +238,24 @@ namespace DarlingServer {
 			std::optional<Message> savedReply = std::nullopt;
 			std::shared_ptr<Call> interruptedCall = nullptr;
 			StackPool::Stack savedStack;
-			// A0-ARCH stage 1b: the interrupted context's ucontext, captured at interrupt
-			// stacking time. _resumeContext is a SINGLE per-thread slot: if the interrupt
-			// fiber itself suspends mid-flight (contended thread_lock in sigexc_enter, a
-			// blocking interrupted continuation), its own park OVERWRITES _resumeContext and
-			// the later jumpToResume would setcontext into a stale/garbage context (the #114
-			// SEGV shape, fuzzer-reproducible). jumpToResume must restore THIS copy.
+			// A0-ARCH stage 1b (retained by stage 3 as the PARKED copy, never jumped into):
+			// the interrupted context's ucontext, captured at interrupt stacking time.
+			// _resumeContext is a SINGLE per-thread slot; the frame keeps the interrupted
+			// copy safe while the interrupt_enter fiber runs, and doneWorking moves it BACK
+			// into the slot once the enter fiber completes (repark-interrupt-cancel).
 			ucontext_t savedResumeContext;
+			// the interrupted continuation, if the interrupted park was a continuation park
+			// (used to live in the per-thread _interruptedContinuation slot, which nesting
+			// could clobber)
+			std::function<void()> savedContinuation = nullptr;
+			// A0-ARCH stage 3: interrupt-as-cancellation bookkeeping. cancellationArmed means
+			// the enter processCall ran and doneWorking still owes the frame's saved context a
+			// restore+repark; replyOwed means interrupt_enter's reply is deferred until the
+			// interrupted call's reply lands in savedReply (the stash site sends it then);
+			// enterCall holds the InterruptEnter call for that deferred reply.
+			bool cancellationArmed = false;
+			bool replyOwed = false;
+			std::shared_ptr<Call> enterCall = nullptr;
 			int signal = 0;
 		};
 		std::stack<InterruptContext> _interrupts;
@@ -360,13 +371,15 @@ namespace DarlingServer {
 
 		void _deactivateCallLocked(std::shared_ptr<Call> expectedCall);
 
-		[[noreturn]]
-		void jumpToResume(ucontext_t* context, void* stack, size_t stackSize);
-
 		void _dispose();
 		void _scheduleRelease();
 
-		static void _handleInterruptEnterForCurrentThread();
+		// A0-ARCH stage 3: interrupt-as-cancellation. Aborts the interrupted wait (sigexc_enter)
+		// and ARMS the top interrupt frame instead of resuming the interrupted context on a
+		// borrowed stack; the cancelled call resumes through the normal dispatch path. Returns
+		// true when interrupt_enter's reply should be sent immediately (nothing in-flight to
+		// cancel); false when the reply is owed at reply-stash time (frame.replyOwed).
+		static bool _handleInterruptEnterForCurrentThread();
 
 		static StackPool stackPool;
 

@@ -353,17 +353,25 @@ void DarlingServer::Thread::makePendingCallActive() {
 };
 
 void DarlingServer::Thread::_deactivateCallLocked(std::shared_ptr<Call> expectedCall) {
-	// A0-ARCH stage 1c: under an RPC-stream desync a stray interrupt_exit can pop
-	// _interrupts while an interrupt is notionally in flight; top() on an empty stack is UB
-	// (captured as jumpToResume(context=0x2) SIGSEGV). Fall back to the plain slot loudly.
-	bool viaInterrupt = _interruptedForSignal && !_interrupts.empty();
-	if (_interruptedForSignal && _interrupts.empty()) {
-		threadLog.error() << _tid << "(" << _nstid << "): _deactivateCallLocked: interrupted-for-signal with EMPTY interrupt stack (desync); using active call slot" << threadLog.endLog;
+	// A0-ARCH stage 3: a call can live in one of three slots -- the plain active slot, or
+	// (with an interrupt window open) the frame's interruptedCall / deferred-reply enterCall.
+	// Deactivate whichever slot holds it. (The old version keyed on the transient
+	// _interruptedForSignal window, which no longer exists.)
+	if (_activeCall.get() == expectedCall.get()) {
+		_activeCall = nullptr;
+		return;
 	}
-	if ((viaInterrupt ? _interrupts.top().interruptedCall : _activeCall).get() != expectedCall.get()) {
-		throw std::runtime_error("Upon deactivating the active call found active/interrupted call != expected call");
+	if (!_interrupts.empty()) {
+		if (_interrupts.top().interruptedCall.get() == expectedCall.get()) {
+			_interrupts.top().interruptedCall = nullptr;
+			return;
+		}
+		if (_interrupts.top().enterCall.get() == expectedCall.get()) {
+			_interrupts.top().enterCall = nullptr;
+			return;
+		}
 	}
-	(viaInterrupt ? _interrupts.top().interruptedCall : _activeCall) = nullptr;
+	throw std::runtime_error("Upon deactivating the active call found active/interrupted call != expected call");
 };
 
 void DarlingServer::Thread::deactivateCall(std::shared_ptr<Call> expectedCall) {
@@ -484,20 +492,13 @@ void DarlingServer::Thread::microthreadWorker() {
 		}
 	}
 
-	if (currentThreadVar->_handlingInterruptedCall) {
-		currentThreadVar->_didSyscallReturnDuringInterrupt = true;
+	// A0-ARCH stage 3: no more _syscallReturnHereDuringInterrupt detour -- every fiber exits
+	// through its own doneWorking, on its own stack, exactly once.
 #if DSERVER_ASAN
-		__sanitizer_start_switch_fiber(NULL, currentThreadVar->_stack.base, currentThreadVar->_stack.size);
+	// we're exiting normally, so we might not re-enter this microthread; tell ASAN to drop the fake stack
+	__sanitizer_start_switch_fiber(NULL, asanOldStackBottom, asanOldStackSize);
 #endif
-		setcontext(&currentThreadVar->_syscallReturnHereDuringInterrupt);
-	} else {
-#if DSERVER_ASAN
-		// we're exiting normally, so we might not re-enter this microthread; tell ASAN to drop the fake stack
-		__sanitizer_start_switch_fiber(NULL, asanOldStackBottom, asanOldStackSize);
-#endif
-
-		setcontext(&backToThreadTopContext);
-	}
+	setcontext(&backToThreadTopContext);
 	__builtin_unreachable();
 };
 
@@ -515,19 +516,11 @@ void DarlingServer::Thread::microthreadContinuation() {
 		currentContinuation = nullptr;
 	}
 
-	if (currentThreadVar->_handlingInterruptedCall) {
-		currentThreadVar->_didSyscallReturnDuringInterrupt = true;
 #if DSERVER_ASAN
-		__sanitizer_start_switch_fiber(NULL, currentThreadVar->_stack.base, currentThreadVar->_stack.size);
+	// see microthreadWorker()
+	__sanitizer_start_switch_fiber(NULL, asanOldStackBottom, asanOldStackSize);
 #endif
-		setcontext(&currentThreadVar->_syscallReturnHereDuringInterrupt);
-	} else {
-#if DSERVER_ASAN
-		// see microthreadWorker()
-		__sanitizer_start_switch_fiber(NULL, asanOldStackBottom, asanOldStackSize);
-#endif
-		setcontext(&backToThreadTopContext);
-	}
+	setcontext(&backToThreadTopContext);
 	__builtin_unreachable();
 };
 
@@ -655,14 +648,14 @@ void DarlingServer::Thread::doWork() {
 		_rwlock.lock();
 
 		if (!_pendingCallOverride && _pendingCall && _pendingCall->number() == Call::Number::InterruptEnter) {
+			// A0-ARCH stage 3: the frame is the PARKING SPOT for the interrupted context while
+			// the enter fiber runs -- nothing ever jumps into it from another stack anymore;
+			// doneWorking moves it back into the live slots once the enter fiber completes.
 			_interrupts.emplace();
 			_interrupts.top().savedStack = _stack;
-			// A0-ARCH stage 1b: capture the interrupted context's ucontext WITH its stack.
-			// _resumeContext is a single slot; if the interrupt fiber suspends mid-flight it
-			// overwrites it, and jumpToResume would resume a stale context (#114 SEGV shape).
 			_interrupts.top().savedResumeContext = _resumeContext;
 			_stack = StackPool::Stack();
-			_interruptedContinuation = _continuationCallback;
+			_interrupts.top().savedContinuation = _continuationCallback;
 			_continuationCallback = nullptr;
 			_interrupts.top().interruptedCall = _activeCall;
 			_activeCall = nullptr;
@@ -749,17 +742,42 @@ void DarlingServer::Thread::doWork() {
 doneWorking:
 	// we must be holding `_rwlock` when we get here
 	if (_microState == MicroState::Running || _microState == MicroState::Parking) {
-		// this stint actually ran the microthread (vs. a goto from the guards above).
-		// Repark when the park was committed THIS stint (Parking) or when a no-op
+		// A0-ARCH stage 3: if this completed stint was an interrupt_enter whose processCall
+		// armed a cancellation, the frame's saved (interrupted) context now moves BACK into
+		// the live slots and the thread REPARKS with it -- the machine stays honest (the
+		// thread genuinely has a resumable context again), and the pending Xnu wake that
+		// sigexc_enter fired makes it Ready -> dispatched normally on its own fiber. The
+		// enter fiber's own stack was already freed at return-to-top (its own completion,
+		// exactly once); the interruptedCall returns to the active slot for the normal
+		// syscall-return/deactivation flow. Only a RUNNING (completed) stint restores: a
+		// Parking stint means the enter fiber itself is just suspending mid-flight.
+		bool restoredInterrupted = false;
+		if (_microState == MicroState::Running && !_interrupts.empty() && _interrupts.top().cancellationArmed) {
+			auto& frame = _interrupts.top();
+			frame.cancellationArmed = false;
+			// the enter call's deferred reply (if owed) lives on in frame.enterCall; the
+			// active slot goes back to the interrupted call (null for context-only frames)
+			_activeCall = frame.interruptedCall;
+			_stack = frame.savedStack;
+			frame.savedStack = StackPool::Stack();
+			_resumeContext = frame.savedResumeContext;
+			_continuationCallback = frame.savedContinuation;
+			frame.savedContinuation = nullptr;
+			restoredInterrupted = _stack.isValid() || _continuationCallback;
+			_mstateEventLocked(StateEvent::Note, "interrupt-cancel-restored", 0, _interrupts.size());
+		}
+		// Repark when the park was committed THIS stint (Parking), when a no-op
 		// dispatch left a previously-parked context untouched (parkedContextIntact --
 		// the old `_suspended` flag carried this implicitly; the state field must not
-		// lose it or the next wake drops as "no-park" and the thread wedges).
+		// lose it or the next wake drops as "no-park" and the thread wedges), or when a
+		// cancelled interrupted context was just restored (restoredInterrupted).
 		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
-		if (_microState == MicroState::Parking || parkedContextIntact) {
+		if (_microState == MicroState::Parking || parkedContextIntact || restoredInterrupted) {
 			_mstateTransitionLocked(
 				_hasDeliverablePendingWakeLocked() ? MicroState::Ready : MicroState::Parked,
-				_microState == MicroState::Parking ? "park-committed" : "repark-noop-dispatch");
+				_microState == MicroState::Parking ? "park-committed"
+					: (restoredInterrupted ? "repark-interrupt-cancel" : "repark-noop-dispatch"));
 		} else {
 			_mstateTransitionLocked(MicroState::Idle, "done");
 		}
@@ -1601,8 +1619,11 @@ void DarlingServer::Thread::syscallReturn(int resultCode) {
 	}
 
 	{
-		// A0-ARCH stage 1c: guard the empty-interrupt-stack desync case (see _deactivateCallLocked)
-		auto call = (currentThreadVar->_interruptedForSignal && !currentThreadVar->_interrupts.empty()) ? currentThreadVar->_interrupts.top().interruptedCall : currentThreadVar->_activeCall;
+		// A0-ARCH stage 3: a cancelled interrupted call runs here via the NORMAL dispatch
+		// path, with itself restored as the active call -- no special interrupt-slot lookup,
+		// no setcontext detour. Its reply lands in pushCallReply, which stashes it on the
+		// open interrupt frame and sends the owed interrupt_enter reply.
+		auto call = currentThreadVar->_activeCall;
 		if (!call || !call->isXNUTrap()) {
 			throw std::runtime_error("Attempt to return from syscall on thread with no active syscall");
 		}
@@ -1611,17 +1632,6 @@ void DarlingServer::Thread::syscallReturn(int resultCode) {
 		} else {
 			call->sendBasicReply(resultCode);
 		}
-	}
-
-	if (currentThreadVar->_interruptedForSignal) {
-		currentThreadVar->_didSyscallReturnDuringInterrupt = true;
-#if DSERVER_ASAN
-		if (currentThreadVar->_handlingInterruptedCall) {
-			__sanitizer_start_switch_fiber(nullptr, currentThreadVar->_stack.base, currentThreadVar->_stack.size);
-		}
-#endif
-		setcontext(&currentThreadVar->_syscallReturnHereDuringInterrupt);
-		__builtin_unreachable();
 	}
 
 	// jump back to the top of the thread
@@ -2740,7 +2750,17 @@ bool DarlingServer::Thread::_publishReplyToRingLocked(Message& reply) {
 #endif
 
 void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Message&& reply) {
+	std::shared_ptr<Call> owedEnterReply = nullptr;
+	{
 	std::unique_lock lock(_rwlock);
+
+	// A0-ARCH stage 3: a reply from the interrupted call of an OPEN interrupt frame stashes
+	// on the frame (the guest flushes it at interrupt_exit) -- keyed on the durable frame
+	// fact, not the old transient _interruptedForSignal window, because the cancelled call
+	// now replies through the normal dispatch path AFTER interrupt_enter's processCall has
+	// completed. Computed BEFORE deactivation (which nulls the frame slot).
+	bool stashOnInterruptFrame = expectedCall && !_interrupts.empty()
+		&& _interrupts.top().interruptedCall.get() == expectedCall.get();
 
 	if (expectedCall) {
 		_deactivateCallLocked(expectedCall);
@@ -2752,7 +2772,7 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 	// produces any REPLY-* line, names the stuck call + drop site. (call number from expectedCall.)
 	{
 		unsigned callnum = expectedCall ? (unsigned)expectedCall->number() : 0u;
-		const char* disp = _interruptedForSignal ? "STASH-SAVED[interrupt]"
+		const char* disp = stashOnInterruptFrame ? "STASH-SAVED[interrupt]"
 			: _deferReplyForS2C ? "STASH-DEFERRED[s2c]"
 			: _dead ? "DROP-DEAD"
 			: "SEND";
@@ -2760,24 +2780,21 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 			id(), (long long)nsid(), callnum, disp);
 	}
 
-	if (_interruptedForSignal && !_interrupts.empty()) {
+	if (stashOnInterruptFrame) {
 		if (_interrupts.top().savedReply) {
 			throw std::runtime_error("New reply would overwrite existing saved reply");
 		}
 
 		_interrupts.top().savedReply = std::move(reply);
-	} else if (_interruptedForSignal) {
-		// A0-ARCH stage 1c: interrupted-for-signal but the interrupt stack is empty (stray
-		// interrupt_exit popped it during a desync). There is no interrupt frame to stash
-		// the reply on; send it directly rather than corrupt memory / lose it.
-		microthreadLog.error() << _tid << "(" << _nstid << "): pushCallReply: interrupted-for-signal with EMPTY interrupt stack (desync); sending reply directly" << microthreadLog.endLog;
-		if (!_dead) {
-#ifdef DSERVER_RING_TRANSPORT
-			if (_publishReplyToRingLocked(reply)) {
-				return;
-			}
-#endif
-			Server::sharedInstance().sendMessage(std::move(reply));
+
+		// the interrupted call's reply is now safely stashed -- if interrupt_enter's reply
+		// was deferred on it, it goes out NOW (outside the lock below): exactly the guest
+		// ordering the old synchronous unwind provided, without borrowing any stack.
+		// enterCall stays IN the frame slot: its sendBasicReply re-enters pushCallReply,
+		// whose _deactivateCallLocked clears it from there.
+		if (_interrupts.top().replyOwed) {
+			_interrupts.top().replyOwed = false;
+			owedEnterReply = _interrupts.top().enterCall;
 		}
 	} else if (_deferReplyForS2C) {
 		// A ring-originated call that performs an S2C upcall defers its reply here; the flush in
@@ -2794,6 +2811,18 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 #endif
 		DarlingServer::__rpctrace("SENT-UDS htid=%d nstid=%lld", id(), (long long)nsid());
 		Server::sharedInstance().sendMessage(std::move(reply));
+	}
+	} // release _rwlock
+
+	if (owedEnterReply) {
+		try {
+			owedEnterReply->sendBasicReply(0);
+		} catch (const std::exception& ex) {
+			// only reachable under an RPC-stream desync that popped the frame between the
+			// unlock above and the re-lock inside sendBasicReply; survive loudly
+			microthreadLog.error() << _tid << "(" << _nstid
+				<< "): deferred interrupt_enter reply failed: " << ex.what() << microthreadLog.endLog;
+		}
 	}
 };
 
@@ -2864,17 +2893,6 @@ void DarlingServer::Thread::sendSignal(int signal) const {
 	} else {
 		throw std::system_error(ESRCH, std::generic_category());
 	}
-};
-
-void DarlingServer::Thread::jumpToResume(ucontext_t* context, void* stack, size_t stackSize) {
-	// A0-ARCH stage 1b: resume an EXPLICIT saved context, not the shared _resumeContext slot
-	// (which may have been overwritten by a park of the interrupt fiber itself in the
-	// meantime -- the #114 stale-setcontext SEGV).
-#if DSERVER_ASAN
-	__sanitizer_start_switch_fiber(&asanOldFakeStack, stack, stackSize);
-#endif
-	setcontext(context);
-	__builtin_unreachable();
 };
 
 void DarlingServer::Thread::notifyDead() {
@@ -3021,17 +3039,24 @@ void DarlingServer::Thread::_scheduleRelease() {
 	});
 };
 
-void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
-	// perf#25a A0 (Part 3f, replaces the old "FIXME: does not work if suspended waiting for a
-	// lock"): this function's fiber can SUSPEND mid-flight -- dtape_thread_sigexc_enter takes
-	// thread_lock (a dtape mutex whose contention raw-suspends the microthread), and the
-	// interrupted continuation resumed below can block again. When the fiber suspends, the OS
-	// thread's doneWorking clears the thread_local currentThreadVar; when the fiber resumes
-	// (possibly on a DIFFERENT OS thread: the main loop and the worker both run fibers), code
-	// here that re-reads currentThreadVar dereferences an empty shared_ptr (captured SIGSEGV:
-	// null + offsetof(_handlingInterruptedCall), cvstorm2 storm). Pin the thread in a local
-	// `self` at entry, use it throughout, and re-assert the TLS after every potentially
-	// suspending call so downstream TLS readers (dtape hooks) stay correct too.
+bool DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
+	// A0-ARCH stage 3: interrupt as CANCELLATION. The old flow resumed the interrupted
+	// context synchronously on a borrowed stack (jumpToResume) and detoured its syscall
+	// return back here (_syscallReturnHereDuringInterrupt) -- the #114 stack-lifetime
+	// disease. Now: sigexc_enter finalizes the interrupted wait as THREAD_INTERRUPTED,
+	// which fires a typed Xnu wake; we ARM the frame and simply return. The enter fiber's
+	// doneWorking restores the frame's saved context into the live slots and reparks
+	// ("repark-interrupt-cancel"), and the pending wake dispatches the cancelled call
+	// through the NORMAL path -- its own fiber, its own stack. Our reply is deferred until
+	// that call's reply is stashed on the frame (pushCallReply sends it), which is the
+	// same guest-visible ordering the synchronous unwind provided. A raw-parked (non-TH_WAIT)
+	// interrupted context fires no wake here and just stays parked after the restore; its
+	// GENUINE wake eventually resumes it and the stash sends our reply then -- also exactly
+	// the old timing.
+	//
+	// perf#25a A0 (Part 3f): pin `self` -- sigexc_enter takes thread_lock (a dtape mutex
+	// whose contention raw-suspends this fiber, possibly migrating OS threads), so
+	// currentThreadVar must be re-asserted after it and never re-read.
 	std::shared_ptr<Thread> self = currentThreadVar;
 
 	{
@@ -3039,12 +3064,10 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 
 		// A0-ARCH stage 1c: doWork pushes an InterruptContext for every InterruptEnter
 		// dispatch, so an empty stack here means a stray interrupt_exit popped it out from
-		// under us (RPC-stream desync). Bail out gracefully: processCall still replies 0,
-		// the server survives, and the desync is loud in the log instead of top()-UB
-		// (captured as jumpToResume(context=0x2) SIGSEGV).
+		// under us (RPC-stream desync). Bail out gracefully: reply 0, survive loudly.
 		if (self->_interrupts.empty()) {
 			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt_enter with EMPTY interrupt stack (desync); ignoring" << microthreadLog.endLog;
-			return;
+			return true;
 		}
 
 		if (self->_pendingSavedReply) {
@@ -3058,87 +3081,50 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 			// the interrupt stack and will flush at interrupt_exit (FLUSH-SAVED). Not sent here.
 			DarlingServer::__rpctrace("PENDINGSAVED->INTERRUPTTOP htid=%d nstid=%lld", self->id(), (long long)self->nsid());
 		}
-
-		self->_interruptedForSignal = true;
 	}
 
+	// Abort the interrupted wait (if any). clear_wait_internal -> thread_go -> thread_unblock
+	// writes wait_result = THREAD_INTERRUPTED and fires the typed Xnu wake -- which we KEEP
+	// (it is the dispatch vehicle for the cancellation unwind; the old flow dropped it
+	// because it resumed synchronously). A pending Raw wake likewise survives untouched.
 	dtape_thread_sigexc_enter(self->_dtapeThread);
 	currentThreadVar = self; // may have suspended+migrated inside (thread_lock contention)
 
-	// Extract the interrupted continuation into a LOCAL (fiber-stack) variable, not the old
-	// thread_local: a fiber that suspends and migrates OS threads keeps its stack but not the
-	// previous OS thread's TLS, and the syscall-return re-entry below must not read/clobber
-	// whatever unrelated value the current OS thread's TLS happens to hold. Locals assigned
-	// before getcontext() are restored consistently by the setcontext() re-entry.
-	std::function<void()> localInterruptedContinuation = nullptr;
-	{
-		std::unique_lock lock(self->_rwlock);
-		localInterruptedContinuation = self->_interruptedContinuation;
-		self->_interruptedContinuation = nullptr;
-	}
-
-	// perf#25a A0 (Part 3b, retyped by A0-ARCH stage 1): sigexc_enter's clear_wait_internal ->
-	// thread_go -> thread_unblock fires a typed Xnu wake for the INTERRUPTED wait. The
-	// interrupt path resumes the interrupted continuation SYNCHRONOUSLY below (jumpToResume /
-	// interruptedContinuation), so that wake is already satisfied here -- drop the pending Xnu
-	// token so it is not re-delivered. Deliberately ONLY the Xnu one: a Raw wake pending here
-	// belongs to a raw park of the interrupted context (kwq lock handoff) and must SURVIVE the
-	// interrupt (the untyped permit machinery used to lose it -- one of the crosstalk faces).
-	{
-		std::unique_lock lock(self->_rwlock);
-		if (self->_pendingWakeGen[static_cast<size_t>(WakeKind::Xnu)] != 0) {
-			self->_mstateEventLocked(StateEvent::WakeDropped, "interrupt-enter-drop-xnu",
-				(uint8_t)WakeKind::Xnu, self->_pendingWakeGen[static_cast<size_t>(WakeKind::Xnu)]);
-		}
-		self->_pendingWakeGen[static_cast<size_t>(WakeKind::Xnu)] = 0;
-	}
-
-	self->_didSyscallReturnDuringInterrupt = false;
-	getcontext(&self->_syscallReturnHereDuringInterrupt);
-
-	// re-entered here either directly or via the interrupted call's syscall-return setcontext;
-	// in the latter case the executing OS thread's TLS is already self (the fiber only runs
-	// inside a doWork stint), but re-assert for the direct path after suspensions above.
-	currentThreadVar = self;
-
-	if (!self->_didSyscallReturnDuringInterrupt) {
-		if (localInterruptedContinuation) {
-			localInterruptedContinuation();
-		} else if (self->_interrupts.empty()) {
-			// A0-ARCH stage 1c: a stray interrupt_exit popped our frame while we were
-			// suspended in sigexc_enter (desync); nothing to resume, survive loudly.
-			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt frame popped mid-interrupt_enter (desync); skipping interrupted-call resume" << microthreadLog.endLog;
-		} else if (self->_interrupts.top().interruptedCall) {
-			self->_handlingInterruptedCall = true;
-			self->_pendingCallOverride = true;
-			self->jumpToResume(&self->_interrupts.top().savedResumeContext, self->_interrupts.top().savedStack.base, self->_interrupts.top().savedStack.size);
-		}
-	} else if (self->_handlingInterruptedCall) {
-#if DSERVER_ASAN
-		const void* dummy;
-		size_t dummy2;
-		__sanitizer_finish_switch_fiber(nullptr, &dummy, &dummy2);
-#endif
-
-		self->_handlingInterruptedCall = false;
-		self->_pendingCallOverride = false;
-	}
-
-	{
-		std::unique_lock lock(self->_rwlock);
-
-		if (!self->_interrupts.empty()) {
-			if (self->_interrupts.top().savedStack.isValid()) {
-				stackPool.free(self->_interrupts.top().savedStack);
-			}
-			self->_interrupts.top().interruptedCall = nullptr;
-		} else {
-			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt frame missing at interrupt_enter epilogue (desync)" << microthreadLog.endLog;
-		}
-
-		self->_interruptedForSignal = false;
-	}
-
+	// Push the fresh signal-handling user state. Note the order vs the old flow: this now
+	// runs BEFORE the interrupted call's unwind (which happens after we return) instead of
+	// after it. The unwind paths (wait-abort error paths replying to the guest) do not read
+	// the user-state stack, so the inversion is benign -- and the guest still only observes
+	// enter2's effect after our reply, which is ordered after the stashed unwind reply.
 	dtape_thread_sigexc_enter2(self->_dtapeThread);
 	currentThreadVar = self;
+
+	{
+		std::unique_lock lock(self->_rwlock);
+
+		if (self->_interrupts.empty()) {
+			// A0-ARCH stage 1c: a stray interrupt_exit popped our frame while we were
+			// suspended in sigexc_enter (desync); nothing to arm, survive loudly.
+			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt frame popped mid-interrupt_enter (desync); nothing to cancel" << microthreadLog.endLog;
+			return true;
+		}
+
+		auto& frame = self->_interrupts.top();
+		bool hasSavedContext = frame.savedStack.isValid() || frame.savedContinuation;
+
+		if (frame.interruptedCall || hasSavedContext) {
+			// something is in flight: arm the restore (doneWorking reparks the saved context)
+			frame.cancellationArmed = true;
+			self->_mstateEventLocked(StateEvent::Note, "interrupt-cancel-armed", 0, self->_interrupts.size());
+		}
+
+		if (frame.interruptedCall) {
+			// our reply is owed at the moment the cancelled call's reply is stashed
+			frame.replyOwed = true;
+			frame.enterCall = self->_activeCall;
+			return false;
+		}
+	}
+
+	// nothing in-flight to cancel (fresh interrupt, e.g. the S2C signal path): reply now
+	return true;
 };
