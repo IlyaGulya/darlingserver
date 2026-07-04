@@ -85,6 +85,15 @@ fuzz-nestwait s1/s2, fuzz-cvstorm s1, cvstorm2-throttled):
     on duct-tape panic(); wiring the dump into a fatal-signal handler is a
     possible stage-3 triage improvement.)
 
+Acceptance quick gate (e50a3450, A0_FUZZ_SEEDS=3, fuzz legs abort-on-violation):
+- **ALL 15 gating legs GREEN** (boot, nestwait-off 4/4, nestwait-on 4/4,
+  forkwait, cvstorm-nostorm 3/3, brew-xz 2/2 strict) with **ZERO mstate
+  violations across the entire battery** — including real brew load.
+- Fuzz survival 4 RED / 6 (nestwait s1/s2/s3 + cvstorm s2) = IDENTICAL to the
+  stage-1c baseline; no violation notes on the red legs → they die of the
+  pre-existing disease, not of the shadow machine. 2a is behaviorally
+  transparent, as a shadow must be.
+
 ## 2b — flip authority (planned)
 
 - `_running`/`_suspended` become derived views (accessors over `_microState`);
