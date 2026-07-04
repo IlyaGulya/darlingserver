@@ -145,9 +145,14 @@ struct DTapeHooks {
 		std::unique_lock lock(server._timerLock);
 
 		if (!override && server._currentTimerDeadline != 0 && deadline_ns >= server._currentTimerDeadline) {
+			DarlingServer::__rpctrace("TIMER-ARM-SKIP dl=%llu cur=%llu",
+				(unsigned long long)deadline_ns, (unsigned long long)server._currentTimerDeadline);
 			return;
 		}
 
+		DarlingServer::__rpctrace("TIMER-ARM dl=%llu ovr=%d (cur was %llu)",
+			(unsigned long long)deadline_ns, override ? 1 : 0,
+			(unsigned long long)server._currentTimerDeadline);
 		server._currentTimerDeadline = deadline_ns;
 
 		if (timerfd_settime(server._timerFD, TFD_TIMER_ABSTIME, &newSpec, NULL) < 0) {
@@ -999,6 +1004,18 @@ void DarlingServer::Server::start() {
 					// spurious expiration?
 					continue;
 				}
+
+				// A0-ARCH stage 3 (pre-existing hole, amplified by the wider cancellation
+				// windows): the deadline we were armed for has FIRED -- there is no armed
+				// deadline anymore. Leaving the stale (now past) value in
+				// _currentTimerDeadline makes every non-override timer_arm until
+				// dtape_timer_fired's re-arm compare against the past and get SKIPPED --
+				// a fresh short deadline (usleep's 1ms wait timer) is then never armed and
+				// only fires when some unrelated event re-arms the timerfd (captured live:
+				// the cvstorm2-throttled stormer's 1ms sleeps latching to the 5s duplex
+				// metronome, starving the whole workload into the wedge).
+				_currentTimerDeadline = 0;
+				DarlingServer::__rpctrace("TIMER-FIRED exp=%llu", (unsigned long long)expirations);
 
 				// we're done handling the timerfd;
 				// we don't need to lock anymore (and the following call might need to arm the timer again)
