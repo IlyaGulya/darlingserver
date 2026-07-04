@@ -110,4 +110,18 @@ Acceptance quick gate (e50a3450, A0_FUZZ_SEEDS=3, fuzz legs abort-on-violation):
 
 ## ASAN leg (stage-0 leftover, folded in here)
 
-(pending — -DDSERVER_ASAN=ON build of 2a through a short synth battery)
+- `-DDSERVER_ASAN=ON` builds clean (binary 417b961c, saved in job tmp next to
+  the normal e50a3450; build tree restored to ASAN=OFF afterwards).
+- **Boot requires `ASAN_OPTIONS=detect_stack_use_after_return=0`.** With FSUAR
+  on, the very first inline doWork stint dies (SEGV reading the zero page from
+  `isCurrentlySuspended` right after the fiber returns): ASAN's fake-stack
+  machinery does not survive the getcontext/setcontext fiber switches on the
+  perf#2b inline-dispatch path even with the __sanitizer fiber annotations —
+  locals of the interrupted frame read back as garbage. Instrumentation
+  incompatibility, not a server bug; FSUAR off boots and runs green.
+- Reduced synth battery under ASAN: see results below.
+
+Perf A/B (e50a3450 vs 886d13af/stage-1 numbers): nestwait NO_STORM
+3642/3614/3692 jobs/15s (mean ~3649 vs stage-1 ~3635 / baseline ~3679, within
+the 3609–3692 historical spread); 300x /usr/bin/true = 2s (identical).
+**No regression** — the tape writes are free at RPC granularity.
