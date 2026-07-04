@@ -591,7 +591,16 @@ void DarlingServer::Thread::doWork() {
 	// pre-dispatch view (the state field is authoritative now; there is no lingering
 	// _suspended residue to read). Parking is impossible here (the running guard above).
 	preDispatchParked = _isSuspendedLocked();
-	if (preDispatchParked && _consumePendingWakeLocked()) {
+	// A0-ARCH stage 3: only consume a pending wake when this dispatch can actually RESUME
+	// the parked context (no pending call in the way). With interrupt-as-cancellation the
+	// thread is genuinely Parked while an interrupt window is open, so a storm's nested
+	// interrupt_enter can dispatch ONTO the parked context -- that dispatch takes the
+	// interrupt-stacking branch, and consuming the wake here would EAT the cancellation
+	// resume permit (sigexc_enter of the nested enter finds the wait already finalized and
+	// fires no replacement -- captured live as the nestwait storm wedge, jobs frozen while
+	// storm_hits grow). The unconsumed wake survives in its pending slot and dispatches the
+	// restored context after the nested enter completes.
+	if (preDispatchParked && !_pendingCall && _consumePendingWakeLocked()) {
 		// This execution was scheduled by a matching typed wake; consume it.
 		hadResumePermit = true;
 	}
