@@ -13,8 +13,15 @@ Landing acceptance (d81b5cf1): synth 16/16, quick gate 19/19 gating green
 mstate/xwait violations, ZERO SEGV; cvstorm2-throttled 12/12 OK at full storm.
 Two pre-existing non-blockers re-scoped out (proven NOT stage-3 regressions via
 A/B vs 7692d9f6): cvstorm2-flood dispatch-starvation HANG -> task #118; rare ~2%
-nestwait semaphore_timedwait -111 flake (seen pre-stage-3). Stage 4 (optional
-single-runner) is measure-first per spec.
+nestwait semaphore_timedwait -111 flake (seen pre-stage-3).
+
+**Stage 4 (single-runner): MEASURED -> NO-GO (2026-07-04).** See the "Stage 4
+measurement" section at the bottom. The WorkQueue worker is already de-facto
+unused (workers_busy=0 in 19/20 samples under a full-rate nestwait storm;
+inline fastpath handles ~100% of dispatch); collapsing it buys no throughput and
+removes no real race surface, while touching the hot loop for negative expected
+value. #116's goal was met by stage 3. Recommendation: STOP the A0-ARCH ladder
+here.
 
 ### FLOOD A/B SETTLED (2026-07-04, 2nd session pass) -- landing unblocked
 
@@ -273,3 +280,43 @@ echo smoke, cvstorm2-throttled 6/6 GREEN at full storm rate. NOT yet run on it:
    (dar-a0arch-stage1-typed-wake-tokens.md) + task #116, `west dw handoff`, close
    #114 with a pointer here.
 6. Then stage 4 measurement (single-runner go/no-go writeup) or stop per spec.
+
+## Stage 4 (single-runner): MEASUREMENT + GO/NO-GO (2026-07-04)
+
+Spec stage 4 (optional, measure-first): collapse the `WorkQueue<Thread>` worker
+into the main event loop -> ONE runner, to remove the fiber-migration race
+surface (fibers today can run either inline in doWork or on the worker thread,
+migrating OS threads via getcontext/setcontext).
+
+**Measurement** (job-tmp s4_measure.sh + statsample.py, on d81b5cf1): sampled the
+server stat socket (`darlingserver-stat:<prefix>`, abstract UDS; gauges
+workers_total/busy/available + workqueue_depth + inline_handled/rpcs_serviced)
+once/sec under (A) a full-rate nestwait storm and (B) a launch-heavy 200x
+/usr/bin/true. Stat gauges come from `_workQueue.stats()` (server.cpp:713, the
+progress-metrics patch) -- no gdb, no bss offsets.
+
+**Result -- the worker is already de-facto UNUSED:**
+- Under the nestwait storm at ~33k RPCs/s (rpcs_serviced 655k->816k over the
+  window): **workers_busy = 0 in 19 of 20 samples**; workqueue_depth = 0 except
+  two transient depth=2 blips (t=7s, t=14s) that drained by the next sample.
+  workers_total=1, workers_available=1 throughout.
+- **inline_handled tracks rpcs_serviced ~1:1** (871k vs 816k at t=20s): the perf#2b
+  inline fastpath already handles ~100% of dispatch in the main loop.
+- Leg B (launch/fork-exec shape): same -- workers_busy=0, depth=0.
+
+**GO/NO-GO: NO-GO (stop).** The premise (bypass/kill the worker to remove
+migration races) is moot -- the worker is already bypassed ~100% of the time by
+the inline fastpath, so (a) there is no throughput to gain (inline IS the path,
+the worker is not a bottleneck being avoided), and (b) fibers essentially never
+migrate to the worker in the real dispatch pattern (busy=0 almost always), so the
+migration hazard stage 4 targets is already vanishingly rare. Deleting the worker
+would touch the hot dispatch loop and force the rare genuine concurrent-ready case
+(the depth=2 blips = 2 threads that truly needed to run at once) to serialize --
+a small latency/correctness risk for zero measurable benefit. The two-runner split
+costs nothing when idle and earns its keep exactly in those rare concurrent cases.
+
+**#116 is DONE:** its goal (kill the #114 SEGV crash class via the wake/wait
+protocol redesign) was achieved by stages 0-3 (LANDED, d81b5cf1 baseline). Stage 4
+is declined on evidence. Remaining darlingserver hardening lives in separate
+tickets: #118 (flood dispatch-starvation), #119 (nestwait -111 flake), plus the
+post-stage-2 UDS correlation-ID transport backlog.
