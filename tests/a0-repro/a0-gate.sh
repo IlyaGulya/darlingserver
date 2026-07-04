@@ -33,6 +33,12 @@
 #   DARLING_LAUNCHER launcher       (default ~/work/darling-prefix/bin/darling)
 #   A0_RING          1|0            (default 1 = ring transport ON, the prod config)
 #   A0_NEST_RUNS / A0_CV_RUNS / A0_BREW_RUNS   iteration counts
+#   A0_MSTATE_ABORT  1|0  force DSERVER_MSTATE_ABORT for ALL synth legs (default:
+#                    1 on fuzz legs only; violations always greped from dserver.log)
+#   NOTE for -DDSERVER_ASAN=ON binaries: export
+#   ASAN_OPTIONS=detect_stack_use_after_return=0 before running the gate --
+#   ASAN's fake stack does not survive the fiber getcontext/setcontext switches
+#   (first inline doWork stint SEGVs on the zero page otherwise).
 # =============================================================================
 set -u
 
