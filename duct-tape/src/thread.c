@@ -43,6 +43,24 @@ kern_return_t thread_set_state(register thread_t thread, int flavor, thread_stat
 
 kern_return_t thread_get_state(thread_t thread, int flavor, thread_state_t state, mach_msg_type_number_t* state_count);
 
+// A0-ARCH stage 2c: THE single write funnel for the XNU wait state. Every write of the
+// TH_WAIT/TH_RUN/TH_UNINT/TH_TERMINATE bits and/or wait_result goes through here as a NAMED
+// transition, reported to the server via the thread_xwait_transition hook so it lands on the
+// thread's run-state transition tape (violations get the full MSTATE VIOLATION treatment
+// there). Callers run under the XNU thread_lock where today's code did -- the funnel adds no
+// locking of its own; the hook takes the server-side Thread lock (established order:
+// thread_lock -> Thread rwlock, same as the arm/resume hooks these sites already fire).
+static void xnu_wait_state_write(dtape_thread_t* thread, uint32_t new_state, bool write_wresult, wait_result_t wresult, const char* reason, bool violation) {
+	uint32_t old_state = thread->xnu_thread.state;
+	thread->xnu_thread.state = new_state;
+	if (write_wresult) {
+		thread->xnu_thread.wait_result = wresult;
+	}
+	dtape_hooks->thread_xwait_transition(thread->context, reason, old_state, new_state,
+		write_wresult ? wresult : thread->xnu_thread.wait_result,
+		(violation ? DTAPE_XWAIT_VIOLATION : 0) | (write_wresult ? DTAPE_XWAIT_WROTE_RESULT : 0));
+};
+
 dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* context) {
 	dtape_thread_t* thread = malloc(sizeof(dtape_thread_t));
 	if (!thread) {
@@ -72,6 +90,9 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 
 	// this next section uses code adapted from XNU's thread_create_internal() in osfmk/kern/thread.c
 
+	// A0-ARCH stage 2c: birth init stays OUTSIDE the xnu_wait_state_write funnel on purpose --
+	// the owning server-side Thread is still mid-construction here (we are called from its
+	// constructor), so the report hook must not touch it; nobody else can see this thread yet.
 	thread->xnu_thread.wait_result = THREAD_WAITING;
 	thread->xnu_thread.options = THREAD_ABORTSAFE;
 	thread->xnu_thread.state = TH_RUN;
@@ -148,8 +169,8 @@ void dtape_thread_destroy(dtape_thread_t* thread) {
 	while (thread->xnu_thread.wait_timer_active > 0);
 
 	// pull the thread from any waitqs it might have been waiting on
-	thread->xnu_thread.state |= TH_TERMINATE;
-	thread->xnu_thread.state &= ~(TH_UNINT);
+	xnu_wait_state_write(thread, (thread->xnu_thread.state | TH_TERMINATE) & ~TH_UNINT,
+		false, 0, "xwait-destroy", false);
 	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
 
 	thread_unlock(&thread->xnu_thread);
@@ -169,14 +190,29 @@ void dtape_thread_destroy(dtape_thread_t* thread) {
 	free(thread);
 };
 
-void dtape_thread_entering(dtape_thread_t* thread) {
-	// if the thread is entering, it cannot be waiting
+// A0-ARCH stage 2c: dtape_thread_entering() is DELETED. Its unconditional
+// "entering => cannot be waiting" TH_WAIT clobber on every dispatch was the A0 disease
+// (half-torn committed waits; the whole preserveWaitState dance in doWork existed only to
+// dodge it). The dispatch paths now ASSERT the fresh-call invariant instead: this recovery
+// helper reports (returns true) if a fresh dispatch finds TH_WAIT stranded, clearing it the
+// way entering used to so release builds stay at least as robust as before. Deliberately
+// lock-free like the old entering: callers hold the server-side Thread lock, and a stranded
+// bit is already a violation -- a racy read cannot create one, only report it a beat late.
+bool dtape_thread_clear_stranded_wait(dtape_thread_t* thread) {
+	if (!(thread->xnu_thread.state & TH_WAIT)) {
+		return false;
+	}
 	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
-	thread->xnu_thread.state |= TH_RUN;
 	thread->xnu_thread.block_hint = kThreadWaitNone;
+	return true;
 };
 
 void dtape_thread_exiting(dtape_thread_t* thread) {
+	// TH_RUN is a write-only diagnostic bit in this codebase (nothing compiled reads it; it
+	// only shows up in panic dumps). Kept for that fidelity, but NOT routed through the
+	// stage-2c funnel: the caller (doneWorking) holds the Thread lock, so the report hook
+	// must not fire from here -- and the adjacent MicroState transition tapes this instant
+	// anyway.
 	thread->xnu_thread.state &= ~TH_RUN;
 };
 
@@ -487,7 +523,11 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 		dtape_mutex_unlock(&thread->suspension_mutex);
 		dtape_condvar_signal(&thread->suspension_condvar, SIZE_MAX);
 
-		thread->xnu_thread.wait_result = THREAD_WAITING;
+		// stage 2c: routed for the tape; no state bits change (this park is a user-suspension
+		// park, not a TH_WAIT wait) -- wait_result doubles as the "did dying interrupt us"
+		// channel that the loop exit below reads.
+		xnu_wait_state_write(thread, thread->xnu_thread.state, true, THREAD_WAITING,
+			"xwait-user-suspension-wait", false);
 
 		dtape_hooks->thread_suspend(thread->context, NULL, NULL, NULL);
 
@@ -534,7 +574,8 @@ void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
 	// tests/../tmp/cvstorm.c). Letting clear_wait_internal own the state
 	// transition matches XNU, where a signal-interrupted wait is torn down by
 	// thread_go(), not by the caller hand-clearing TH_WAIT. (perf#25a A0)
-	thread->xnu_thread.state &= ~TH_UNINT;
+	xnu_wait_state_write(thread, thread->xnu_thread.state & ~TH_UNINT,
+		false, 0, "xwait-sigexc-abort", false);
 	// perf#25a A0 (Part 2): do NOT pre-assign wait_result here. clear_wait_internal()
 	// -> thread_go() -> thread_unblock() writes wait_result = THREAD_INTERRUPTED itself,
 	// but ONLY when it actually finds the thread still waiting (TH_WAIT set). If a psynch
@@ -579,9 +620,12 @@ void dtape_thread_sigexc_exit(dtape_thread_t* thread) {
 
 void dtape_thread_dying(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
-	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
-	thread->xnu_thread.state |= TH_TERMINATE;
-	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
+	// NB (documented, semantics kept as-is by stage 2c): pre-clearing TH_WAIT here means the
+	// clear_wait_internal below takes its KERN_NOT_WAITING branch -- the waitq unlink still
+	// happens, but thread_go/thread_unblock is SKIPPED (no wake for a dying thread); the
+	// hand-written THREAD_INTERRUPTED is what wait_while_user_suspended's loop exits on.
+	xnu_wait_state_write(thread, (thread->xnu_thread.state & ~(TH_UNINT | TH_WAIT)) | TH_TERMINATE,
+		true, THREAD_INTERRUPTED, "xwait-dying", false);
 	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
 	thread_unlock(&thread->xnu_thread);
 };
@@ -626,6 +670,9 @@ static void thread_continuation_callback(void* context) {
 	// another stray permit, the loop re-checks.
 	while (thread->xnu_thread.state & TH_WAIT) {
 		thread_unlock(&thread->xnu_thread);
+		// stage 2c: taped like the inline-variant re-park above
+		dtape_hooks->thread_xwait_transition(thread->context, "xwait-repark-still-waiting",
+			thread->xnu_thread.state, thread->xnu_thread.state, THREAD_WAITING, 0);
 		dtape_hooks->thread_suspend(thread->context, thread_continuation_callback, thread, NULL);
 		thread_lock(&thread->xnu_thread);
 	}
@@ -680,6 +727,11 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 				if (!still_waiting) {
 					break;
 				}
+				// stage 2c: each re-park is a taped event (no state write) -- a suspension
+				// popped without thread_unblock finalizing the wait, which the typed tokens
+				// made rare; the tape shows how rare.
+				dtape_hooks->thread_xwait_transition(thread->context, "xwait-repark-still-waiting",
+					thread->xnu_thread.state, thread->xnu_thread.state, THREAD_WAITING, 0);
 				dtape_hooks->thread_suspend(thread->context, NULL, thread, NULL);
 			}
 		}
@@ -730,10 +782,14 @@ boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	// cvstorm2 -DNCONS=1 storm-on). Clearing TH_WAIT here makes the second
 	// clear_wait_internal correctly return KERN_NOT_WAITING and leave the grant intact.
 	// (Do not clear TH_TERMINATE: a terminating thread must stay terminating.)
-	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
-	thread->xnu_thread.state |= TH_RUN;
-
-	thread->xnu_thread.wait_result = wresult;
+	// A0-ARCH stage 2c: unblocking a thread that is NOT waiting is a violation -- every legal
+	// path here (clear_wait_internal's TH_WAIT guard, waitq wakeups pulling a marked waiter)
+	// proved TH_WAIT first.
+	{
+		uint32_t old_state = thread->xnu_thread.state;
+		xnu_wait_state_write(thread, (old_state & ~(TH_WAIT | TH_UNINT)) | TH_RUN,
+			true, wresult, "xwait-unblock", !(old_state & TH_WAIT));
+	}
 
 	// Cancel the wait timer if one was armed for a timed wait. XNU's
 	// thread_unblock() does this; duct-tape previously only cancelled it in
@@ -771,18 +827,28 @@ kern_return_t thread_go(thread_t thread, wait_result_t wresult, waitq_options_t 
 
 wait_result_t thread_mark_wait_locked(thread_t thread, wait_interrupt_t interruptible_orig) {
 	dtape_stub_safe();
-	thread->state = TH_WAIT;
-	thread->wait_result = THREAD_WAITING;
+	dtape_thread_t* dthread = dtape_thread_for_xnu_thread(thread);
+	// A0-ARCH stage 2c: double-marking a wait (TH_WAIT already set) or marking one on a
+	// terminating thread is a violation -- and note the write below always FULL-overwrote the
+	// state word (semantics kept), so a violated TH_TERMINATE would be silently erased here.
+	xnu_wait_state_write(dthread, TH_WAIT, true, THREAD_WAITING, "xwait-mark-wait",
+		(thread->state & (TH_WAIT | TH_TERMINATE)) != 0);
 	thread->block_hint = thread->pending_block_hint;
 	thread->pending_block_hint = kThreadWaitNone;
 	// A0-ARCH stage 1: arm the typed wake token for this XNU wait. Runs under the thread
 	// lock BEFORE the thread becomes findable on any waitq, so thread_unblock (the single
 	// finalizer, also under the thread lock) always reads the matching generation.
-	{
-		dtape_thread_t* dthread = dtape_thread_for_xnu_thread(thread);
-		dthread->xnu_wait_gen = dtape_hooks->thread_arm_wake(dthread->context, dtape_wake_kind_xnu);
-	}
+	dthread->xnu_wait_gen = dtape_hooks->thread_arm_wake(dthread->context, dtape_wake_kind_xnu);
 	return THREAD_WAITING;
+};
+
+// A0-ARCH stage 2c: waitq.c's prepost early-out (waitq_assert_wait64_locked on an
+// already-preposted set) is the ONE compiled-XNU site outside this file that writes
+// wait_result; it calls here so the write goes through the funnel. No state bits change --
+// the wait is satisfied BEFORE thread_mark_wait_locked ever runs.
+void dtape_xwait_prepost_awakened(thread_t xthread) {
+	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+	xnu_wait_state_write(thread, xthread->state, true, THREAD_AWAKENED, "xwait-prepost-awakened", false);
 };
 
 kern_return_t thread_terminate(thread_t xthread) {
@@ -810,7 +876,7 @@ kern_return_t kernel_thread_create(thread_continue_t continuation, void* paramet
 
 	thread->xnu_thread.continuation = continuation;
 	thread->xnu_thread.parameter = parameter;
-	thread->xnu_thread.state = TH_WAIT | TH_UNINT;
+	xnu_wait_state_write(thread, TH_WAIT | TH_UNINT, false, 0, "xwait-kthread-birth", false);
 
 	dtape_hooks->thread_setup(thread->context, thread_continuation_callback, thread);
 
@@ -2126,7 +2192,8 @@ thread_start_in_assert_wait(
 	thread_lock(thread);
 	assert(!thread->started);
 	assert((thread->state & (TH_WAIT | TH_UNINT)) == (TH_WAIT | TH_UNINT));
-	thread->state &= ~(TH_WAIT | TH_UNINT);
+	xnu_wait_state_write(dtape_thread_for_xnu_thread(thread), thread->state & ~(TH_WAIT | TH_UNINT),
+		false, 0, "xwait-start-assert-wait", false);
 	thread_unlock(thread);
 
 	/* assert wait interruptibly forever */
