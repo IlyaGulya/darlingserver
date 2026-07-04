@@ -71,6 +71,40 @@ namespace DarlingServer {
 		};
 		static constexpr size_t wakeKindCount = 5;
 
+		// A0-ARCH stage 2a: SHADOW microthread run-state machine. One per-thread state,
+		// currently written ALONGSIDE the existing _running/_suspended flips (deriving from
+		// them, not driving them) through a single legality-asserting transition function,
+		// with a per-thread ring-buffer tape of the last transitions/wake events that is
+		// dumped on any violation and from the duct-tape panic funnel. Stage 2b flips
+		// authority: the bools become derived views of this field.
+		enum class MicroState : uint8_t {
+			Idle = 0,       // no resumable context, not on a worker; waiting for a fresh call
+			Running = 1,    // a worker owns this microthread right now
+			Parking = 2,    // suspend() committed the park; fiber is unwinding to doneWorking
+			Parked = 3,     // off-worker with a resumable context, waiting for a typed wake
+			Ready = 4,      // parked with a deliverable matching wake pending; a dispatch is owed
+			Terminated = 5, // final: will never run again
+		};
+		enum class StateEvent : uint8_t {
+			Transition = 0,
+			ArmWake,
+			DisarmWake,
+			WakePending,   // wake recorded while not immediately consumable into a resume
+			WakeDropped,   // stale/unarmed wake dropped
+			WakeConsumed,  // a deliverable wake consumed by dispatch/park-race check
+			InterruptPush,
+			InterruptPop,
+			RerunDeferred, // dispatch arrived while still running; owed re-run recorded
+			ImpersonatePin,
+			ImpersonateUnpin,
+			Note,
+		};
+		static const char* microStateName(MicroState state);
+		static const char* stateEventName(StateEvent event);
+		// best-effort tape dump of the CURRENT thread for the duct-tape panic funnel;
+		// takes no locks (the process is dying) and prints straight to stdout like panic()
+		static void dumpCurrentThreadStateTape();
+
 	private:
 		enum class DeferralState: uint8_t {
 			/**
@@ -115,6 +149,27 @@ namespace DarlingServer {
 		bool _consumePendingWakeLocked();
 		// True if some pending wake is currently deliverable. _rwlock held (shared ok).
 		bool _hasDeliverablePendingWakeLocked() const;
+		// A0-ARCH stage 2a: shadow run-state + transition tape (all writes under _rwlock).
+		struct StateTapeEntry {
+			uint64_t timeUs;
+			uint64_t aux64;      // wake generation / interrupt depth / armed-kind mask
+			const char* reason;  // static string literal
+			StateEvent event;
+			MicroState from;
+			MicroState to;
+			uint8_t aux8;        // wake kind, where applicable
+		};
+		static constexpr size_t stateTapeCapacity = 32;
+		StateTapeEntry _stateTape[stateTapeCapacity] = {};
+		uint64_t _stateTapeCount = 0; // total events ever; ring index = count % capacity
+		MicroState _microState = MicroState::Idle;
+		void _mstateRecordLocked(StateEvent event, MicroState from, MicroState to, const char* reason, uint8_t aux8, uint64_t aux64);
+		// THE transition function (stage 2 spec): asserts legality + view consistency,
+		// records the transition on the tape. Violations dump the tape at error level
+		// (fatal instead when DSERVER_MSTATE_ABORT=1).
+		void _mstateTransitionLocked(MicroState to, const char* reason, uint8_t aux8 = 0, uint64_t aux64 = 0);
+		void _mstateEventLocked(StateEvent event, const char* reason, uint8_t aux8 = 0, uint64_t aux64 = 0);
+		void _dumpStateTapeLocked(const char* why) const;
 		// perf#25a A0: a dispatch (scheduleThread) can be popped by a worker and
 		// enter doWork() while this microthread is still _running on another worker
 		// (mid suspend()/doneWorking transition; _running clears only at the

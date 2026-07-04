@@ -94,6 +94,10 @@ struct DTapeHooks {
 		static_cast<DarlingServer::Thread*>(thread_context)->disarmWake(mapWakeKind(kind));
 	};
 
+	static void dtape_hook_current_thread_dump_state_tape(void) {
+		DarlingServer::Thread::dumpCurrentThreadStateTape();
+	};
+
 	static dtape_task_t* dtape_hook_current_task(void) {
 		auto thread = DarlingServer::Thread::currentThread();
 		if (!thread) {
@@ -444,6 +448,7 @@ struct DTapeHooks {
 		.current_thread_interrupt_enable = dtape_hook_current_thread_interrupt_enable,
 		.current_thread_syscall_return = dtape_hook_current_thread_syscall_return,
 		.current_thread_set_bsd_retval = dtape_hook_current_thread_set_bsd_retval,
+		.current_thread_dump_state_tape = dtape_hook_current_thread_dump_state_tape,
 
 		.task_read_memory = dtape_hook_task_read_memory,
 		.task_write_memory = dtape_hook_task_write_memory,

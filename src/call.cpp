@@ -1153,6 +1153,7 @@ void DarlingServer::Call::InterruptExit::processCall() {
 		auto tmp = std::move(thread->_interrupts.top());
 
 		thread->_interrupts.pop();
+		thread->_mstateEventLocked(DarlingServer::Thread::StateEvent::InterruptPop, "interrupt-exit", 0, thread->_interrupts.size());
 
 		if (tmp.savedReply) {
 			callLog.debug() << *thread << ": Going to send saved reply" << callLog.endLog;
