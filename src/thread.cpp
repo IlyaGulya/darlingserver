@@ -544,6 +544,7 @@ void DarlingServer::Thread::doWork() {
 	bool hadResumePermit = false;
 	bool preserveWaitState = false;
 	bool preDispatchParked = false;
+	bool parkedContextIntact = false;
 
 	// A0-ARCH stage 0 fuzzer: reorder this dispatch behind whatever else is queued (models the
 	// dispatch-vs-wake races), and/or inject an extra permit-less dispatch (models stale re-runs).
@@ -724,7 +725,13 @@ void DarlingServer::Thread::doWork() {
 			setcontext(&_resumeContext);
 		} else {
 			if (!_pendingCall) {
-				// if we don't actually have a pending call, we have nothing to do
+				// if we don't actually have a pending call, we have nothing to do.
+				// A0-ARCH stage 2b: if this no-op dispatch found a parked context, that
+				// context was never touched -- doneWorking must REPARK it, not idle the
+				// thread (idling here loses the park: the next genuine wake finds
+				// "no-park" and is dropped -- captured live as a fuzz boot wedge, the
+				// launchd tape ending Parked->Running->Idle then wake-dropped no-park).
+				parkedContextIntact = preDispatchParked;
 				goto doneWorking;
 			}
 			_rwlock.unlock();
@@ -758,14 +765,20 @@ void DarlingServer::Thread::doWork() {
 doneWorking:
 	// we must be holding `_rwlock` when we get here
 	if (_microState == MicroState::Running || _microState == MicroState::Parking) {
-		// this stint actually ran the microthread (vs. a goto from the guards above)
+		// this stint actually ran the microthread (vs. a goto from the guards above).
+		// Repark when the park was committed THIS stint (Parking) or when a no-op
+		// dispatch left a previously-parked context untouched (parkedContextIntact --
+		// the old `_suspended` flag carried this implicitly; the state field must not
+		// lose it or the next wake drops as "no-park" and the thread wedges).
 		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
-		_mstateTransitionLocked(
-			_microState == MicroState::Parking
-				? (_hasDeliverablePendingWakeLocked() ? MicroState::Ready : MicroState::Parked)
-				: MicroState::Idle,
-			_microState == MicroState::Parking ? "park-committed" : "done");
+		if (_microState == MicroState::Parking || parkedContextIntact) {
+			_mstateTransitionLocked(
+				_hasDeliverablePendingWakeLocked() ? MicroState::Ready : MicroState::Parked,
+				_microState == MicroState::Parking ? "park-committed" : "repark-noop-dispatch");
+		} else {
+			_mstateTransitionLocked(MicroState::Idle, "done");
+		}
 	}
 	// A wake can arrive after suspend()'s final permit check but before it
 	// physically switches back here. Now that the running view is clear, rescheduling
