@@ -46,7 +46,26 @@ the flood throughput-starvation HANG is spun out as a follow-up.
   known-limit legs GREEN this run (flood landed on the OK side of its coin-flip).
   Fuzz reds all the pre-existing UDS-desync class ("pre-redesign hole -- not
   gating"); no new failure class, no interrupt crashes.
-- **quick/brew gate**: (in progress -- final landing check, brew xz strict).
+- **quick/brew gate** (1st run): PASS=16 FAIL=2 -- brew-xz 2/2 GREEN, but two
+  gating nestwait legs (nestwait-off-4, nestwait-on-3) RED with
+  `semaphore_timedwait failed (internally): -111`. NOT a hang or crash: both legs
+  ran the full 15s with healthy progress (jobs climbing, stall=0), then the guest
+  aborted at teardown. -111 = -ECONNREFUSED on the semaphore_timedwait RPC (#62);
+  the guest emulation (xnu .../mach_traps.c:214) tolerates only -EINTR
+  (-> KERN_ABORTED) and __simple_abort()s on anything else.
+- **-111 is a RARE PRE-EXISTING FLAKE, not a stage-3 regression** (investigated
+  before landing): A/B nestwait 2c-baseline 7692d9f6 vs stage-3 d81b5cf1 (8 iters
+  each, fresh boot per leg = matches run_synth) = 0 -111 on BOTH; a 20-iter stage-3
+  repro = 0 -111. So across ~44 stage-3 nestwait runs since the single quick-gate
+  occurrence, exactly ONE -111 (~2%). Seen historically pre-stage-3 too (PERF25A
+  census line 604: same `-111 ; Illegal instruction` signature). Could not capture
+  one live to root-cause the ECONNREFUSED-vs-EINTR reply path (rate too low). Fix
+  direction when it recurs: capture the failing run's auxlog (RPC #62
+  RECV/REPLY-DISP/STASH) -- the cancelled/torn semaphore_timedwait should surface
+  -EINTR, not a transport ECONNREFUSED; suspect the guest side treating a
+  connection-level error as the RPC return under teardown. Tracked as a low-pri
+  known-flake (own note; NOT gating-blocking for stage 3). Landing signal = a
+  clean confirmatory quick gate (the ~2% flake clears on a re-run).
 
 Acceptance (original): `A0_STRICT=1 tests/a0-repro/a0-gate.sh full` GREEN. NOTE:
 the flood-KNOWNLIMIT leg will still coin-flip RED under A0_STRICT=1 as a HANG (not
