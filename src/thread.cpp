@@ -575,6 +575,7 @@ void DarlingServer::Thread::doWork() {
 		// forever and the microthread deadlocks. Record the owed re-run; the
 		// doneWorking tail will reschedule exactly once after _running clears.
 		_rerunPending = true;
+		_mstateEventLocked(StateEvent::RerunDeferred, "dispatch-while-running");
 		microthreadLog.debug() << _tid << "(" << _nstid << "): dispatch arrived while still running; deferring re-run" << microthreadLog.endLog;
 		_rwlock.unlock();
 		return;
@@ -595,6 +596,8 @@ void DarlingServer::Thread::doWork() {
 		hadResumePermit = true;
 	}
 	_running = true;
+	_mstateTransitionLocked(MicroState::Running,
+		hadResumePermit ? "dispatch-resume" : (_suspended ? "dispatch-stale" : "dispatch-fresh"));
 	currentThreadVar = shared_from_this();
 	// perf#25a A0 (Part 3): an interrupt_enter that stacks onto an in-flight call must NOT run
 	// dtape_thread_entering(). The interrupted call may be suspended on a waitq with TH_WAIT set
@@ -673,6 +676,7 @@ void DarlingServer::Thread::doWork() {
 			_continuationCallback = nullptr;
 			_interrupts.top().interruptedCall = _activeCall;
 			_activeCall = nullptr;
+			_mstateEventLocked(StateEvent::InterruptPush, "interrupt-enter-stacked", 0, _interrupts.size());
 		}
 
 		if (_continuationCallback && _pendingCall) {
@@ -754,6 +758,9 @@ doneWorking:
 		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
 		_running = false;
+		_mstateTransitionLocked(
+			_suspended ? (_hasDeliverablePendingWakeLocked() ? MicroState::Ready : MicroState::Parked) : MicroState::Idle,
+			_suspended ? "park-committed" : "done");
 	}
 	// A wake can arrive after suspend()'s final permit check but before it
 	// physically switches back here. Now that _running is false, rescheduling
@@ -781,6 +788,7 @@ doneWorking:
 		// but we had an active call and had to finish it first
 		_terminating = true;
 		canRelease = true;
+		_mstateTransitionLocked(MicroState::Terminated, "dead-after-last-call");
 	}
 	if (_terminating && !_dead) {
 		// this will not destroy our thread immediately;
@@ -847,6 +855,7 @@ bool DarlingServer::Thread::doWorkInline() {
 	currentThreadVar = shared_from_this();
 	dtape_thread_entering(_dtapeThread);
 	_suspended = false;
+	_mstateTransitionLocked(MicroState::Running, "inline-dispatch");
 	lock.unlock();
 	_runningCondvar.notify_all();
 
@@ -910,10 +919,12 @@ bool DarlingServer::Thread::doWorkInline() {
 		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
 		_running = false;
+		_mstateTransitionLocked(MicroState::Idle, "inline-done");
 
 		if (_dead && !_activeCall && !_terminating) {
 			_terminating = true;
 			canRelease = true;
+			_mstateTransitionLocked(MicroState::Terminated, "dead-after-last-call");
 		}
 		if (_terminating && !_dead) {
 			relock.unlock();
@@ -968,6 +979,7 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 	currentThreadVar = shared_from_this();
 	dtape_thread_entering(_dtapeThread);
 	_suspended = false;
+	_mstateTransitionLocked(MicroState::Running, "inline-mrp-dispatch");
 	lock.unlock();
 	_runningCondvar.notify_all();
 
@@ -1020,10 +1032,12 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
 		_running = false;
+		_mstateTransitionLocked(MicroState::Idle, "inline-mrp-done");
 
 		if (_dead && !_activeCall && !_terminating) {
 			_terminating = true;
 			canRelease = true;
+			_mstateTransitionLocked(MicroState::Terminated, "dead-after-last-call");
 		}
 		if (_terminating && !_dead) {
 			relock.unlock();
@@ -1086,6 +1100,16 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 		return;
 	}
 	_suspended = true;
+	{
+		// tape the armed-kind mask so a stuck park names what it is waiting for
+		uint64_t armedMask = 0;
+		for (size_t kindIndex = 0; kindIndex < wakeKindCount; kindIndex++) {
+			if (_armedWakeGen[kindIndex] != 0) {
+				armedMask |= (1ull << kindIndex);
+			}
+		}
+		_mstateTransitionLocked(MicroState::Parking, "park", 0, armedMask);
+	}
 	_rwlock.unlock();
 
 	unlockMeWhenSuspending = unlockMe;
@@ -1096,6 +1120,12 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	// Consume a matching wake that arrived while the resume context was being captured.
 	if (_consumePendingWakeLocked()) {
 		_suspended = false;
+		// this check runs on BOTH getcontext paths: a genuine park race (state Parking) and
+		// a spurious-but-legal consume right after a real resume (state already Running via
+		// doWork's dispatch-resume transition; the caller's wait loop re-checks its predicate)
+		if (_microState == MicroState::Parking) {
+			_mstateTransitionLocked(MicroState::Running, "wake-raced-park");
+		}
 		_rwlock.unlock();
 		if (unlockMeWhenSuspending) {
 			libsimple_lock_unlock(unlockMeWhenSuspending);
@@ -1136,6 +1166,150 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	}
 };
 
+// A0-ARCH stage 2a: shadow run-state machine. Violations are log-and-survive by default
+// so a mismodeled edge cannot take down a production server; DSERVER_MSTATE_ABORT=1
+// (fuzz/gate legs) makes them fatal so the fuzzer can catch them as crashes.
+static bool mstateAbortOnViolation = false;
+static bool mstateAbortInit() {
+	const char* value = getenv("DSERVER_MSTATE_ABORT");
+	return value && value[0] && value[0] != '0';
+};
+static const bool mstateAbortInitDone = (mstateAbortOnViolation = mstateAbortInit(), true);
+
+const char* DarlingServer::Thread::microStateName(MicroState state) {
+	switch (state) {
+		case MicroState::Idle:       return "Idle";
+		case MicroState::Running:    return "Running";
+		case MicroState::Parking:    return "Parking";
+		case MicroState::Parked:     return "Parked";
+		case MicroState::Ready:      return "Ready";
+		case MicroState::Terminated: return "Terminated";
+	}
+	return "?";
+};
+
+const char* DarlingServer::Thread::stateEventName(StateEvent event) {
+	switch (event) {
+		case StateEvent::Transition:       return "transition";
+		case StateEvent::ArmWake:          return "arm";
+		case StateEvent::DisarmWake:       return "disarm";
+		case StateEvent::WakePending:      return "wake-pending";
+		case StateEvent::WakeDropped:      return "wake-dropped";
+		case StateEvent::WakeConsumed:     return "wake-consumed";
+		case StateEvent::InterruptPush:    return "interrupt-push";
+		case StateEvent::InterruptPop:     return "interrupt-pop";
+		case StateEvent::RerunDeferred:    return "rerun-deferred";
+		case StateEvent::ImpersonatePin:   return "impersonate-pin";
+		case StateEvent::ImpersonateUnpin: return "impersonate-unpin";
+		case StateEvent::Note:             return "note";
+	}
+	return "?";
+};
+
+static bool mstateLegalTransition(DarlingServer::Thread::MicroState from, DarlingServer::Thread::MicroState to) {
+	using MS = DarlingServer::Thread::MicroState;
+	switch (from) {
+		case MS::Idle:
+			// Running = fresh dispatch; Parked = kernel-thread birth park;
+			// Terminated = died with nothing left to run
+			return to == MS::Running || to == MS::Parked || to == MS::Terminated;
+		case MS::Running:
+			return to == MS::Parking || to == MS::Idle || to == MS::Terminated;
+		case MS::Parking:
+			// Parked/Ready = doneWorking committed the park; Running = a wake raced the park
+			// (suspend()'s post-getcontext check); Idle = inline-path suspend contract
+			// violation recovery (that site logs loudly on its own)
+			return to == MS::Parked || to == MS::Ready || to == MS::Running || to == MS::Idle;
+		case MS::Parked:
+			// Running covers both a consuming resume and a stale/fresh-call dispatch
+			return to == MS::Running || to == MS::Ready || to == MS::Terminated;
+		case MS::Ready:
+			return to == MS::Running || to == MS::Terminated;
+		case MS::Terminated:
+			return false;
+	}
+	return false;
+};
+
+void DarlingServer::Thread::_mstateRecordLocked(StateEvent event, MicroState from, MicroState to, const char* reason, uint8_t aux8, uint64_t aux64) {
+	StateTapeEntry& entry = _stateTape[_stateTapeCount % stateTapeCapacity];
+	_stateTapeCount++;
+	entry.timeUs = DarlingServer::Metrics::nowMonoUs();
+	entry.aux64 = aux64;
+	entry.reason = reason;
+	entry.event = event;
+	entry.from = from;
+	entry.to = to;
+	entry.aux8 = aux8;
+};
+
+void DarlingServer::Thread::_mstateEventLocked(StateEvent event, const char* reason, uint8_t aux8, uint64_t aux64) {
+	_mstateRecordLocked(event, _microState, _microState, reason, aux8, aux64);
+};
+
+void DarlingServer::Thread::_mstateTransitionLocked(MicroState to, const char* reason, uint8_t aux8, uint64_t aux64) {
+	MicroState from = _microState;
+	_microState = to;
+	_mstateRecordLocked(StateEvent::Transition, from, to, reason, aux8, aux64);
+
+	// legality + view-consistency assertions. The views are checked POSITIVELY only:
+	// impersonate() latches _running=true on a non-running thread as a lockout, so
+	// "_running implies Running" does not hold (stage 2b untangles that latch).
+	const char* violation = nullptr;
+	if (!mstateLegalTransition(from, to)) {
+		violation = "illegal transition";
+	} else if ((to == MicroState::Running || to == MicroState::Parking) && !_running) {
+		violation = "Running/Parking without _running";
+	} else if ((to == MicroState::Parking || to == MicroState::Parked || to == MicroState::Ready) && !_suspended) {
+		violation = "park state without _suspended";
+	} else if (to == MicroState::Idle && _suspended) {
+		violation = "Idle with _suspended";
+	}
+	if (violation) {
+		microthreadLog.error() << _tid << "(" << _nstid << "): MSTATE VIOLATION: " << violation
+			<< " (" << microStateName(from) << " -> " << microStateName(to) << ", " << reason << ")" << microthreadLog.endLog;
+		_dumpStateTapeLocked(violation);
+		if (mstateAbortOnViolation) {
+			abort();
+		}
+	}
+};
+
+void DarlingServer::Thread::_dumpStateTapeLocked(const char* why) const {
+	microthreadLog.error() << _tid << "(" << _nstid << "): state tape dump (" << why << "): state="
+		<< microStateName(_microState) << ", " << _stateTapeCount << " events total" << microthreadLog.endLog;
+	uint64_t count = (_stateTapeCount < stateTapeCapacity) ? _stateTapeCount : stateTapeCapacity;
+	for (uint64_t i = _stateTapeCount - count; i < _stateTapeCount; i++) {
+		const StateTapeEntry& entry = _stateTape[i % stateTapeCapacity];
+		microthreadLog.error() << _tid << ": tape[" << i << "] t=" << entry.timeUs << "us "
+			<< stateEventName(entry.event) << " " << microStateName(entry.from) << "->" << microStateName(entry.to)
+			<< " reason=" << (entry.reason ? entry.reason : "-")
+			<< " aux8=" << (int)entry.aux8 << " aux64=" << entry.aux64 << microthreadLog.endLog;
+	}
+};
+
+void DarlingServer::Thread::dumpCurrentThreadStateTape() {
+	// panic funnel: no locks (the process is dying and may hold them), print like panic()
+	Thread* self = currentThreadVar.get();
+	if (!self) {
+		printf("mstate: no current microthread at panic\n");
+		fflush(stdout);
+		return;
+	}
+	printf("mstate: tid=%d nstid=%d state=%s events=%llu\n", self->_tid, self->_nstid,
+		microStateName(self->_microState), (unsigned long long)self->_stateTapeCount);
+	uint64_t total = self->_stateTapeCount;
+	uint64_t count = (total < stateTapeCapacity) ? total : stateTapeCapacity;
+	for (uint64_t i = total - count; i < total; i++) {
+		const StateTapeEntry& entry = self->_stateTape[i % stateTapeCapacity];
+		printf("mstate: tape[%llu] t=%lluus %s %s->%s reason=%s aux8=%u aux64=%llu\n",
+			(unsigned long long)i, (unsigned long long)entry.timeUs,
+			stateEventName(entry.event), microStateName(entry.from), microStateName(entry.to),
+			entry.reason ? entry.reason : "-", (unsigned)entry.aux8, (unsigned long long)entry.aux64);
+	}
+	fflush(stdout);
+};
+
 uint64_t DarlingServer::Thread::armWake(WakeKind kind) {
 	std::unique_lock lock(_rwlock);
 	uint64_t gen = ++_wakeGenCounter;
@@ -1152,14 +1326,17 @@ uint64_t DarlingServer::Thread::armWake(WakeKind kind) {
 		// construction (gen is fresh); drop it so it cannot satisfy the new wait
 		microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
 			<< (int)k << " gen " << _pendingWakeGen[k] << " at re-arm" << microthreadLog.endLog;
+		_mstateEventLocked(StateEvent::WakeDropped, "stale-at-re-arm", (uint8_t)k, _pendingWakeGen[k]);
 		_pendingWakeGen[k] = 0;
 	}
+	_mstateEventLocked(StateEvent::ArmWake, "arm", (uint8_t)k, gen);
 	return gen;
 };
 
 void DarlingServer::Thread::disarmWake(WakeKind kind) {
 	std::unique_lock lock(_rwlock);
 	const size_t k = static_cast<size_t>(kind);
+	_mstateEventLocked(StateEvent::DisarmWake, "disarm", (uint8_t)k, _armedWakeGen[k]);
 	_armedWakeGen[k] = 0;
 	// old Part 3d lives here now: a wake already delivered for this (concluded) wait is
 	// satisfied by definition -- drop it so it cannot go stale and spuriously satisfy the
@@ -1173,6 +1350,7 @@ bool DarlingServer::Thread::_consumePendingWakeLocked() {
 	constexpr size_t abortIdx = static_cast<size_t>(WakeKind::Abort);
 	if (_pendingWakeGen[abortIdx] != 0) {
 		_pendingWakeGen[abortIdx] = 0;
+		_mstateEventLocked(StateEvent::WakeConsumed, "consume-abort", (uint8_t)abortIdx, 1);
 		return true;
 	}
 	// Prefer the innermost park kinds: a raw queue handoff belongs to the park physically on
@@ -1187,6 +1365,7 @@ bool DarlingServer::Thread::_consumePendingWakeLocked() {
 		if (_pendingWakeGen[k] == _armedWakeGen[k]) {
 			// consuming clears BOTH slots: the wait is being delivered right now, so the
 			// arm-site's own disarm (which would drop a still-pending wake) becomes a no-op
+			_mstateEventLocked(StateEvent::WakeConsumed, "consume", (uint8_t)k, _pendingWakeGen[k]);
 			_pendingWakeGen[k] = 0;
 			_armedWakeGen[k] = 0;
 			return true;
@@ -1194,6 +1373,7 @@ bool DarlingServer::Thread::_consumePendingWakeLocked() {
 		// pending no longer matches the armed wait of its kind -- its wait is gone; drop
 		microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
 			<< (int)k << " gen " << _pendingWakeGen[k] << " (armed " << _armedWakeGen[k] << ")" << microthreadLog.endLog;
+		_mstateEventLocked(StateEvent::WakeDropped, "stale-at-consume", (uint8_t)k, _pendingWakeGen[k]);
 		_pendingWakeGen[k] = 0;
 	}
 	return false;
@@ -1218,10 +1398,12 @@ void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
 		if (!_running && !_suspended) {
 			// nothing to deliver to (no parked context and no owner mid-transition);
 			// same no-op as the old untyped resume()
+			_mstateEventLocked(StateEvent::WakeDropped, "no-park", (uint8_t)kind, generation);
 			return;
 		}
 		if (kind == WakeKind::Abort) {
 			_pendingWakeGen[static_cast<size_t>(WakeKind::Abort)] = 1;
+			_mstateEventLocked(StateEvent::WakePending, "abort", (uint8_t)WakeKind::Abort, 1);
 		} else {
 			size_t k = static_cast<size_t>(kind);
 			if (generation == 0) {
@@ -1239,6 +1421,7 @@ void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
 				if (generation == 0) {
 					microthreadLog.info() << _tid << "(" << _nstid << "): dropping untyped wake kind "
 						<< (int)k << ": nothing armed" << microthreadLog.endLog;
+					_mstateEventLocked(StateEvent::WakeDropped, "untyped-nothing-armed", (uint8_t)k, 0);
 					return;
 				}
 			} else if (_armedWakeGen[k] != generation) {
@@ -1247,9 +1430,15 @@ void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
 				// old untyped permit would have delivered it as a spurious resume; drop it.
 				microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale wake kind "
 					<< (int)k << " gen " << generation << " (armed " << _armedWakeGen[k] << ")" << microthreadLog.endLog;
+				_mstateEventLocked(StateEvent::WakeDropped, "stale-wake", (uint8_t)k, generation);
 				return;
 			}
 			_pendingWakeGen[k] = generation;
+			_mstateEventLocked(StateEvent::WakePending, "wake", (uint8_t)k, generation);
+		}
+		if (_microState == MicroState::Parked && _hasDeliverablePendingWakeLocked()) {
+			// the park is committed and this wake matches it: the thread now owes a dispatch
+			_mstateTransitionLocked(MicroState::Ready, "wake-deliverable", (uint8_t)kind, generation);
 		}
 		schedule = _suspended && !_running;
 	}
@@ -1276,6 +1465,7 @@ void DarlingServer::Thread::terminate() {
 
 	_rwlock.lock();
 	_terminating = true;
+	_mstateEventLocked(StateEvent::Note, "terminate");
 
 	if (currentThreadVar.get() == this) {
 		// if it's the current thread, just suspend it;
@@ -1309,6 +1499,8 @@ void DarlingServer::Thread::setupKernelThread(std::function<void()> startupCallb
 	// kick (startKernelThread below, or an untyped first thread_unblock for kernel threads
 	// created via kernel_thread_create -- see wake()).
 	_armedWakeGen[static_cast<size_t>(WakeKind::Kick)] = ++_wakeGenCounter;
+	_mstateEventLocked(StateEvent::ArmWake, "kthread-birth-kick", (uint8_t)WakeKind::Kick, _armedWakeGen[static_cast<size_t>(WakeKind::Kick)]);
+	_mstateTransitionLocked(MicroState::Parked, "kthread-birth");
 	getcontext(&_resumeContext);
 };
 
@@ -1328,6 +1520,7 @@ void DarlingServer::Thread::impersonate(std::shared_ptr<Thread> thread) {
 			std::unique_lock lock(thread->_rwlock);
 			thread->_deferLocked(true, lock);
 			thread->_running = true;
+			thread->_mstateEventLocked(StateEvent::ImpersonatePin, "impersonate");
 		}
 		thread->_runningCondvar.notify_all();
 	}
@@ -1342,6 +1535,7 @@ void DarlingServer::Thread::impersonate(std::shared_ptr<Thread> thread) {
 		{
 			std::unique_lock lock(oldThread->_rwlock);
 			oldThread->_running = false;
+			oldThread->_mstateEventLocked(StateEvent::ImpersonateUnpin, "impersonate-end");
 			oldThread->_undeferLocked(lock);
 		}
 		oldThread->_runningCondvar.notify_all();
@@ -2665,6 +2859,7 @@ void DarlingServer::Thread::notifyDead() {
 
 		threadLog.info() << *this << ": thread dying" << threadLog.endLog;
 		_dead = true;
+		_mstateEventLocked(StateEvent::Note, "notify-dead");
 
 #ifdef DSERVER_RING_TRANSPORT
 		ringMonitorToRelease = std::move(_ringMonitor);
@@ -2678,6 +2873,7 @@ void DarlingServer::Thread::notifyDead() {
 			// so set `_terminating` to make sure that doesn't happen
 			_terminating = true;
 			canRelease = true;
+			_mstateTransitionLocked(MicroState::Terminated, "dead-no-active-call");
 		}
 	}
 
@@ -2852,6 +3048,10 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 	// interrupt (the untyped permit machinery used to lose it -- one of the crosstalk faces).
 	{
 		std::unique_lock lock(self->_rwlock);
+		if (self->_pendingWakeGen[static_cast<size_t>(WakeKind::Xnu)] != 0) {
+			self->_mstateEventLocked(StateEvent::WakeDropped, "interrupt-enter-drop-xnu",
+				(uint8_t)WakeKind::Xnu, self->_pendingWakeGen[static_cast<size_t>(WakeKind::Xnu)]);
+		}
 		self->_pendingWakeGen[static_cast<size_t>(WakeKind::Xnu)] = 0;
 	}
 
