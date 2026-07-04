@@ -1,13 +1,49 @@
 # A0-ARCH stage 3: interrupt as cancellation (kills #114 stack borrowing)
 
 Status: **IMPLEMENTED + fixes 1/3/4 (fix 2 reverted), 2026-07-04. Binary d81b5cf1
-deployed (intentional drift; baseline still 7692d9f6 until landing).
-cvstorm2-throttled repro: 6/6 GREEN with the storm at full rate (~14.8k hits/20s)
--- the #114 acceptance grain is solved. REMAINING: the gate ladder (see HANDOFF
-at the bottom).** Branch `fix/a0-arch-redesign`.
-Spec: tests/A0-ARCH-REDESIGN-SPEC.md stage 3. Prior: tests/A0-ARCH-STAGE2.md.
-Acceptance: `A0_STRICT=1 tests/a0-repro/a0-gate.sh full` GREEN (cvstorm2 throttled AND
-flood legs stop crashing) = the #114 close-out criterion.
+deployed (intentional drift; baseline still 7692d9f6 until landing).**
+Branch `fix/a0-arch-redesign`. Spec: tests/A0-ARCH-REDESIGN-SPEC.md stage 3.
+Prior: tests/A0-ARCH-STAGE2.md.
+
+### FLOOD A/B SETTLED (2026-07-04, 2nd session pass) -- landing unblocked
+
+The two #114 grains, measured HONESTLY (not the over-optimistic "6/6" first pass):
+
+- **cvstorm2-throttled** (-DNCONS=1 -DSTORM_THROTTLE_US=1000): **12/12 OK** on
+  d81b5cf1. Solid. done ~375M/run. This grain of #114 is closed.
+- **cvstorm2-flood** (-DNCONS=1, no throttle = pathological pthread_kill storm):
+  a coin-flip HANG (~1/3 of runs), but **NO CRASH** and no server death on EITHER
+  binary. A/B (job-tmp s3_flood_ab.sh, robust busy-file swap): 2c baseline
+  7692d9f6 = ~11 OK / 5 HANG / 0 crash; stage-3 d81b5cf1 = ~9 OK / 2 HANG / 0
+  crash (combined across two A/B rounds). **The flood HANG is PRE-EXISTING on the
+  pre-stage-3 baseline -- it is NOT a stage-3 regression.**
+
+**Root cause of the flood HANG (separate, pre-existing bug -- NOT the cancellation
+redesign):** dispatch starvation under the interrupt(pthread_kill) flood. The
+guest's condvar-signal wakes are not dispatched promptly because the interrupt-RPC
+storm monopolizes the main loop; forward progress is gated to the **1 Hz XNU
+long-term-timer scan** (`TIMER_LONGTERM_THRESHOLD = 1 sec` on x86_64,
+duct-tape/xnu/osfmk/kern/timer_call.c:89). Every guest timeout (30s/5s/4s cond
+deadlines) exceeds the 1s threshold, so they sit in the long-term queue and are
+serviced only by the periodic ~1s rescan -- captured live in the auxlog as a
+perfect 1.000s cadence of non-override TIMER-ARM (job-tmp s3_flood_tt_auxlog +
+the arm/skip/fire deltas). So `done` advances ~1 step/sec -> maxstall climbs
+3->5 -> RESULT=HANG when a stall crosses STALL_LIMIT=5. This is a fairness/
+starvation problem, orthogonal to interrupt-as-cancellation, and belongs to its
+own ticket (candidate: a fast-path condvar-wake dispatch that pre-empts the
+interrupt storm, or servicing the ready-queue before re-blocking on epoll).
+
+**Landing decision: stage 3 achieved its goal and is SAFE TO LAND.** It eliminated
+the #114 SEGV stack-borrowing crash class (zero interrupt SEGVs across every
+stage-3 run), the throttled grain is 12/12 solid, and the residual flood
+slow-wedge is pre-existing (present identically on 2c). #114's SEGV is closed;
+the flood throughput-starvation HANG is spun out as a follow-up.
+
+Acceptance (original): `A0_STRICT=1 tests/a0-repro/a0-gate.sh full` GREEN. NOTE:
+the flood-KNOWNLIMIT leg will still coin-flip RED under A0_STRICT=1 as a HANG (not
+a crash) -- that is the pre-existing starvation bug, not a stage-3 failure. Land
+on: throttled GREEN + zero-SEGV + no-flood-regression vs 2c, and re-scope the
+A0_STRICT flood leg to the follow-up ticket.
 
 ## Today's flow (what dies)
 
