@@ -35,6 +35,7 @@
 #include <signal.h>
 
 #include <darlingserver/duct-tape.h>
+#include <darlingserver/duct-tape/hooks.h> // A0-ARCH stage 2c: DTAPE_XWAIT_* flags
 #include <atomic>
 
 #include <sys/syscall.h>
@@ -542,7 +543,6 @@ void DarlingServer::Thread::doWork() {
 	// _rerunPending whose wake was already consumed) and must not touch the parked wait --
 	// resuming it would deliver a spurious wakeup with wait_result == THREAD_WAITING.
 	bool hadResumePermit = false;
-	bool preserveWaitState = false;
 	bool preDispatchParked = false;
 	bool parkedContextIntact = false;
 
@@ -605,37 +605,21 @@ void DarlingServer::Thread::doWork() {
 	_mstateTransitionLocked(MicroState::Running,
 		hadResumePermit ? "dispatch-resume" : (preDispatchParked ? "dispatch-stale" : "dispatch-fresh"));
 	currentThreadVar = shared_from_this();
-	// perf#25a A0 (Part 3): an interrupt_enter that stacks onto an in-flight call must NOT run
-	// dtape_thread_entering(). The interrupted call may be suspended on a waitq with TH_WAIT set
-	// (e.g. fork_wait_for_child parked in waitForChildAfterFork's semaphore, or a psynch cv/mutex
-	// wait), and entering's unconditional "entering => cannot be waiting" clear half-tears that
-	// wait: dtape_thread_sigexc_enter's clear_wait_internal(THREAD_INTERRUPTED) then sees no
-	// TH_WAIT, returns KERN_NOT_WAITING, and SKIPS the real teardown -- no waitq unlink, no
-	// wait_result write, no wait-timer cancel. The thread stays linked on the waitq while its
-	// microthread unwinds, so the next semaphore_signal/wakeup on that waitq is consumed by a
-	// thread that is no longer waiting and the GENUINE waiter never wakes: zombie child + parent
-	// parked forever in recvmsg (the brew reinstall / nestwait.c hang). With the Part 2a fix (no
-	// wait_result pre-write) the same clobber is loud instead: the resumed continuation reads
-	// wait_result == THREAD_WAITING and panics in semaphore_convert_wait_result (captured live on
-	// nestwait ring-OFF). Preserving the wait state here lets clear_wait_internal perform the
-	// full, correct abort exactly like XNU. Fresh calls (no in-flight call to stack onto) keep
-	// the normal entering transition.
-	preserveWaitState =
-		// an interrupt_enter stacking onto an in-flight (possibly waitq-parked) call...
-		(_pendingCall && _pendingCall->number() == Call::Number::InterruptEnter
-			&& !_pendingCallOverride && (_activeCall || preDispatchParked || _continuationCallback))
-		// ...or ANY dispatch that resumes a suspended context (matches the resume branch
-		// below) rather than starting a fresh call. A genuine wake already had
-		// thread_unblock clear TH_WAIT and write wait_result; a stray wake (raw
-		// mutex/condvar handoff crosstalk, stale re-run) left TH_WAIT set and the Part 3e
-		// re-park guard in thread_block/thread_continuation_callback needs to SEE it --
-		// entering's unconditional TH_WAIT clear here would launder the stray wake into a
-		// spurious wait_result == THREAD_WAITING return (stranded waitq link -> "thread
-		// already waiting" panic / silent lost wakeup). dtape_thread_entering is only for
-		// fresh call dispatches, where the guest thread is by definition not blocked here.
-		|| (preDispatchParked && (_pendingCallOverride || !_pendingCall));
-	if (!preserveWaitState) {
-		dtape_thread_entering(_dtapeThread);
+	// A0-ARCH stage 2c: dtape_thread_entering() is GONE, and with it the whole
+	// preserveWaitState dance that existed only to keep its unconditional TH_WAIT clobber away
+	// from committed waits (the Part 3 history: half-torn waits, zombie children, the brew
+	// hang). The dispatch paths never touch the XNU wait state anymore; the wait tear-down
+	// paths (thread_unblock / clear_wait_internal / dying) own it, all through the stage-2c
+	// write funnel. What remains here is the ASSERTION the old skip-condition encoded: an
+	// unambiguous fresh-call dispatch (nothing parked, no override, a fresh non-interrupt
+	// call, nothing in flight) must find the guest thread NOT waiting -- a stranded TH_WAIT
+	// means some tear-down path failed to clear it (the recovery clear keeps release builds
+	// as robust as the old silent launder, but LOUDLY).
+	if (!preDispatchParked && !_pendingCallOverride
+			&& _pendingCall && _pendingCall->number() != Call::Number::InterruptEnter
+			&& !_activeCall && !_continuationCallback
+			&& dtape_thread_clear_stranded_wait(_dtapeThread)) {
+		_strandedWaitViolationLocked("doWork-fresh-dispatch");
 	}
 
 	returningToThreadTop = false;
@@ -870,7 +854,11 @@ bool DarlingServer::Thread::doWorkInline() {
 	}
 
 	currentThreadVar = shared_from_this();
-	dtape_thread_entering(_dtapeThread);
+	// stage 2c: the guards above proved this a genuinely fresh dispatch (not suspended, no
+	// continuation); a stranded TH_WAIT here is the same violation as doWork's
+	if (dtape_thread_clear_stranded_wait(_dtapeThread)) {
+		_strandedWaitViolationLocked("doWorkInline-dispatch");
+	}
 	_mstateTransitionLocked(MicroState::Running, "inline-dispatch");
 	lock.unlock();
 	_runningCondvar.notify_all();
@@ -991,7 +979,9 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 	}
 
 	currentThreadVar = shared_from_this();
-	dtape_thread_entering(_dtapeThread);
+	if (dtape_thread_clear_stranded_wait(_dtapeThread)) {
+		_strandedWaitViolationLocked("doMachReplyPortInline-dispatch");
+	}
 	_mstateTransitionLocked(MicroState::Running, "inline-mrp-dispatch");
 	lock.unlock();
 	_runningCondvar.notify_all();
@@ -1220,6 +1210,7 @@ const char* DarlingServer::Thread::stateEventName(StateEvent event) {
 		case StateEvent::ImpersonatePin:   return "impersonate-pin";
 		case StateEvent::ImpersonateUnpin: return "impersonate-unpin";
 		case StateEvent::Note:             return "note";
+		case StateEvent::XnuWait:          return "xwait";
 	}
 	return "?";
 };
@@ -1328,6 +1319,31 @@ void DarlingServer::Thread::dumpCurrentThreadStateTape() {
 			entry.reason ? entry.reason : "-", (unsigned)entry.aux8, (unsigned long long)entry.aux64);
 	}
 	fflush(stdout);
+};
+
+void DarlingServer::Thread::recordXnuWaitTransition(const char* reason, uint32_t oldState, uint32_t newState, int32_t waitResult, uint8_t flags) {
+	std::unique_lock lock(_rwlock);
+	_mstateEventLocked(StateEvent::XnuWait, reason, (uint8_t)(newState & 0xff),
+		((uint64_t)(oldState & 0xff) << 32) | (uint64_t)(uint32_t)waitResult);
+	if (flags & DTAPE_XWAIT_VIOLATION) {
+		microthreadLog.error() << _tid << "(" << _nstid << "): MSTATE VIOLATION (xwait): " << reason
+			<< " (state 0x" << std::hex << oldState << " -> 0x" << newState << std::dec
+			<< ", wait_result " << waitResult << ")" << microthreadLog.endLog;
+		_dumpStateTapeLocked(reason);
+		if (mstateAbortOnViolation) {
+			abort();
+		}
+	}
+};
+
+void DarlingServer::Thread::_strandedWaitViolationLocked(const char* site) {
+	_mstateEventLocked(StateEvent::XnuWait, site, 0, 0);
+	microthreadLog.error() << _tid << "(" << _nstid << "): MSTATE VIOLATION (xwait): fresh dispatch found"
+		<< " stranded TH_WAIT (recovery-cleared) at " << site << microthreadLog.endLog;
+	_dumpStateTapeLocked(site);
+	if (mstateAbortOnViolation) {
+		abort();
+	}
 };
 
 uint64_t DarlingServer::Thread::armWake(WakeKind kind) {

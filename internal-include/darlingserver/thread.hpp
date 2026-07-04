@@ -98,12 +98,20 @@ namespace DarlingServer {
 			ImpersonatePin,
 			ImpersonateUnpin,
 			Note,
+			XnuWait,       // A0-ARCH stage 2c: a named XNU wait-state transition (duct-tape
+			               // funnel); aux8 = new TH_* bits, aux64 = (old bits << 32) | wait_result
 		};
 		static const char* microStateName(MicroState state);
 		static const char* stateEventName(StateEvent event);
 		// best-effort tape dump of the CURRENT thread for the duct-tape panic funnel;
 		// takes no locks (the process is dying) and prints straight to stdout like panic()
 		static void dumpCurrentThreadStateTape();
+		// A0-ARCH stage 2c: called (via the thread_xwait_transition hook) by duct-tape's single
+		// XNU wait-state write funnel. Records the named transition on the tape; a violation
+		// (flags & DTAPE_XWAIT_VIOLATION) gets the full MSTATE VIOLATION treatment (error log +
+		// tape dump + abort under DSERVER_MSTATE_ABORT=1). Takes _rwlock (callers never hold it;
+		// same locking pattern as armWake/wake from dtape context).
+		void recordXnuWaitTransition(const char* reason, uint32_t oldState, uint32_t newState, int32_t waitResult, uint8_t flags);
 
 	private:
 		enum class DeferralState: uint8_t {
@@ -177,6 +185,12 @@ namespace DarlingServer {
 		void _mstateTransitionLocked(MicroState to, const char* reason, uint8_t aux8 = 0, uint64_t aux64 = 0);
 		void _mstateEventLocked(StateEvent event, const char* reason, uint8_t aux8 = 0, uint64_t aux64 = 0);
 		void _dumpStateTapeLocked(const char* why) const;
+		// A0-ARCH stage 2c: a FRESH-call dispatch found TH_WAIT stranded on the XNU side (the
+		// wait tear-down path that should have cleared it did not run). The old
+		// dtape_thread_entering() silently laundered this on EVERY dispatch; now the recovery
+		// clear (dtape_thread_clear_stranded_wait) happens only on this violation path and is
+		// reported loudly. _rwlock held.
+		void _strandedWaitViolationLocked(const char* site);
 		// perf#25a A0: a dispatch (scheduleThread) can be popped by a worker and
 		// enter doWork() while this microthread is still _running on another worker
 		// (mid suspend()/doneWorking transition; _running clears only at the
@@ -408,8 +422,8 @@ namespace DarlingServer {
 		// microthread fiber. doWork() always allocates a stack and makecontext/setcontext-swaps
 		// onto a fiber so the call can suspend; for a tiny self-trap that never suspends (e.g.
 		// mach_reply_port) that fiber machinery is ~half the hot-path cost. doWorkInline()
-		// establishes the SAME duct-tape context (currentThreadVar + dtape_thread_entering, so
-		// current_task()/current_thread() resolve identically) and calls the SAME processCall()
+		// establishes the SAME duct-tape context (currentThreadVar, so current_task()/
+		// current_thread() resolve identically) and calls the SAME processCall()
 		// on the current (main-loop) stack, then runs the same completion cleanup.
 		//
 		// CONTRACT: the caller MUST guarantee the call never suspends (never calls suspend()).
@@ -422,7 +436,7 @@ namespace DarlingServer {
 		// doWorkInline() still pays the generic RPC framing (rebuild a Message, callFromMessage
 		// registry re-lookup, heap-allocate a Call, decode) before running the op. For the single
 		// hottest no-arg trap we skip ALL of it: establish the SAME duct-tape context as
-		// doWorkInline (currentThreadVar + dtape_thread_entering, so current_task() resolves), call
+		// doWorkInline (currentThreadVar, so current_task() resolves), call
 		// dtape_mach_reply_port() DIRECTLY (the identical primitive MachReplyPort::processCall uses
 		// -- no reimplemented ipc_port_alloc), publish the {replyhdr.code=0}{uint32 port} reply
 		// straight onto this thread's s2c ring + wake the guest, then the same completion cleanup.
