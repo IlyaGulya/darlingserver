@@ -1123,22 +1123,6 @@ for call in calls:
 		internal_header.write("\t\t\t_sendReply(resultCode); \\\n")
 		internal_header.write("\t\t}; \\\n")
 
-	# z27x.7 (#118) WIP: sendDeferredReply sends this call's NATURAL reply (status 0) when it was
-	# deferred by a folded interrupt_enter. Only sigprocess (1 int reply param) folds today; emit
-	# for both shapes so the mechanism is general. 1 non-fd reply param -> _sendReply(0, replyValue)
-	# (sigprocess's new_bsd_signal_number); 0 reply params -> the pre-fold sendBasicReply(0).
-	if len(reply_parameters) == 1 and not is_fd(reply_parameters[0]):
-		internal_header.write("\tpublic: \\\n")
-		internal_header.write("\t\tvoid sendDeferredReply(int replyValue) override { \\\n")
-		internal_header.write("\t\t\t_sendReply(0, static_cast<" + parse_type(reply_parameters[0], False) + ">(replyValue)); \\\n")
-		internal_header.write("\t\t}; \\\n")
-	elif len(reply_parameters) == 0:
-		internal_header.write("\tpublic: \\\n")
-		internal_header.write("\t\tvoid sendDeferredReply(int replyValue) override { \\\n")
-		internal_header.write("\t\t\t(void)replyValue; \\\n")
-		internal_header.write("\t\t\t_sendReply(0); \\\n")
-		internal_header.write("\t\t}; \\\n")
-
 	if (flags & XNU_TRAP_CALL) != 0:
 		internal_header.write("\t\tbool isXNUTrap() const override { \\\n")
 		internal_header.write("\t\t\treturn true; \\\n")

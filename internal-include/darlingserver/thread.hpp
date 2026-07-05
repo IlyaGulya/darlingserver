@@ -257,9 +257,24 @@ namespace DarlingServer {
 			bool replyOwed = false;
 			std::shared_ptr<Call> enterCall = nullptr;
 			int signal = 0;
-			// z27x.7 (#118) WIP: for a folded-sigprocess deferred reply, enterCall is the Sigprocess
-			// call and its reply must carry new_bsd_signal_number; stash it here for the flush.
-			int owedReplyValue = 0;
+			// z27x.7 (#118): SAFE fold. When a signal interrupts an in-flight RPC, the folded
+			// Sigprocess must NOT run processSignal on the enter fiber (it just fired clear_wait;
+			// re-asserting a wait inline = "thread already waiting" panic under contention). Instead
+			// we capture the sigprocess params HERE, set foldPhase2Pending, requeue the Sigprocess
+			// call as a pending interrupt, and let doneWorking's repark-interrupt-cancel restore the
+			// interrupted context FIRST -- exactly the fiber boundary the old 2-RPC (separate
+			// interrupt_enter + sigprocess) path provided. The requeued dispatch runs processSignal
+			// on its own fresh fiber and sends the reply. foldSigCall holds the Sigprocess call so
+			// its reply lands on the right correlation. The common flood case (nothing in flight)
+			// never sets these -- it folds inline, fast and safe.
+			bool foldPhase2Pending = false;
+			std::shared_ptr<Call> foldSigCall = nullptr;
+			int foldBsdSignal = 0;
+			int foldLinuxSignal = 0;
+			int foldCode = 0;
+			uintptr_t foldSignalAddress = 0;
+			uintptr_t foldThreadState = 0;
+			uintptr_t foldFloatState = 0;
 		};
 		std::stack<InterruptContext> _interrupts;
 		std::queue<std::shared_ptr<Call>> _pendingInterrupts;
@@ -542,6 +557,11 @@ namespace DarlingServer {
 		uint32_t* bsdReturnValuePointer();
 
 		void pushCallReply(std::shared_ptr<Call> expectedCall, Message&& reply);
+
+		// z27x.7 (#118): re-dispatch a folded Sigprocess call for phase 2 (run processSignal on a
+		// FRESH fiber after the interrupted context was reparked). Pushes it onto _pendingInterrupts
+		// so doneWorking dispatches it exactly like a real interrupt -- its own fiber, its own stack.
+		void requeueFoldedSigprocess(std::shared_ptr<Call> sigprocessCall);
 
 		RunState getRunState() const;
 

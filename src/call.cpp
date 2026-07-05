@@ -477,13 +477,6 @@ void DarlingServer::Call::sendBSDReply(int resultCode, uint32_t returnValue) {
 	throw std::runtime_error("This call cannot send a BSD reply");
 };
 
-void DarlingServer::Call::sendDeferredReply(int replyValue) {
-	// z27x.7 (#118) WIP: default = the pre-fold behavior (interrupt_enter deferred as
-	// sendBasicReply(0)). replyValue is consulted only by the generated Sigprocess override.
-	(void)replyValue;
-	sendBasicReply(0);
-};
-
 bool DarlingServer::Call::isXNUTrap() const {
 	return false;
 };
@@ -1005,36 +998,88 @@ void DarlingServer::Call::ForkWaitForChild::processCall() {
 };
 
 void DarlingServer::Call::Sigprocess::processCall() {
-	// z27x.7 (#118) WIP: sigprocess FOLDS interrupt_enter. Run the enter logic FIRST (exactly what
-	// Call::InterruptEnter::processCall did), then processSignal, so the guest sends ONE RPC per
-	// signal. _handleInterruptEnterForCurrentThread() returns false (defer) ONLY when a signal
-	// interrupted an in-flight RPC (frame.interruptedCall set); it then armed replyOwed with
-	// enterCall == this call. In that case our reply is deferred (carrying new_bsd_signal_number)
-	// until the interrupted call's reply stashes.
-	// KNOWN BUG (NCONS=8 panic): running processSignal inline after enter's clear_wait on the same
-	// fiber re-asserts a wait mid-signal (the 2-RPC path dispatched the cancellation continuation
-	// on a separate fiber across the RPC boundary). Fix TBD: settle the cancellation dispatch, or
-	// only fold when !frame.interruptedCall.
+	// z27x.7 (#118): sigprocess FOLDS interrupt_enter -- the server runs the enter logic at the top
+	// of this call so the guest sends ONE RPC per signal instead of two (interrupt_enter+sigprocess),
+	// halving the per-signal RPC count under a pthread_kill flood. The guest still sends
+	// interrupt_exit; the server pushes the interrupt frame during THIS call (doWork extends its
+	// InterruptEnter frame-stacking to Sigprocess), so interrupt_exit still finds its frame.
+	//
+	// FIBER-BOUNDARY SAFETY (the NCONS=8 fix): _handleInterruptEnterForCurrentThread() fires
+	// clear_wait (dtape_thread_sigexc_enter) ONLY when a real RPC was in flight, and returns false.
+	// Running processSignal INLINE right after that clear_wait re-asserts a wait on the SAME fiber =
+	// "thread already waiting" panic under contention. The old 2-RPC path never hit this: enter
+	// completed its fiber, doneWorking did repark-interrupt-cancel, THEN sigprocess arrived on a
+	// FRESH fiber. So we reproduce that boundary: when enter deferred (in-flight interrupted), we do
+	// NOT touch processSignal here -- we capture the params on the frame, requeue THIS call as a
+	// pending interrupt, and let doneWorking restore+repark the interrupted context first. The
+	// requeued dispatch (phase 2) runs processSignal on its own fresh fiber and replies. The common
+	// flood case (nothing in flight, no clear_wait) folds inline -- fast and panic-free.
+	auto thread = _thread.lock();
+
+	// Phase 2: the re-dispatched folded sigprocess. The frame already exists (enter ran in phase 1
+	// and doneWorking has since reparked the interrupted context). Just process + reply.
+	if (thread) {
+		std::unique_lock lock(thread->_rwlock);
+		if (!thread->_interrupts.empty() && thread->_interrupts.top().foldPhase2Pending
+				&& thread->_interrupts.top().foldSigCall.get() == this) {
+			auto& frame = thread->_interrupts.top();
+			frame.foldPhase2Pending = false;
+			frame.foldSigCall = nullptr;
+			int bsd = frame.foldBsdSignal, lin = frame.foldLinuxSignal, cd = frame.foldCode;
+			uintptr_t sigAddr = frame.foldSignalAddress, tstate = frame.foldThreadState, fstate = frame.foldFloatState;
+			lock.unlock();
+
+			int code = 0;
+			int newBSDSignal = 0;
+			try {
+				thread->processSignal(bsd, lin, cd, sigAddr, tstate, fstate);
+				newBSDSignal = thread->pendingSignal();
+			} catch (std::system_error e) {
+				code = -e.code().value();
+			}
+			_sendReply(code, newBSDSignal);
+			return;
+		}
+	}
+
+	// Phase 1: run the folded interrupt_enter logic.
 	bool replyNow = Thread::_handleInterruptEnterForCurrentThread();
 
 	int code = 0;
 	int newBSDSignal = 0;
 
-	if (auto thread = _thread.lock()) {
+	if (thread) {
+		if (!replyNow) {
+			// A real in-flight RPC was interrupted: enter fired clear_wait + armed replyOwed/enterCall
+			// on the frame (enterCall == this). DEFER processSignal to a fresh fiber to preserve the
+			// fiber boundary. We keep the replyOwed arming: pushCallReply's owed-enter flush fires when
+			// the interrupted call stashes its reply -- which is EXACTLY the post-repark moment the old
+			// 2-RPC guest would have sent its sigprocess. There, requeueFoldedSigprocess re-dispatches
+			// us on a fresh fiber (phase 2) to run processSignal + reply. Stash the params for it now.
+			std::unique_lock lock(thread->_rwlock);
+			if (!thread->_interrupts.empty() && thread->_interrupts.top().replyOwed
+					&& thread->_interrupts.top().enterCall.get() == this) {
+				auto& frame = thread->_interrupts.top();
+				frame.foldPhase2Pending = true;
+				frame.foldSigCall = shared_from_this();
+				frame.foldBsdSignal = _body.bsd_signal_number;
+				frame.foldLinuxSignal = _body.linux_signal_number;
+				frame.foldCode = _body.code;
+				frame.foldSignalAddress = (uintptr_t)_body.signal_address;
+				frame.foldThreadState = (uintptr_t)_body.thread_state;
+				frame.foldFloatState = (uintptr_t)_body.float_state;
+				return;
+			}
+			// frame popped out from under us (desync); fall through and reply inline.
+		}
+
+		// replyNow == true (common flood: nothing in flight, no clear_wait happened -> safe to fold
+		// inline) OR a desync fell through. Process + reply now.
 		try {
 			thread->processSignal(_body.bsd_signal_number, _body.linux_signal_number, _body.code, _body.signal_address, _body.thread_state, _body.float_state);
 			newBSDSignal = thread->pendingSignal();
 		} catch (std::system_error e) {
 			code = -e.code().value();
-		}
-
-		if (!replyNow) {
-			std::unique_lock lock(thread->_rwlock);
-			if (!thread->_interrupts.empty() && thread->_interrupts.top().replyOwed) {
-				thread->_interrupts.top().owedReplyValue = newBSDSignal;
-				return;
-			}
-			// frame popped out from under us (desync); fall through and reply now.
 		}
 	} else {
 		code = -ESRCH;

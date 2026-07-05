@@ -86,12 +86,6 @@ namespace DarlingServer {
 		// FIXME: this should actually be in a "BSD" subclass with BSD traps inheriting from it
 		virtual void sendBSDReply(int resultCode, uint32_t returnValue);
 
-		// z27x.7 (#118) WIP: send this call's NATURAL reply (status 0) when it was deferred by a
-		// folded interrupt_enter (InterruptContext::owedReplyValue). Base default == the pre-fold
-		// sendBasicReply(0); the generated Sigprocess override sends _sendReply(0, replyValue) so
-		// new_bsd_signal_number reaches the guest.
-		virtual void sendDeferredReply(int replyValue);
-
 		virtual bool isXNUTrap() const;
 		virtual bool isBSDTrap() const;
 

@@ -341,6 +341,25 @@ void DarlingServer::Thread::setPendingCall(std::shared_ptr<Call> newPendingCall)
 	_pendingCall = newPendingCall;
 };
 
+void DarlingServer::Thread::requeueFoldedSigprocess(std::shared_ptr<Call> sigprocessCall) {
+	// z27x.7 (#118): the folded Sigprocess deferred its processSignal (a real RPC was interrupted,
+	// enter fired clear_wait). We are called from pushCallReply's owed-enter flush -- the interrupted
+	// call has just stashed its reply and doneWorking has (or is about to) repark-interrupt-cancel the
+	// interrupted context, so running processSignal now on its own fresh fiber no longer double-asserts
+	// the wait. Push onto _pendingInterrupts: doneWorking's tail dispatches exactly one pending
+	// interrupt per completed stint (its own fiber, own stack) -- identical to how a real interrupt or
+	// the old separate sigprocess RPC would have arrived.
+	std::unique_lock lock(_rwlock);
+	_pendingInterrupts.push(sigprocessCall);
+	// If the thread is idle (no work in flight to trigger doneWorking's tail), kick a dispatch so the
+	// pending interrupt is picked up. When a call IS in flight, doneWorking handles it and this
+	// schedule is a harmless no-op-ish extra wake (the running guard defers it).
+	if (!_pendingCall && !_activeCall) {
+		lock.unlock();
+		Server::sharedInstance().scheduleThread(shared_from_this());
+	}
+};
+
 std::shared_ptr<DarlingServer::Call> DarlingServer::Thread::activeCall() const {
 	std::shared_lock lock(_rwlock);
 	return _activeCall;
@@ -651,10 +670,13 @@ void DarlingServer::Thread::doWork() {
 
 		_rwlock.lock();
 
-		// z27x.7 (#118) WIP: a folded Sigprocess runs the enter logic and needs the same frame
-		// stacked, so it takes this branch too. (interrupt_enter still dispatches on its own for
-		// sigrt_handler's SUSPEND/S2C paths.)
-		if (!_pendingCallOverride && _pendingCall
+		// z27x.7 (#118): a folded Sigprocess runs the enter logic and needs the same frame stacked,
+		// so PHASE 1 takes this branch too. (interrupt_enter still dispatches on its own for
+		// sigrt_handler's SUSPEND/S2C paths.) The PHASE-2 re-dispatch (foldPhase2Pending on the top
+		// frame) must REUSE the existing frame -- its stashed params live there -- so it must NOT
+		// stack a new one; exclude it.
+		bool foldPhase2Redispatch = !_interrupts.empty() && _interrupts.top().foldPhase2Pending;
+		if (!_pendingCallOverride && _pendingCall && !foldPhase2Redispatch
 				&& (_pendingCall->number() == Call::Number::InterruptEnter
 					|| _pendingCall->number() == Call::Number::Sigprocess)) {
 			// A0-ARCH stage 3: the frame is the PARKING SPOT for the interrupted context while
@@ -2768,7 +2790,10 @@ bool DarlingServer::Thread::_publishReplyToRingLocked(Message& reply) {
 
 void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Message&& reply) {
 	std::shared_ptr<Call> owedEnterReply = nullptr;
-	int owedEnterReplyValue = 0; // z27x.7 (#118) WIP: new_bsd_signal_number for a folded-sigprocess deferred reply
+	// z27x.7 (#118): when the owed "enter" reply is a FOLDED sigprocess that deferred its
+	// processSignal (foldPhase2Pending), we must NOT send a reply here -- instead re-dispatch it for
+	// phase 2 on a fresh fiber. foldSigToRequeue carries that call; owedEnterReply stays null then.
+	std::shared_ptr<Call> foldSigToRequeue = nullptr;
 	{
 	std::unique_lock lock(_rwlock);
 
@@ -2812,8 +2837,15 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 		// whose _deactivateCallLocked clears it from there.
 		if (_interrupts.top().replyOwed) {
 			_interrupts.top().replyOwed = false;
-			owedEnterReply = _interrupts.top().enterCall;
-			owedEnterReplyValue = _interrupts.top().owedReplyValue; // z27x.7 (#118) WIP
+			if (_interrupts.top().foldPhase2Pending) {
+				// z27x.7 (#118): folded sigprocess -- requeue for phase 2 instead of replying. The
+				// interrupted context is being reparked (repark-interrupt-cancel), so processSignal on
+				// a fresh fiber won't double-assert its wait. Leave enterCall in the frame slot; the
+				// phase-2 dispatch clears it and sends the real reply. Do it OUTSIDE the lock below.
+				foldSigToRequeue = _interrupts.top().foldSigCall;
+			} else {
+				owedEnterReply = _interrupts.top().enterCall;
+			}
 		}
 	} else if (_deferReplyForS2C) {
 		// A ring-originated call that performs an S2C upcall defers its reply here; the flush in
@@ -2833,10 +2865,13 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 	}
 	} // release _rwlock
 
-	if (owedEnterReply) {
+	if (foldSigToRequeue) {
+		// z27x.7 (#118): re-dispatch the folded sigprocess for phase 2 (processSignal on a fresh
+		// fiber). NOT a reply -- the reply is sent by the phase-2 dispatch itself.
+		requeueFoldedSigprocess(foldSigToRequeue);
+	} else if (owedEnterReply) {
 		try {
-			// z27x.7 (#118) WIP: carries owedEnterReplyValue for a folded sigprocess; base == sendBasicReply(0)
-			owedEnterReply->sendDeferredReply(owedEnterReplyValue);
+			owedEnterReply->sendBasicReply(0);
 		} catch (const std::exception& ex) {
 			// only reachable under an RPC-stream desync that popped the frame between the
 			// unlock above and the re-lock inside sendBasicReply; survive loudly
