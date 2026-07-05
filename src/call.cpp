@@ -477,6 +477,13 @@ void DarlingServer::Call::sendBSDReply(int resultCode, uint32_t returnValue) {
 	throw std::runtime_error("This call cannot send a BSD reply");
 };
 
+void DarlingServer::Call::sendDeferredReply(int replyValue) {
+	// z27x.7 (#118) WIP: default = the pre-fold behavior (interrupt_enter deferred as
+	// sendBasicReply(0)). replyValue is consulted only by the generated Sigprocess override.
+	(void)replyValue;
+	sendBasicReply(0);
+};
+
 bool DarlingServer::Call::isXNUTrap() const {
 	return false;
 };
@@ -998,6 +1005,18 @@ void DarlingServer::Call::ForkWaitForChild::processCall() {
 };
 
 void DarlingServer::Call::Sigprocess::processCall() {
+	// z27x.7 (#118) WIP: sigprocess FOLDS interrupt_enter. Run the enter logic FIRST (exactly what
+	// Call::InterruptEnter::processCall did), then processSignal, so the guest sends ONE RPC per
+	// signal. _handleInterruptEnterForCurrentThread() returns false (defer) ONLY when a signal
+	// interrupted an in-flight RPC (frame.interruptedCall set); it then armed replyOwed with
+	// enterCall == this call. In that case our reply is deferred (carrying new_bsd_signal_number)
+	// until the interrupted call's reply stashes.
+	// KNOWN BUG (NCONS=8 panic): running processSignal inline after enter's clear_wait on the same
+	// fiber re-asserts a wait mid-signal (the 2-RPC path dispatched the cancellation continuation
+	// on a separate fiber across the RPC boundary). Fix TBD: settle the cancellation dispatch, or
+	// only fold when !frame.interruptedCall.
+	bool replyNow = Thread::_handleInterruptEnterForCurrentThread();
+
 	int code = 0;
 	int newBSDSignal = 0;
 
@@ -1007,6 +1026,15 @@ void DarlingServer::Call::Sigprocess::processCall() {
 			newBSDSignal = thread->pendingSignal();
 		} catch (std::system_error e) {
 			code = -e.code().value();
+		}
+
+		if (!replyNow) {
+			std::unique_lock lock(thread->_rwlock);
+			if (!thread->_interrupts.empty() && thread->_interrupts.top().replyOwed) {
+				thread->_interrupts.top().owedReplyValue = newBSDSignal;
+				return;
+			}
+			// frame popped out from under us (desync); fall through and reply now.
 		}
 	} else {
 		code = -ESRCH;

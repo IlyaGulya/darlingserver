@@ -175,6 +175,13 @@ calls = [
 
 	('fork_wait_for_child', [], [], ALLOW_INTERRUPTIONS),
 
+	# z27x.7 (#118) WIP: sigprocess FOLDS interrupt_enter (server runs the enter logic at the top
+	# of Sigprocess::processCall) so the guest sends ONE RPC per signal instead of two. Closes the
+	# NCONS=1 pthread_kill flood (12/12 OK). BLOCKED: NCONS=8 (contended mutex + storm) panics --
+	# the fold runs processSignal inline after enter's clear_wait on the SAME fiber, but the OLD
+	# two-RPC path dispatched the cancellation continuation on a SEPARATE fiber across the RPC
+	# boundary; folding re-asserts a wait mid-signal (perf#25a Part-2 / #114 fiber-reentry class).
+	# PUSH_UNKNOWN_REPLIES is required for the same stray-reply race interrupt_enter needed it for.
 	('sigprocess', [
 		('bsd_signal_number', 'int32_t'),
 		('linux_signal_number', 'int32_t'),
@@ -187,7 +194,7 @@ calls = [
 		('float_state', 'uint64_t'),
 	], [
 		('new_bsd_signal_number', 'int32_t'),
-	]),
+	], PUSH_UNKNOWN_REPLIES),
 
 	('task_is_64_bit', [
 		('id', 'int32_t'),
@@ -1114,6 +1121,22 @@ for call in calls:
 		internal_header.write("\tpublic: \\\n")
 		internal_header.write("\t\tvoid sendBasicReply(int resultCode) override { \\\n")
 		internal_header.write("\t\t\t_sendReply(resultCode); \\\n")
+		internal_header.write("\t\t}; \\\n")
+
+	# z27x.7 (#118) WIP: sendDeferredReply sends this call's NATURAL reply (status 0) when it was
+	# deferred by a folded interrupt_enter. Only sigprocess (1 int reply param) folds today; emit
+	# for both shapes so the mechanism is general. 1 non-fd reply param -> _sendReply(0, replyValue)
+	# (sigprocess's new_bsd_signal_number); 0 reply params -> the pre-fold sendBasicReply(0).
+	if len(reply_parameters) == 1 and not is_fd(reply_parameters[0]):
+		internal_header.write("\tpublic: \\\n")
+		internal_header.write("\t\tvoid sendDeferredReply(int replyValue) override { \\\n")
+		internal_header.write("\t\t\t_sendReply(0, static_cast<" + parse_type(reply_parameters[0], False) + ">(replyValue)); \\\n")
+		internal_header.write("\t\t}; \\\n")
+	elif len(reply_parameters) == 0:
+		internal_header.write("\tpublic: \\\n")
+		internal_header.write("\t\tvoid sendDeferredReply(int replyValue) override { \\\n")
+		internal_header.write("\t\t\t(void)replyValue; \\\n")
+		internal_header.write("\t\t\t_sendReply(0); \\\n")
 		internal_header.write("\t\t}; \\\n")
 
 	if (flags & XNU_TRAP_CALL) != 0:

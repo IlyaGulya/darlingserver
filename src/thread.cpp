@@ -651,7 +651,12 @@ void DarlingServer::Thread::doWork() {
 
 		_rwlock.lock();
 
-		if (!_pendingCallOverride && _pendingCall && _pendingCall->number() == Call::Number::InterruptEnter) {
+		// z27x.7 (#118) WIP: a folded Sigprocess runs the enter logic and needs the same frame
+		// stacked, so it takes this branch too. (interrupt_enter still dispatches on its own for
+		// sigrt_handler's SUSPEND/S2C paths.)
+		if (!_pendingCallOverride && _pendingCall
+				&& (_pendingCall->number() == Call::Number::InterruptEnter
+					|| _pendingCall->number() == Call::Number::Sigprocess)) {
 			// A0-ARCH stage 3: the frame is the PARKING SPOT for the interrupted context while
 			// the enter fiber runs -- nothing ever jumps into it from another stack anymore;
 			// doneWorking moves it back into the live slots once the enter fiber completes.
@@ -2763,6 +2768,7 @@ bool DarlingServer::Thread::_publishReplyToRingLocked(Message& reply) {
 
 void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Message&& reply) {
 	std::shared_ptr<Call> owedEnterReply = nullptr;
+	int owedEnterReplyValue = 0; // z27x.7 (#118) WIP: new_bsd_signal_number for a folded-sigprocess deferred reply
 	{
 	std::unique_lock lock(_rwlock);
 
@@ -2807,6 +2813,7 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 		if (_interrupts.top().replyOwed) {
 			_interrupts.top().replyOwed = false;
 			owedEnterReply = _interrupts.top().enterCall;
+			owedEnterReplyValue = _interrupts.top().owedReplyValue; // z27x.7 (#118) WIP
 		}
 	} else if (_deferReplyForS2C) {
 		// A ring-originated call that performs an S2C upcall defers its reply here; the flush in
@@ -2828,7 +2835,8 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 
 	if (owedEnterReply) {
 		try {
-			owedEnterReply->sendBasicReply(0);
+			// z27x.7 (#118) WIP: carries owedEnterReplyValue for a folded sigprocess; base == sendBasicReply(0)
+			owedEnterReply->sendDeferredReply(owedEnterReplyValue);
 		} catch (const std::exception& ex) {
 			// only reachable under an RPC-stream desync that popped the frame between the
 			// unlock above and the re-lock inside sendBasicReply; survive loudly

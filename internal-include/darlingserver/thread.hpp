@@ -257,6 +257,9 @@ namespace DarlingServer {
 			bool replyOwed = false;
 			std::shared_ptr<Call> enterCall = nullptr;
 			int signal = 0;
+			// z27x.7 (#118) WIP: for a folded-sigprocess deferred reply, enterCall is the Sigprocess
+			// call and its reply must carry new_bsd_signal_number; stash it here for the flush.
+			int owedReplyValue = 0;
 		};
 		std::stack<InterruptContext> _interrupts;
 		std::queue<std::shared_ptr<Call>> _pendingInterrupts;
