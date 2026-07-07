@@ -206,7 +206,7 @@ boolean_t machine_timeout_suspended(void) {
 
 boolean_t IOTaskHasEntitlement(task_t task, const char* entitlement) {
 	dtape_stub_safe();
-	return TRUE;
+	return FALSE;
 };
 
 kern_return_t kmod_create(host_priv_t host_priv, vm_address_t addr, kmod_t* id) {
