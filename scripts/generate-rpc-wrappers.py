@@ -796,7 +796,11 @@ extern "C" {
 
 """)
 
-public_header.write("#define DSERVER_CALL_UNMANAGED_FLAG 0x80000000U\n\n")
+public_header.write("#define DSERVER_CALL_UNMANAGED_FLAG 0x80000000U\n")
+public_header.write("#define DSERVER_CALL_SERIAL_FLAG 0x40000000U\n")
+public_header.write("#define DSERVER_CALL_SERIAL_MASK 0x3fff0000U\n")
+public_header.write("#define DSERVER_CALL_SERIAL_SHIFT 16U\n")
+public_header.write("#define DSERVER_CALL_BASE_MASK 0x8000ffffU\n\n")
 public_header.write("enum dserver_callnum {\n")
 # "52ccall" -> "s2c call"
 public_header.write("\tdserver_callnum_s2c = 0x52cca11,\n")
@@ -822,6 +826,26 @@ public_header.write("};\n")
 public_header.write("""\
 
 typedef enum dserver_callnum dserver_callnum_t;
+
+__attribute__((always_inline)) static dserver_callnum_t dserver_rpc_callnum_base(dserver_callnum_t callnum) {
+	uint32_t raw = (uint32_t)callnum;
+	if ((raw & DSERVER_CALL_SERIAL_FLAG) == 0)
+		return callnum;
+	return (dserver_callnum_t)(raw & DSERVER_CALL_BASE_MASK);
+}
+
+__attribute__((always_inline)) static uint32_t dserver_rpc_callnum_serial(dserver_callnum_t callnum) {
+	uint32_t raw = (uint32_t)callnum;
+	if ((raw & DSERVER_CALL_SERIAL_FLAG) == 0)
+		return 0;
+	return (raw & DSERVER_CALL_SERIAL_MASK) >> DSERVER_CALL_SERIAL_SHIFT;
+}
+
+__attribute__((always_inline)) static dserver_callnum_t dserver_rpc_callnum_with_serial(dserver_callnum_t callnum, uint32_t serial) {
+	if (serial == 0)
+		return callnum;
+	return (dserver_callnum_t)(((uint32_t)callnum & DSERVER_CALL_BASE_MASK) | DSERVER_CALL_SERIAL_FLAG | ((serial << DSERVER_CALL_SERIAL_SHIFT) & DSERVER_CALL_SERIAL_MASK));
+}
 
 #ifndef DSERVER_RPC_HOOKS_ARCHITECTURE
 #define DSERVER_RPC_HOOKS_ARCHITECTURE 1
@@ -958,6 +982,15 @@ DSERVER_RPC_HOOKS_ATTRIBUTE void dserver_rpc_hooks_push_reply(int socket, const 
 #endif
 
 """.format(library_import))
+
+library_source.write("""\
+static uint32_t __dserver_rpc_next_serial(void) {
+\tstatic uint32_t next_serial = 1;
+\tuint32_t serial = __atomic_fetch_add(&next_serial, 1, __ATOMIC_RELAXED) & 0x3fffU;
+\treturn serial ? serial : 1;
+}
+
+""")
 
 internal_header.write("#define DSERVER_VALID_CALLNUM_CASES \\\n")
 for call in calls:
@@ -1110,7 +1143,7 @@ for call in calls:
 			int fdIndex = 0; \\
 			reply.setAddress(_replyAddress); \\
 			auto replyStruct = reinterpret_cast<dserver_rpc_reply_{0}_t*>(reply.data().data()); \\
-			replyStruct->header.number = dserver_callnum_{0}; \\
+			replyStruct->header.number = _header.number; \\
 			replyStruct->header.code = resultCode; \\
 			"""), '\t\t\t').format(call_name))
 
@@ -1296,7 +1329,7 @@ for call in calls:
 internal_header.write("\n")
 
 public_header.write("__attribute__((always_inline)) static const char* dserver_callnum_to_string(dserver_callnum_t callnum) {\n")
-public_header.write("\tswitch (callnum) {\n")
+public_header.write("\tswitch (dserver_rpc_callnum_base(callnum)) {\n")
 public_header.write("\t\tcase dserver_callnum_s2c: return \"dserver_callnum_s2c\";\n")
 public_header.write("\t\tcase dserver_callnum_push_reply: return \"dserver_callnum_push_reply\";\n")
 for call in calls:
@@ -1410,7 +1443,7 @@ for call in calls:
 				.architecture = dserver_rpc_hooks_get_architecture(),
 				.pid = dserver_rpc_hooks_get_pid(),
 				.tid = dserver_rpc_hooks_get_tid(),
-				.number = dserver_callnum_{0},
+				.number = dserver_rpc_callnum_with_serial(dserver_callnum_{0}, __dserver_rpc_next_serial()),
 			}},
 		"""), '\t').format(call_name))
 
@@ -1605,14 +1638,14 @@ for call in calls:
 		library_source.write("\t\treturn dserver_rpc_hooks_get_communication_error_status();\n")
 		library_source.write("\t}\n\n")
 
-		library_source.write("\tif (reply_msg.reply.header.number != dserver_callnum_" + call_name + ") {\n")
+		library_source.write("\tif (dserver_rpc_callnum_base(reply_msg.reply.header.number) != dserver_callnum_" + call_name + " || dserver_rpc_callnum_serial(reply_msg.reply.header.number) != dserver_rpc_callnum_serial(call.header.number)) {\n")
 		if (flags & PUSH_UNKNOWN_REPLIES) != 0:
 			library_source.write("\t\tdserver_rpc_hooks_push_reply(server_socket, &replymsg, long_status);\n")
 			library_source.write("\t\tgoto retry_receive;\n")
 		else:
 			if (flags & ALLOW_INTERRUPTIONS) == 0:
 				library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
-			library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE MESSAGE: number=%d (expected %d), code=%d, length=%ld (expected %zu) ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, reply_msg.reply.header.number, dserver_callnum_" + call_name + ", reply_msg.reply.header.code, long_status, sizeof(reply_msg.reply));\n")
+			library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE MESSAGE: number=%d (expected %d), serial=%u (expected %u), code=%d, length=%ld (expected %zu) ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, dserver_rpc_callnum_base(reply_msg.reply.header.number), dserver_callnum_" + call_name + ", dserver_rpc_callnum_serial(reply_msg.reply.header.number), dserver_rpc_callnum_serial(call.header.number), reply_msg.reply.header.code, long_status, sizeof(reply_msg.reply));\n")
 			library_source.write("\t\treturn dserver_rpc_hooks_get_communication_error_status();\n")
 		library_source.write("\t}\n\n")
 
