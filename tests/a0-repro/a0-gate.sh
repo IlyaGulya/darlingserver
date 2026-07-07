@@ -79,24 +79,34 @@ verdict() { # name ok
 # --- synthetic runner: compile <src> in-guest, run, expect RESULT=OK ---------
 run_synth() { # name src cflags secs [ring]
 	local name="$1" src="$2" cf="$3" secs="$4" ring="${5:-$RING}"
-	cleanboot
 	# A0-ARCH stage 2a: surface shadow state-machine violations. Fuzz legs run with
 	# DSERVER_MSTATE_ABORT=1 (violation = crash = RED); all legs also log at err level
 	# and grep the server log for MSTATE VIOLATION afterwards (log-and-survive mode).
 	local DLOG="$PREFIX/private/var/log/dserver.log"
-	: > "$DLOG" 2>/dev/null || true
-	cp "$SELFDIR/$src" "$PREFIX/Users/ilyagulya/$src" 2>/dev/null || cp "$SELFDIR/$src" "$PREFIX/Users/"*"/$src"
-	local G="$WORK/$name.log" HARD=$((secs+50)) W=0
-	DARLING_SERVER_FAST_OPS="$ring" DSERVER_SCHED_FUZZ="${FUZZ:-}" DSERVER_MSTATE_ABORT="${A0_MSTATE_ABORT:-${FUZZ:+1}}" DSERVER_LOG_LEVEL="${DSERVER_LOG_LEVEL:-err}" timeout "$HARD" "$L" shell /bin/bash --login -c \
-		"cd /Users/ilyagulya; $CLANG -isysroot $SDK -O2 $cf -o bin_$name $src 2>&1 && ./bin_$name $secs 2>&1; echo RUN_DONE" \
-		</dev/null > "$G" 2>&1 &
-	local GP=$!
-	while kill -0 $GP 2>/dev/null; do
-		sleep 2; W=$((W+2))
-		grep -q "RESULT=" "$G" && break
-		[ "$W" -ge $((HARD+5)) ] && break
+	local G="$WORK/$name.log" HARD=$((secs+50)) attempt=1
+	while :; do
+		cleanboot
+		: > "$DLOG" 2>/dev/null || true
+		cp "$SELFDIR/$src" "$PREFIX/Users/ilyagulya/$src" 2>/dev/null || cp "$SELFDIR/$src" "$PREFIX/Users/"*"/$src"
+		local W=0
+		DARLING_SERVER_FAST_OPS="$ring" DSERVER_SCHED_FUZZ="${FUZZ:-}" DSERVER_MSTATE_ABORT="${A0_MSTATE_ABORT:-${FUZZ:+1}}" DSERVER_LOG_LEVEL="${DSERVER_LOG_LEVEL:-err}" timeout "$HARD" "$L" shell /bin/bash --login -c \
+			"cd /Users/ilyagulya; $CLANG -isysroot $SDK -O2 $cf -o bin_$name $src 2>&1 && ./bin_$name $secs 2>&1; echo RUN_DONE" \
+			</dev/null > "$G" 2>&1 &
+		local GP=$!
+		while kill -0 $GP 2>/dev/null; do
+			sleep 2; W=$((W+2))
+			grep -q "RESULT=" "$G" && break
+			[ "$W" -ge $((HARD+5)) ] && break
+		done
+		kill -9 $GP 2>/dev/null; wait $GP 2>/dev/null
+		if [ "$attempt" = 1 ] && ! grep -q "RESULT=" "$G" && grep -q "shellspawn.sock" "$G"; then
+			note "$name" "shellspawn missing before test; retrying once"
+			mv "$G" "$G.shellspawn-retry1"
+			attempt=2
+			continue
+		fi
+		break
 	done
-	kill -9 $GP 2>/dev/null; wait $GP 2>/dev/null
 	grep -q "RESULT=OK" "$G"; local ok=$((1-$?))
 	grep -q "duct-tape panic" "$G" && ok=0
 	if grep -q "MSTATE VIOLATION" "$DLOG" 2>/dev/null; then
