@@ -459,7 +459,11 @@ kern_return_t handle_ux_exception(thread_t xthread, int exception, mach_exceptio
 	if (thread->processing_signal) {
 		dtape_hooks->thread_set_pending_signal(thread->context, ux_signal);
 	} else {
-		dtape_stub_unsafe("handle_ux_exception(): TODO: introduce signal into thread");
+		dtape_stub("handle_ux_exception(): queueing signal outside sigexc processing");
+		if (!dtape_hooks || !dtape_hooks->thread_set_pending_signal || !thread->context || ux_signal <= 0) {
+			return KERN_FAILURE;
+		}
+		dtape_hooks->thread_set_pending_signal(thread->context, ux_signal);
 	}
 
 	return KERN_SUCCESS;
@@ -1466,7 +1470,7 @@ kern_return_t thread_abort_safely(thread_t thread) {
 	//       to replicate that, we'd probably have to use another
 	//       real-time signal with SA_RESTART off.
 	dtape_stub();
-	return KERN_SUCCESS;
+	return KERN_FAILURE;
 };
 
 kern_return_t thread_convert_thread_state(thread_t thread, int direction, thread_state_flavor_t flavor, thread_state_t in_state, mach_msg_type_number_t in_state_count, thread_state_t out_state, mach_msg_type_number_t* out_state_count) {
