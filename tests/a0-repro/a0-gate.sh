@@ -11,6 +11,9 @@
 #                             #          source build: launch-churn torture)
 #   ./a0-gate.sh synth        # synthetics only (~8 min, no brew)
 #
+# After a RED run:
+#   ./a0-digest.sh /tmp/a0gate.XXXX
+#
 # Hang detection:
 #   * synthetics carry their own stall detector (RESULT=OK|HANG on stdout);
 #   * brew phases use SERVER RPC PROGRESS (darling-stat rpcs_serviced), NOT
@@ -35,6 +38,10 @@
 #   A0_NEST_RUNS / A0_CV_RUNS / A0_BREW_RUNS   iteration counts
 #   A0_MSTATE_ABORT  1|0  force DSERVER_MSTATE_ABORT for ALL synth legs (default:
 #                    1 on fuzz legs only; violations always greped from dserver.log)
+#   A0_AUXLOG         1|0  capture per-leg dserver-auxlog.txt RPCTRACE/AUXLOG
+#                    sidecars for reply-disposition debugging (default 0)
+#                    Use sparingly on long soaks: aux traces are often
+#                    ~100MB per synthetic leg.
 #   NOTE for -DDSERVER_ASAN=ON binaries: export
 #   ASAN_OPTIONS=detect_stack_use_after_return=0 before running the gate --
 #   ASAN's fake stack does not survive the fiber getcontext/setcontext switches
@@ -83,14 +90,18 @@ run_synth() { # name src cflags secs [ring]
 	# DSERVER_MSTATE_ABORT=1 (violation = crash = RED); all legs also log at err level
 	# and grep the server log for MSTATE VIOLATION afterwards (log-and-survive mode).
 	local DLOG="$PREFIX/private/var/log/dserver.log"
+	local ALOG="$PREFIX/private/var/log/dserver-auxlog.txt"
+	local CLOG="/tmp/dserver-client-rpc.log"
 	local G="$WORK/$name.log" HARD=$((secs+50)) attempt=1
 	while :; do
 		cleanboot
 		: > "$DLOG" 2>/dev/null || true
+		: > "$ALOG" 2>/dev/null || true
+		: > "$CLOG" 2>/dev/null || true
 		cp "$SELFDIR/$src" "$PREFIX/Users/ilyagulya/$src" 2>/dev/null || cp "$SELFDIR/$src" "$PREFIX/Users/"*"/$src"
 		local W=0
-		DARLING_SERVER_FAST_OPS="$ring" DSERVER_SCHED_FUZZ="${FUZZ:-}" DSERVER_MSTATE_ABORT="${A0_MSTATE_ABORT:-${FUZZ:+1}}" DSERVER_LOG_LEVEL="${DSERVER_LOG_LEVEL:-err}" timeout "$HARD" "$L" shell /bin/bash --login -c \
-			"cd /Users/ilyagulya; $CLANG -isysroot $SDK -O2 $cf -o bin_$name $src 2>&1 && ./bin_$name $secs 2>&1; echo RUN_DONE" \
+		DARLING_SERVER_FAST_OPS="$ring" DARLING_SERVER_AUXLOG="${A0_AUXLOG:-0}" DSERVER_SCHED_FUZZ="${FUZZ:-}" DSERVER_MSTATE_ABORT="${A0_MSTATE_ABORT:-${FUZZ:+1}}" DSERVER_LOG_LEVEL="${DSERVER_LOG_LEVEL:-err}" timeout "$HARD" "$L" shell /bin/bash --login -c \
+			"trap 'rc=\$?; echo SHELL_EXIT rc=\$rc' EXIT; cd /Users/ilyagulya; echo RUN_START name=$name; $CLANG -isysroot $SDK -O2 $cf -o bin_$name $src 2>&1 && ./bin_$name $secs 2>&1; rc=\$?; echo RUN_DONE rc=\$rc; exit \$rc" \
 			</dev/null > "$G" 2>&1 &
 		local GP=$!
 		while kill -0 $GP 2>/dev/null; do
@@ -98,10 +109,32 @@ run_synth() { # name src cflags secs [ring]
 			grep -q "RESULT=" "$G" && break
 			[ "$W" -ge $((HARD+5)) ] && break
 		done
-		kill -9 $GP 2>/dev/null; wait $GP 2>/dev/null
+		local killed=0 wait_status=0
+		if kill -0 $GP 2>/dev/null; then
+			killed=1
+			kill -9 $GP 2>/dev/null
+		fi
+		wait $GP 2>/dev/null; wait_status=$?
+		local has_result=0 has_run_done=0
+		grep -q "RESULT=" "$G" && has_result=1
+		grep -q "RUN_DONE" "$G" && has_run_done=1
+		printf 'A0_RUNNER name=%s attempt=%s elapsed=%s hard=%s killed=%s wait_status=%s has_result=%s has_run_done=%s\n' \
+			"$name" "$attempt" "$W" "$HARD" "$killed" "$wait_status" "$has_result" "$has_run_done" >> "$G"
+		if [ -s "$CLOG" ]; then
+			cp "$CLOG" "$WORK/$name.client-rpc.log" 2>/dev/null || true
+		fi
+		if [ -s "$DLOG" ]; then
+			cp "$DLOG" "$WORK/$name.dserver.log" 2>/dev/null || true
+		fi
+		if [ -s "$ALOG" ]; then
+			cp "$ALOG" "$WORK/$name.auxlog.txt" 2>/dev/null || true
+		fi
 		if [ "$attempt" = 1 ] && ! grep -q "RESULT=" "$G" && grep -q "shellspawn.sock" "$G"; then
 			note "$name" "shellspawn missing before test; retrying once"
 			mv "$G" "$G.shellspawn-retry1"
+			[ -f "$WORK/$name.client-rpc.log" ] && mv "$WORK/$name.client-rpc.log" "$WORK/$name.client-rpc.log.shellspawn-retry1"
+			[ -f "$WORK/$name.dserver.log" ] && mv "$WORK/$name.dserver.log" "$WORK/$name.dserver.log.shellspawn-retry1"
+			[ -f "$WORK/$name.auxlog.txt" ] && mv "$WORK/$name.auxlog.txt" "$WORK/$name.auxlog.txt.shellspawn-retry1"
 			attempt=2
 			continue
 		fi
@@ -112,6 +145,15 @@ run_synth() { # name src cflags secs [ring]
 	if grep -q "MSTATE VIOLATION" "$DLOG" 2>/dev/null; then
 		note "$name" "mstate violations: $(grep -c 'MSTATE VIOLATION' "$DLOG")"
 		ok=0
+	fi
+	if [ "$ok" = 0 ] && [ -f "$WORK/$name.client-rpc.log" ]; then
+		note "$name" "client RPC log: $WORK/$name.client-rpc.log"
+	fi
+	if [ "$ok" = 0 ] && [ -f "$WORK/$name.dserver.log" ]; then
+		note "$name" "server log: $WORK/$name.dserver.log"
+	fi
+	if [ "$ok" = 0 ] && [ -f "$WORK/$name.auxlog.txt" ]; then
+		note "$name" "aux log: $WORK/$name.auxlog.txt"
 	fi
 	verdict "$name" "$ok"
 }
