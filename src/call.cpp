@@ -135,12 +135,13 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 	}
 
 	dserver_rpc_callhdr_t* header = reinterpret_cast<dserver_rpc_callhdr_t*>(requestMessage.data().data());
+	dserver_callnum_t callNumber = dserver_rpc_callnum_base(header->number);
 	std::shared_ptr<Call> result = nullptr;
 	std::shared_ptr<Process> process = nullptr;
 	std::shared_ptr<Thread> thread = nullptr;
 
 	// first, make sure we know this call number
-	switch (header->number) {
+	switch (callNumber) {
 		case dserver_callnum_s2c:
 		case dserver_callnum_push_reply:
 		DSERVER_VALID_CALLNUM_CASES
@@ -157,7 +158,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 			int lifetimePipe = -1;
 
-			if (header->number == dserver_callnum_checkin) {
+			if (callNumber == dserver_callnum_checkin) {
 				auto checkinCall = reinterpret_cast<dserver_rpc_call_checkin_t*>(header);
 				if (checkinCall->body.lifetime_listener_pipe != -1) {
 					lifetimePipe = requestMessage.extractDescriptorAtIndex(checkinCall->body.lifetime_listener_pipe);
@@ -191,7 +192,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 			void* stackHint = nullptr;
 
-			if (header->number == dserver_callnum_checkin) {
+			if (callNumber == dserver_callnum_checkin) {
 				auto checkinCall = reinterpret_cast<dserver_rpc_call_checkin_t*>(header);
 				stackHint = reinterpret_cast<void*>(checkinCall->body.stack_hint);
 			}
@@ -226,19 +227,19 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 	auto pidString = (process) ? (std::to_string(process->id()) + " (" + std::to_string(process->nsid()) + ")") : (std::to_string(header->pid) + " (-1)");
 	auto tidString = (thread) ? (std::to_string(thread->id()) + " (" + std::to_string(thread->nsid()) + ")") : (std::to_string(header->tid) + " (-1)");
-	callLog.debug() << "Received call #" << header->number << " (" << dserver_callnum_to_string(header->number) << ") from PID " << pidString << ", TID " << tidString << callLog.endLog;
+	callLog.debug() << "Received call #" << callNumber << " (" << dserver_callnum_to_string(callNumber) << ") from PID " << pidString << ", TID " << tidString << callLog.endLog;
 
 	// A0 RPC TRACE: every call the server accepts, keyed by host tid (matches /proc/<tid> in the guest
 	// capture) + guest nsid. The nsid pins WHICH guest thread; the host tid ties it to the recvmsg the
 	// stall capture saw parked. s2c/push_reply are logged here too (they return early below) so the tape
 	// shows the interrupt/S2C protocol traffic interleaved with the call it belongs to.
 	DarlingServer::__rpctrace("RECV call=%u(%s) hpid=%d htid=%d nspid=%lld nstid=%lld",
-		(unsigned)header->number, dserver_callnum_to_string(header->number),
+		(unsigned)callNumber, dserver_callnum_to_string(callNumber),
 		header->pid, header->tid,
 		(long long)(process ? process->nsid() : -1),
 		(long long)(thread ? thread->nsid() : -1));
 
-	if (header->number == dserver_callnum_s2c) {
+	if (callNumber == dserver_callnum_s2c) {
 		// this is an S2C reply
 
 		{
@@ -254,7 +255,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		dtape_semaphore_up(thread->_s2cReplySempahore);
 
 		return nullptr;
-	} else if (header->number == dserver_callnum_push_reply) {
+	} else if (callNumber == dserver_callnum_push_reply) {
 		// this is a reply push
 		// (used to send interrupted replies back to the server)
 
@@ -345,7 +346,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 	// send path -- by the message body's complex/descriptor shape (one cheap readMemory of the header,
 	// skipped entirely when the census is off so the hot path is byte-identical). The goal is to size
 	// the reclaimable fraction of the ~19% msg_overwrite hotness BEFORE designing any ring migration.
-	if (header->number == dserver_callnum_mach_msg_overwrite &&
+	if (callNumber == dserver_callnum_mach_msg_overwrite &&
 	    Metrics::shared().msgCensusOn.load(std::memory_order_relaxed) &&
 	    requestMessage.data().size() >= sizeof(dserver_rpc_call_mach_msg_overwrite_t)) {
 		auto* mc = reinterpret_cast<const dserver_rpc_call_mach_msg_overwrite_t*>(header);
@@ -407,7 +408,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			result = std::make_shared<_className>(thread, reinterpret_cast<dserver_rpc_call_ ## _callName ## _t*>(header), std::move(requestMessage)); \
 		} break;
 
-	switch (header->number) {
+	switch (callNumber) {
 		DSERVER_CONSTRUCT_CASES
 
 		default:
