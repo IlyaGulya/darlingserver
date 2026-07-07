@@ -206,6 +206,18 @@ else
 		echo
 	fi
 
+	# --- RPC correctness z27x.2: once a guest has published a request onto the ring, timeout/bad-reply
+	#     is committed-unknown and MUST NOT UDS-fall-back (retrying a non-idempotent op can double-apply
+	#     it). This static gate pins the guest helper comments + fail-closed KERN_FAILURE paths. ---
+	CUSRC="$HERE/ring_committed_unknown_contract_test.sh"
+	if [ -f "$CUSRC" ]; then
+		echo "== committed-unknown no-UDS-retry contract =="
+		if ! "$CUSRC"; then
+			echo "committed-unknown contract FAILED"; exit 1
+		fi
+		echo
+	fi
+
 	# --- Phase A (dar-dar6x4-perf-5dq.30.1): THREE-LANE op classification + the static guardrail that
 	#     a destroy-capable / caller-S2C op CANNOT enter the simple ring. Two kinds of arm:
 	#       (i)  C host gate (ring_lane_class_gate_test.c): GREEN runs; RED -DLANECLASS_READD_DEALLOCATE
