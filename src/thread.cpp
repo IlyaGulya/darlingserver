@@ -1844,6 +1844,17 @@ void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNu
 		_processingSignal = true;
 	}
 
+	struct StandardSignalPendingClear {
+		Thread* thread;
+		int linuxSignalNumber;
+		~StandardSignalPendingClear() {
+			if (linuxSignalNumber > 0 && linuxSignalNumber < 32) {
+				std::unique_lock lock(thread->_rwlock);
+				thread->_pendingStandardSignalMask &= ~(1ull << linuxSignalNumber);
+			}
+		}
+	} clearPendingStandardSignal{this, linuxSignalNumber};
+
 	dtape_thread_process_signal(_dtapeThread, bsdSignalNumber, linuxSignalNumber, code, signalAddress);
 
 	// LLDB commonly suspends the thread upon reception of an exception and assumes
@@ -2910,12 +2921,30 @@ void DarlingServer::Thread::sendSignal(int signal) const {
 	if (isDead()) {
 		return;
 	}
+	bool markedPending = false;
+	if (signal > 0 && signal < 32 && signal != SIGCHLD && signal != SIGUSR1) {
+		std::unique_lock lock(_rwlock);
+		uint64_t bit = 1ull << signal;
+		if (_pendingStandardSignalMask & bit) {
+			return;
+		}
+		_pendingStandardSignalMask |= bit;
+		markedPending = true;
+	}
 	if (_process) {
 		if (syscall(SYS_tgkill, _process->id(), id(), signal) < 0) {
 			int code = errno;
+			if (markedPending) {
+				std::unique_lock lock(_rwlock);
+				_pendingStandardSignalMask &= ~(1ull << signal);
+			}
 			throw std::system_error(code, std::generic_category());
 		}
 	} else {
+		if (markedPending) {
+			std::unique_lock lock(_rwlock);
+			_pendingStandardSignalMask &= ~(1ull << signal);
+		}
 		throw std::system_error(ESRCH, std::generic_category());
 	}
 };

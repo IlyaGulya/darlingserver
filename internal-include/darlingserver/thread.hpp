@@ -266,6 +266,7 @@ namespace DarlingServer {
 		std::stack<InterruptContext> _interrupts;
 		std::queue<std::shared_ptr<Call>> _pendingInterrupts;
 		std::optional<Message> _pendingSavedReply = std::nullopt;
+		mutable uint64_t _pendingStandardSignalMask = 0;
 		bool _dead = false;
 		std::shared_ptr<Thread> _selfReference = nullptr;
 
