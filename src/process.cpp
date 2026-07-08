@@ -434,7 +434,14 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 				" parent=" + std::to_string(parent->nsid())
 			);
 			parent->_forkChildCheckin.markChildCheckedIn();
-			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			if (TestDiagnostics::consumeFault("fork.skip_checkin_semaphore")) {
+				TestDiagnostics::traceLine(
+					"process.checkin.fork_skip_semaphore child=" + std::to_string(nsid()) +
+					" parent=" + std::to_string(parent->nsid())
+				);
+			} else {
+				dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			}
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
 		} else {
 			processLog.info() << *this << ": checkin without registered fork parent" << processLog.endLog;
