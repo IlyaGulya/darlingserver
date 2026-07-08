@@ -36,6 +36,7 @@
 #   DARLING_LAUNCHER launcher       (default ~/work/darling-prefix/bin/darling)
 #   A0_RING          1|0            (default 1 = ring transport ON, the prod config)
 #   A0_NEST_RUNS / A0_CV_RUNS / A0_BREW_RUNS   iteration counts
+#   A0_SYNTH_FILTER  substring      run only matching synthetic legs (for short repros)
 #   A0_MSTATE_ABORT  1|0  force DSERVER_MSTATE_ABORT for ALL synth legs (default:
 #                    1 on fuzz legs only; violations always greped from dserver.log)
 #   A0_AUXLOG         1|0  capture per-leg dserver-auxlog.txt RPCTRACE/AUXLOG
@@ -55,6 +56,7 @@ PREFIX="${DPREFIX:-$HOME/work/darling-prefix-homebrew-test}"
 L="${DARLING_LAUNCHER:-$HOME/work/darling-prefix/bin/darling}"
 STAT="$SELFDIR/../../tools/darling-stat"
 RING="${A0_RING:-1}"
+SYNTH_FILTER="${A0_SYNTH_FILTER:-}"
 NEST_RUNS="${A0_NEST_RUNS:-4}"
 CV_RUNS="${A0_CV_RUNS:-3}"
 BREW_RUNS="${A0_BREW_RUNS:-2}"
@@ -67,6 +69,16 @@ PASS=0; FAIL=0; declare -a RED=()
 
 say()  { printf '%s\n' "$*"; }
 note() { printf '  %-46s %s\n' "$1" "$2"; }
+
+want_synth() {
+	[ -z "$SYNTH_FILTER" ] || [[ "$1" == *"$SYNTH_FILTER"* ]]
+}
+
+runtime_processes() {
+	ps -eo pid,ppid,stat,etime,args \
+		| grep -E 'darlingserver|mldr|launchd|vchroot|shellspawn|bin_nestwait|bin_cvstorm|bin_forkwait' \
+		| grep -v grep || true
+}
 
 cleanboot() {
 	"$L" shutdown >/dev/null 2>&1; sleep 2
@@ -86,26 +98,59 @@ verdict() { # name ok
 # --- synthetic runner: compile <src> in-guest, run, expect RESULT=OK ---------
 run_synth() { # name src cflags secs [ring]
 	local name="$1" src="$2" cf="$3" secs="$4" ring="${5:-$RING}"
+	if ! want_synth "$name"; then
+		return
+	fi
 	# A0-ARCH stage 2a: surface shadow state-machine violations. Fuzz legs run with
 	# DSERVER_MSTATE_ABORT=1 (violation = crash = RED); all legs also log at err level
 	# and grep the server log for MSTATE VIOLATION afterwards (log-and-survive mode).
 	local DLOG="$PREFIX/private/var/log/dserver.log"
 	local ALOG="$PREFIX/private/var/log/dserver-auxlog.txt"
 	local CLOG="/tmp/dserver-client-rpc.log"
+	local MARKER_GLOB="$PREFIX/private/tmp/a0gate-$name-attempt*.marker"
 	local G="$WORK/$name.log" HARD=$((secs+50)) attempt=1
 	while :; do
 		cleanboot
 		: > "$DLOG" 2>/dev/null || true
 		: > "$ALOG" 2>/dev/null || true
 		: > "$CLOG" 2>/dev/null || true
+		rm -f $MARKER_GLOB 2>/dev/null || true
 		cp "$SELFDIR/$src" "$PREFIX/Users/ilyagulya/$src" 2>/dev/null || cp "$SELFDIR/$src" "$PREFIX/Users/"*"/$src"
+		local guest_cmd
+		guest_cmd=$(cat <<EOF
+MARK=/private/tmp/a0gate-$name-attempt$attempt.marker
+trap 'rc=\$?; echo exit:\$rc >> \$MARK; echo SHELL_EXIT rc=\$rc' EXIT
+echo shell-pid:\$\$ > \$MARK
+cd /Users/ilyagulya
+echo RUN_START name=$name
+echo compile-start >> \$MARK
+$CLANG -isysroot $SDK -O2 $cf -o bin_$name $src 2>&1
+rc=\$?
+echo compile-rc:\$rc >> \$MARK
+if [ \$rc -eq 0 ]; then
+	echo test-start >> \$MARK
+	./bin_$name $secs 2>&1
+	rc=\$?
+	echo test-rc:\$rc >> \$MARK
+fi
+echo RUN_DONE rc=\$rc
+echo run-done:\$rc >> \$MARK
+exit \$rc
+EOF
+)
 		local W=0
 		DARLING_SERVER_FAST_OPS="$ring" DARLING_SERVER_AUXLOG="${A0_AUXLOG:-0}" DSERVER_SCHED_FUZZ="${FUZZ:-}" DSERVER_MSTATE_ABORT="${A0_MSTATE_ABORT:-${FUZZ:+1}}" DSERVER_LOG_LEVEL="${DSERVER_LOG_LEVEL:-err}" timeout "$HARD" "$L" shell /bin/bash --login -c \
-			"trap 'rc=\$?; echo SHELL_EXIT rc=\$rc' EXIT; cd /Users/ilyagulya; echo RUN_START name=$name; $CLANG -isysroot $SDK -O2 $cf -o bin_$name $src 2>&1 && ./bin_$name $secs 2>&1; rc=\$?; echo RUN_DONE rc=\$rc; exit \$rc" \
+			"$guest_cmd" \
 			</dev/null > "$G" 2>&1 &
 		local GP=$!
 		while kill -0 $GP 2>/dev/null; do
 			sleep 2; W=$((W+2))
+			if [ "${A0_HOST_MONITOR:-0}" = 1 ]; then
+				{
+					printf 'A0_HOST_MONITOR name=%s attempt=%s elapsed=%s\n' "$name" "$attempt" "$W"
+					runtime_processes
+				} >> "$WORK/$name.host-monitor.txt" 2>&1
+			fi
 			grep -q "RESULT=" "$G" && break
 			[ "$W" -ge $((HARD+5)) ] && break
 		done
@@ -129,12 +174,32 @@ run_synth() { # name src cflags secs [ring]
 		if [ -s "$ALOG" ]; then
 			cp "$ALOG" "$WORK/$name.auxlog.txt" 2>/dev/null || true
 		fi
+		for marker in $MARKER_GLOB; do
+			[ -f "$marker" ] || continue
+			cp "$marker" "$WORK/$name.$(basename "$marker")" 2>/dev/null || true
+		done
+		if [ "$has_result" = 0 ] || [ "$has_run_done" = 0 ] || [ "$wait_status" != 0 ]; then
+			{
+				printf 'A0_HOST_SNAPSHOT name=%s attempt=%s elapsed=%s hard=%s killed=%s wait_status=%s\n' \
+					"$name" "$attempt" "$W" "$HARD" "$killed" "$wait_status"
+				printf '\n== guest markers ==\n'
+				for marker in $MARKER_GLOB; do
+					[ -f "$marker" ] || continue
+					printf -- '-- %s --\n' "$marker"
+					sed -n '1,80p' "$marker" 2>/dev/null || true
+				done
+				printf '\n== host processes ==\n'
+				runtime_processes
+			} > "$WORK/$name.host-snapshot.txt" 2>&1
+		fi
 		if [ "$attempt" = 1 ] && ! grep -q "RESULT=" "$G" && grep -q "shellspawn.sock" "$G"; then
 			note "$name" "shellspawn missing before test; retrying once"
 			mv "$G" "$G.shellspawn-retry1"
 			[ -f "$WORK/$name.client-rpc.log" ] && mv "$WORK/$name.client-rpc.log" "$WORK/$name.client-rpc.log.shellspawn-retry1"
 			[ -f "$WORK/$name.dserver.log" ] && mv "$WORK/$name.dserver.log" "$WORK/$name.dserver.log.shellspawn-retry1"
 			[ -f "$WORK/$name.auxlog.txt" ] && mv "$WORK/$name.auxlog.txt" "$WORK/$name.auxlog.txt.shellspawn-retry1"
+			[ -f "$WORK/$name.host-snapshot.txt" ] && mv "$WORK/$name.host-snapshot.txt" "$WORK/$name.host-snapshot.txt.shellspawn-retry1"
+			[ -f "$WORK/$name.host-monitor.txt" ] && mv "$WORK/$name.host-monitor.txt" "$WORK/$name.host-monitor.txt.shellspawn-retry1"
 			attempt=2
 			continue
 		fi
