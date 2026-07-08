@@ -53,9 +53,7 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	thread->context = context;
 	thread->processing_signal = false;
 	thread->name = NULL;
-	thread->cancel_disable = false;
-	thread->cancel_pending = false;
-	thread->canceled = false;
+	dtape_thread_cancel_state_init(&thread->cancel);
 	thread->waiting_suspended = false;
 	LIST_INIT(&thread->user_states);
 	dtape_mutex_init(&thread->suspension_mutex);
@@ -194,25 +192,7 @@ void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, 
 //   action 0 (or default) -> if a cancel is pending and not disabled/already
 //       acted upon, mark it canceled and return 0; otherwise return EINVAL.
 int dtape_thread_canceled(dtape_thread_t* thread, int action) {
-	switch (action) {
-		case 1:
-			thread->cancel_disable = false;
-			return 0;
-		case 2:
-			thread->cancel_disable = true;
-			return 0;
-		case 0:
-		default:
-			// Mirror XNU: act only when UT_CANCEL is set and neither
-			// UT_CANCELDISABLE nor UT_CANCELED is set, i.e.
-			// (uu_flag & (CANCELDISABLE|CANCEL|CANCELED)) == UT_CANCEL.
-			if (thread->cancel_pending && !thread->cancel_disable && !thread->canceled) {
-				thread->cancel_pending = false;
-				thread->canceled = true;
-				return 0;
-			}
-			return EINVAL;
-	}
+	return dtape_thread_cancel_state_canceled(&thread->cancel, action);
 };
 
 // Implements XNU's __pthread_markcancel(thread_port): requests cancellation of
@@ -221,12 +201,7 @@ int dtape_thread_canceled(dtape_thread_t* thread, int action) {
 // observes the request via dtape_thread_canceled(action 0) at its next
 // cancellation point. Returns 0 on success.
 int dtape_thread_markcancel(dtape_thread_t* thread) {
-	// Mirror XNU's guard: only arm a cancel if one is not already in flight
-	// or acted upon ((uu_flag & (CANCEL|CANCELED)) == 0; we have no vfork bit).
-	if (!thread->cancel_pending && !thread->canceled) {
-		thread->cancel_pending = true;
-	}
-	return 0;
+	return dtape_thread_cancel_state_markcancel(&thread->cancel);
 };
 
 dtape_thread_t* dtape_thread_for_port(uint32_t thread_port) {
