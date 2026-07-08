@@ -52,6 +52,7 @@
 #include <limits>
 #include <system_error>
 #include <cerrno>
+#include <cstdio>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -67,6 +68,7 @@ static thread_local bool returningToThreadTop = false;
 static thread_local ucontext_t backToThreadTopContext;
 static thread_local libsimple_lock_t* unlockMeWhenSuspending = nullptr;
 static thread_local std::function<void()> currentContinuation = nullptr;
+static thread_local char lastMakecontextTrace[256] = "none";
 
 /**
  * Our microthreads use cooperative multitasking, so we don't really use interrupts per-se.
@@ -77,6 +79,40 @@ static thread_local std::function<void()> currentContinuation = nullptr;
  * This is primarily of use for debugging duct-tape code and ensuring certain assumptions made in the duct-tape code hold true.
  */
 static thread_local uint64_t interruptDisableCount = 0;
+
+static bool envFlagEnabled(const char* name) {
+	const char* value = getenv(name);
+	return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static bool contextTraceEnabled() {
+	static const bool enabled = envFlagEnabled("DSERVER_CONTEXT_TRACE");
+	return enabled;
+}
+
+extern "C" const char* dserver_last_makecontext_trace() {
+	return lastMakecontextTrace;
+}
+
+static void recordMakecontextTrace(const char* branch, const DarlingServer::Thread* thread, const DarlingServer::StackPool::Stack& stack, const std::shared_ptr<DarlingServer::Call>& call) {
+	auto callNumber = call ? call->number() : DarlingServer::Call::Number::Invalid;
+	snprintf(lastMakecontextTrace,
+			sizeof(lastMakecontextTrace),
+			"branch=%s thread=%p stack=%p size=%zu call=%u(%s)",
+			branch,
+			static_cast<const void*>(thread),
+			stack.base,
+			stack.size,
+			static_cast<unsigned int>(callNumber),
+			DarlingServer::Call::callNumberToString(callNumber));
+
+	if (!contextTraceEnabled()) {
+		return;
+	}
+
+	fprintf(stderr, "DSERVER_CONTEXT_TRACE: %s\n", lastMakecontextTrace);
+	fflush(stderr);
+}
 
 // A0-ARCH stage 0: scheduling-order fuzzer. Every A0 wake/wait bug was a 2-event reorder
 // (dispatch vs wake, wake-before-suspend, stale re-run); this injects exactly that class of
@@ -637,7 +673,7 @@ void DarlingServer::Thread::doWork() {
 
 		_rwlock.lock();
 
-		if (_microState != MicroState::Parking || _continuationCallback) {
+		if ((_microState != MicroState::Parking || _continuationCallback) && _stack.isValid()) {
 			// we discard the old stack when either:
 			//   * we exit normally (i.e. without suspending -- state stayed Running);
 			//   * or when we suspend with a continuation callback.
@@ -701,6 +737,7 @@ void DarlingServer::Thread::doWork() {
 				_resumeContext.uc_stack.ss_size = _stack.size;
 				_resumeContext.uc_stack.ss_flags = 0;
 				_resumeContext.uc_link = &backToThreadTopContext;
+				recordMakecontextTrace("continuation", this, _stack, _pendingCall);
 				makecontext(&_resumeContext, microthreadContinuation, 0);
 			} else {
 				// otherwise, we expect to have a valid stack to continue where we left off
@@ -738,6 +775,7 @@ void DarlingServer::Thread::doWork() {
 			newContext.uc_stack.ss_size = _stack.size;
 			newContext.uc_stack.ss_flags = 0;
 			newContext.uc_link = &backToThreadTopContext;
+			recordMakecontextTrace("worker", this, _stack, _pendingCall);
 			makecontext(&newContext, microthreadWorker, 0);
 
 #if DSERVER_ASAN

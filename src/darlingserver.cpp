@@ -39,6 +39,9 @@
 #include <sys/syscall.h>
 #include <sys/signal.h>
 #include <climits>
+#include <filesystem>
+#include <exception>
+#include <execinfo.h>
 
 #include <darling-config.h>
 
@@ -59,6 +62,100 @@
 #endif
 
 // TODO: most of the code here was ported over from startup/darling.c; we should C++-ify it.
+
+static bool g_exitTraceBacktrace = false;
+
+extern "C" const char* dserver_last_makecontext_trace();
+
+static bool exitTraceEnabled() {
+	const char* value = getenv("DSERVER_EXIT_TRACE");
+	return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static bool exitTraceAllSignalsEnabled() {
+	const char* value = getenv("DSERVER_EXIT_TRACE_ALL_SIGNALS");
+	return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static void writeSignalNumber(int signum) {
+	char buf[16];
+	size_t off = sizeof(buf);
+	unsigned int value = static_cast<unsigned int>(signum);
+
+	buf[--off] = '\0';
+	do {
+		buf[--off] = static_cast<char>('0' + (value % 10));
+		value /= 10;
+	} while (value != 0 && off > 0);
+
+	write(STDERR_FILENO, &buf[off], sizeof(buf) - off - 1);
+}
+
+static void exitTraceSignalHandler(int signum) {
+	static const char prefix[] = "DSERVER_EXIT_TRACE: signal ";
+	static const char suffix[] = "\n";
+	static const char btPrefix[] = "DSERVER_EXIT_TRACE: backtrace\n";
+	static const char contextPrefix[] = "DSERVER_EXIT_TRACE: last_makecontext ";
+
+	write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+	writeSignalNumber(signum);
+	write(STDERR_FILENO, suffix, sizeof(suffix) - 1);
+	const char* context = dserver_last_makecontext_trace();
+	if (context) {
+		write(STDERR_FILENO, contextPrefix, sizeof(contextPrefix) - 1);
+		write(STDERR_FILENO, context, strlen(context));
+		write(STDERR_FILENO, suffix, sizeof(suffix) - 1);
+	}
+	if (g_exitTraceBacktrace) {
+		void* frames[64];
+		int count = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
+		write(STDERR_FILENO, btPrefix, sizeof(btPrefix) - 1);
+		backtrace_symbols_fd(frames, count, STDERR_FILENO);
+	}
+	_exit(128 + signum);
+}
+
+static void exitTraceAtExit() {
+	if (exitTraceEnabled()) {
+		fputs("DSERVER_EXIT_TRACE: atexit\n", stderr);
+		fflush(stderr);
+	}
+}
+
+static void exitTraceTerminate() {
+	if (exitTraceEnabled()) {
+		fputs("DSERVER_EXIT_TRACE: std::terminate\n", stderr);
+		fflush(stderr);
+	}
+	abort();
+}
+
+static void installExitTrace() {
+	if (!exitTraceEnabled()) {
+		return;
+	}
+
+	const char* backtrace = getenv("DSERVER_EXIT_TRACE_BACKTRACE");
+	g_exitTraceBacktrace = backtrace != nullptr && backtrace[0] != '\0' && strcmp(backtrace, "0") != 0;
+	atexit(exitTraceAtExit);
+	std::set_terminate(exitTraceTerminate);
+
+	struct sigaction action = {};
+	action.sa_handler = exitTraceSignalHandler;
+	sigemptyset(&action.sa_mask);
+	action.sa_flags = SA_RESETHAND;
+
+	int fatalSignals[] = { SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+	for (int signum : fatalSignals) {
+		sigaction(signum, &action, nullptr);
+	}
+	if (exitTraceAllSignalsEnabled()) {
+		int allSignals[] = { SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGPIPE };
+		for (int signum : allSignals) {
+			sigaction(signum, &action, nullptr);
+		}
+	}
+}
 
 static int openDirectoryAt(int parentFD, const char* name, bool missingIsOkay = false) {
 	struct stat st;
@@ -988,6 +1085,8 @@ static void handle_sigusr1(int signum) {
 #endif
 
 int main(int argc, char** argv) {
+	installExitTrace();
+
 	const char* prefix = NULL;
 	int prefixFD = -1;
 	int prefixParentFD = -1;
