@@ -164,6 +164,20 @@ target_include_directories(dserver_runtime_mode_tests PRIVATE
 	include
 )
 
+add_executable(dserver_stack_pool_tests
+	tests/stack-pool-null-regression.cpp
+	src/stack-pool.cpp
+)
+
+target_compile_options(dserver_stack_pool_tests PRIVATE
+	-std=c++17
+)
+
+add_custom_target(dserver_stack_pool_tests_run
+	COMMAND $<TARGET_FILE:dserver_stack_pool_tests>
+	DEPENDS dserver_stack_pool_tests
+)
+
 add_dependencies(darlingserver
 	generate_dserver_rpc_wrappers
 	rtsig_h
