@@ -17,6 +17,7 @@ UNMANAGED_CALL         = 1 << 6
 ALLOW_INTERRUPTIONS    = 1 << 7
 PUSH_UNKNOWN_REPLIES   = 1 << 8
 NO_REPLY               = 1 << 9
+QUIET_SEND_DISCONNECT  = 1 << 10
 
 # NOTE: in Python 3.7+, we can rely on dictionaries having their items in insertion order.
 #       unfortunately, we can't expect everyone building Darling to have Python 3.7+ installed.
@@ -93,6 +94,14 @@ calls = [
 	#     call queued for delivery when the signal was received, the client will send interrupt_enter and immediately receive the reply to the interrupted
 	#     call. without handling this gracefully (by saving the reply for later), RPC communication becomes desynchronized and the program crashes.
 	#
+	#     note that this flag should only be used in very special circumstances (interrupt_enter currently being the only such one).
+	#     not only can it mask legitimate RPC communication errors, but it also requires significantly more stack space to handle such calls,
+	#     as the wrapper must create a buffer large enough to store any possible reply (including any potential descriptors).
+	#
+	#     the way this works is that calls with this flag allocate enough space in the reply buffer to hold all possible replies;
+	#     if they receive an unexpected reply, they push it back to the server. the server then holds on to the reply
+	#     and re-sends it when appropriate (e.g. for interrupt_enter, that's after interrupt_exit is called).
+	#
 	#   NO_REPLY
 	#     (perf #10, dar-dar6x4-perf-5dq.17) marks a "fire-and-forget" call: the client sends the request and returns
 	#     IMMEDIATELY without waiting for a reply. The profile (perf #9) showed pure setters with an empty reply
@@ -105,13 +114,10 @@ calls = [
 	#     status code the caller genuinely ignores. Ordering is preserved -- the per-thread socket delivers datagrams in send
 	#     order, so a NO_REPLY setter is always processed before any later synchronous call that depends on its effect.
 	#
-	#     note that this flag should only be used in very special circumstances (interrupt_enter currently being the only such one).
-	#     not only can it mask legitimate RPC communication errors, but it also requires significantly more stack space to handle such calls,
-	#     as the wrapper must create a buffer large enough to store any possible reply (including any potential descriptors).
-	#
-	#     the way this works is that calls with this flag allocate enough space in the reply buffer to hold all possible replies;
-	#     if they receive an unexpected reply, they push it back to the server. the server then holds on to the reply
-	#     and re-sends it when appropriate (e.g. for interrupt_enter, that's after interrupt_exit is called).
+	#   QUIET_SEND_DISCONNECT
+	#     endpoint-disappeared send failures are expected during teardown for selected best-effort calls. Return the transport
+	#     status to the caller without logging a BAD SEND diagnostic. This is intentionally narrower than ALLOW_INTERRUPTIONS:
+	#     it does not allow signal interruption, does not map disconnects to EINTR, and does not change receive-side handling.
 	#
 	# TODO: we should probably add a class for these calls (so it's more readable).
 	#       we could even create a DSL (à-la-MIG), but that's probably overkill since
@@ -195,7 +201,7 @@ calls = [
 		('is_64_bit', 'bool'),
 	]),
 
-	('interrupt_enter', [], [], PUSH_UNKNOWN_REPLIES),
+	('interrupt_enter', [], [], PUSH_UNKNOWN_REPLIES | QUIET_SEND_DISCONNECT),
 
 	('interrupt_exit', [], []),
 
@@ -288,11 +294,11 @@ calls = [
 	('pthread_kill', [
 		('thread_port', 'uint32_t'),
 		('signal', 'int32_t'),
-	], []),
+	], [], QUIET_SEND_DISCONNECT),
 
 	('pthread_canceled', [
 		('action', 'int32_t'),
-	], []),
+	], [], QUIET_SEND_DISCONNECT),
 
 	('pthread_markcancel', [
 		('thread_port', 'uint32_t'),
@@ -953,6 +959,10 @@ DSERVER_RPC_HOOKS_ATTRIBUTE int dserver_rpc_hooks_get_communication_error_status
 DSERVER_RPC_HOOKS_ATTRIBUTE int dserver_rpc_hooks_get_broken_pipe_status(void);
 #endif
 
+#ifndef dserver_rpc_hooks_is_disconnect_status
+DSERVER_RPC_HOOKS_ATTRIBUTE int dserver_rpc_hooks_is_disconnect_status(long int status);
+#endif
+
 #ifndef dserver_rpc_hooks_close_fd
 DSERVER_RPC_HOOKS_ATTRIBUTE void dserver_rpc_hooks_close_fd(int fd);
 #endif
@@ -1565,6 +1575,16 @@ for call in calls:
 	library_source.write("\t}\n\n")
 
 	library_source.write("\tif (long_status < 0) {\n")
+	if (flags & ALLOW_INTERRUPTIONS) != 0:
+		library_source.write("\t\tif (dserver_rpc_hooks_is_disconnect_status(long_status)) {\n")
+		library_source.write("\t\t\treturn dserver_rpc_hooks_get_interrupt_status();\n")
+		library_source.write("\t\t}\n")
+	if (flags & QUIET_SEND_DISCONNECT) != 0:
+		library_source.write("\t\tif (dserver_rpc_hooks_is_disconnect_status(long_status)) {\n")
+		if (flags & ALLOW_INTERRUPTIONS) == 0:
+			library_source.write("\t\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
+		library_source.write("\t\t\treturn (int)long_status;\n")
+		library_source.write("\t\t}\n")
 	if (flags & ALLOW_INTERRUPTIONS) == 0:
 		library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
 	library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD SEND STATUS: %ld ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, long_status);\n")
