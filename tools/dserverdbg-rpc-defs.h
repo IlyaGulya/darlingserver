@@ -82,6 +82,13 @@ static long int dserver_rpc_hooks_receive_message(int socket, dserver_rpc_hooks_
 
 #define dserver_rpc_hooks_get_broken_pipe_status() (-EPIPE)
 
+static int dserver_rpc_hooks_is_disconnect_status(long int status) {
+	return status == -EPIPE
+		|| status == -ECONNRESET
+		|| status == -ENOTCONN
+		|| status == -ECONNREFUSED;
+}
+
 #define dserver_rpc_hooks_close_fd close
 
 extern int __dserver_main_thread_socket_fd;
