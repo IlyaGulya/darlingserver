@@ -450,7 +450,8 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 				return;
 			}
 			parent->_forkChildCheckin.markChildCheckedIn();
-			if (TestDiagnostics::consumeFault("fork.skip_checkin_semaphore")) {
+			std::string targetedFault = "fork.skip_checkin_semaphore parent=" + std::to_string(parent->nsid());
+			if (TestDiagnostics::consumeFault(targetedFault.c_str())) {
 				TestDiagnostics::traceLine(
 					"process.checkin.fork_skip_semaphore child=" + std::to_string(nsid()) +
 					" parent=" + std::to_string(parent->nsid())
