@@ -344,6 +344,10 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// _threads / _listeningKqchannels / _kqchannels / scalar fields, none of which
 		// we mutate while unlocked.
 		lock.unlock();
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_dtape_create_unlocked pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid())
+		);
 
 		// replace the old task with a new task that inherits from it
 		auto oldTask = _dtapeTask;
@@ -395,6 +399,10 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		mainThread->_s2cInterruptExitSemaphore = newInterruptExit;
 		TestDiagnostics::traceLine(
 			"process.checkin.exec_publish pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid())
+		);
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_publish_before_release pid=" + std::to_string(id()) +
 			" nsid=" + std::to_string(nsid())
 		);
 		lock.unlock();
