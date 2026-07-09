@@ -452,6 +452,12 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 
 		thread->xnu_thread.wait_result = THREAD_WAITING;
 
+		if (dtape_test_consume_fault("microthread.resume_before_suspend")) {
+			dtape_test_trace_line("microthread.dtape.resume_before_suspend");
+			thread->xnu_thread.suspend_count = 0;
+			dtape_hooks->thread_resume(thread->context);
+		}
+
 		dtape_hooks->thread_suspend(thread->context, NULL, NULL, NULL);
 
 		dtape_log_debug("sigexc: woken up");
