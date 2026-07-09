@@ -1,6 +1,7 @@
 #pragma once
 
 int dtape_test_consume_fault(const char* name);
+void dtape_test_trace_line(const char* line);
 void dtape_test_trace_wait_timer(
 	const char* event,
 	unsigned long long thread,
