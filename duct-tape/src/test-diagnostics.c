@@ -24,7 +24,7 @@ static unsigned long dtape_test_trace_strlen(const char* string) {
 	return result;
 }
 
-static void dtape_test_trace_line(const char* line) {
+void dtape_test_trace_line(const char* line) {
 	const char* path = getenv(DSERVER_TEST_TRACE_FILE);
 	if (!path || path[0] == '\0') {
 		return;
