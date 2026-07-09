@@ -2930,13 +2930,39 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 		// abort). Cancel any such leftover before (re)arming for this wait so
 		// the wait_timer state starts clean. Matches XNU's invariant that a
 		// thread entering assert_wait has no live wait_timer.
+		int injected_stale_timer = dtape_test_consume_fault("waitq.assert_wait_stale_timer");
+		if (injected_stale_timer) {
+			thread->wait_timer_is_set = TRUE;
+			dtape_test_trace_wait_timer(
+			    "wait_prepare_fault",
+			    (unsigned long long)thread,
+			    thread->wait_result,
+			    thread->wait_timer_is_set,
+			    thread->wait_timer_active);
+		}
 		dtape_test_trace_wait_timer(
-		    "wait_prepare",
+		    "wait_prepare_before",
 		    (unsigned long long)thread,
 		    thread->wait_result,
 		    thread->wait_timer_is_set,
 		    thread->wait_timer_active);
 		dtape_thread_prepare_for_wait(thread);
+		dtape_test_trace_wait_timer(
+		    "wait_prepare_after",
+		    (unsigned long long)thread,
+		    thread->wait_result,
+		    thread->wait_timer_is_set,
+		    thread->wait_timer_active);
+		if (injected_stale_timer) {
+			dtape_test_trace_wait_timer(
+			    thread->wait_timer_is_set ?
+			        "wait_prepare_fault_uncleared" :
+			        "wait_prepare_fault_cleared",
+			    (unsigned long long)thread,
+			    thread->wait_result,
+			    thread->wait_timer_is_set,
+			    thread->wait_timer_active);
+		}
 
 		if (deadline != 0) {
 			boolean_t act;
