@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/un.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 typedef uint32_t mach_port_type_t;
 typedef uint32_t mach_port_right_t;
@@ -47,6 +48,7 @@ typedef enum dserverdbg_command {
 	dserverdbg_command_lsport,
 	dserverdbg_command_lspset,
 	dserverdbg_command_lsmsg,
+	dserverdbg_command_uidgid_fault,
 } dserverdbg_command_t;
 
 struct sockaddr_un __dserver_socket_address_data = {0};
@@ -78,7 +80,7 @@ static void joinNamespace(pid_t pid, int type, const char* typeName)
 {
 	int fdNS;
 	char pathNS[4096];
-	
+
 	snprintf(pathNS, sizeof(pathNS), "/proc/%d/ns/%s", pid, typeName);
 
 	fdNS = open(pathNS, O_RDONLY);
@@ -193,6 +195,49 @@ err_out:
 	return -1;
 };
 
+static int set_receive_timeout(int fd, int seconds) {
+	struct timeval timeout = {
+		.tv_sec = seconds,
+		.tv_usec = 0,
+	};
+
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+		return errno;
+	}
+
+	return 0;
+}
+
+static int run_uidgid_fault_oracle(void) {
+	int old_uid = -1;
+	int old_gid = -1;
+	int status = 0;
+
+	status = set_receive_timeout(__dserver_main_thread_socket_fd, 3);
+	if (status != 0) {
+		fprintf(stderr, "DSERVERDBG_RECV_TIMEOUT_SETUP_RC=%d (%s)\n", status, strerror(status));
+		return 1;
+	}
+
+	status = dserver_rpc_checkin(false, NULL, -1);
+	printf("DSERVERDBG_CHECKIN_RC=%d\n", status);
+	if (status != 0) {
+		return 1;
+	}
+
+	status = dserver_rpc_uidgid(-1, -1, &old_uid, &old_gid);
+	printf("DSERVERDBG_UIDGID_RC=%d\n", status);
+	printf("DSERVERDBG_UIDGID_OLD_UID=%d\n", old_uid);
+	printf("DSERVERDBG_UIDGID_OLD_GID=%d\n", old_gid);
+
+	if (status == -EINVAL) {
+		printf("DSERVERDBG_UIDGID_FAULT_OK\n");
+		return 0;
+	}
+
+	return 1;
+}
+
 // borrowed from `src/startup/darling.c`
 static void missingSetuidRoot(void)
 {
@@ -207,6 +252,35 @@ static void missingSetuidRoot(void)
 
 	fprintf(stderr, "Sorry, the `%s' binary is not setuid root, which is mandatory.\n", path);
 	fprintf(stderr, "Darling needs this in order to create mount and PID namespaces and to perform mounts.\n");
+}
+
+static int run_direct_uidgid_fault_command(uid_t original_uid) {
+	char* prefix_path = get_prefix_path(original_uid);
+	int status = 1;
+
+	if (!prefix_path) {
+		fprintf(stderr, "Failed to determine prefix path\n");
+		return 1;
+	}
+
+	__dserver_socket_address_data.sun_family = AF_UNIX;
+	snprintf(__dserver_socket_address_data.sun_path, sizeof(__dserver_socket_address_data.sun_path), "%s/.darlingserver.sock", prefix_path);
+
+	__dserver_main_thread_socket_fd = setup_socket();
+	if (__dserver_main_thread_socket_fd < 0) {
+		fprintf(stderr, "Failed to set up darlingserver client socket\n");
+		goto out;
+	}
+
+	status = run_uidgid_fault_oracle();
+
+out:
+	if (__dserver_main_thread_socket_fd >= 0) {
+		close(__dserver_main_thread_socket_fd);
+		__dserver_main_thread_socket_fd = -1;
+	}
+	free(prefix_path);
+	return status;
 }
 
 int main(int argc, char** argv) {
@@ -224,6 +298,14 @@ int main(int argc, char** argv) {
 #if USE_LINUX_4_11_HACK
 	pid_t pidInit = 0;
 #endif
+
+	if (argc > 1 && strcmp(argv[1], "uidgid-fault") == 0) {
+		if (argc > 2) {
+			fprintf(stderr, "Expected 1 argument (subcommand); got %d arguments\n", argc);
+			return 1;
+		}
+		return run_direct_uidgid_fault_command(getuid());
+	}
 
 	if (geteuid() != 0) {
 		missingSetuidRoot();
@@ -266,6 +348,8 @@ int main(int argc, char** argv) {
 			command = dserverdbg_command_lspset;
 		} else if (strcmp(argv[1], "lsmsg") == 0) {
 			command = dserverdbg_command_lsmsg;
+		} else if (strcmp(argv[1], "uidgid-fault") == 0) {
+			command = dserverdbg_command_uidgid_fault;
 		} else {
 			fprintf(stderr, "Unknown subcommand: %s\n", argv[1]);
 			return 1;
@@ -285,6 +369,12 @@ int main(int argc, char** argv) {
 				return 1;
 			}
 			command_pid = atoi(argv[2]);
+			break;
+		case dserverdbg_command_uidgid_fault:
+			if (argc > 2) {
+				fprintf(stderr, "Expected 1 argument (subcommand); got %d arguments\n", argc);
+				return 1;
+			}
 			break;
 		case dserverdbg_command_lspset:
 		case dserverdbg_command_lsmsg:
@@ -314,6 +404,9 @@ int main(int argc, char** argv) {
 			status = dserver_rpc_debug_list_messages(command_pid, command_port, &count, &output_fd);
 			elmsize = sizeof(dserver_debug_message_t);
 			break;
+		case dserverdbg_command_uidgid_fault:
+			status = run_uidgid_fault_oracle();
+			goto out;
 	}
 
 	if (status != 0) {
@@ -375,4 +468,11 @@ int main(int argc, char** argv) {
 	}
 
 	return 0;
+
+out:
+	if (prefix_path) {
+		free(prefix_path);
+	}
+
+	return status;
 };
