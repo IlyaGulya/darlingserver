@@ -3,10 +3,14 @@
 extern char* getenv(const char* name);
 extern int open(const char* pathname, int flags, ...);
 extern long write(int fd, const void* buf, unsigned long count);
+extern long read(int fd, void* buf, unsigned long count);
 extern int close(int fd);
+extern int unlink(const char* pathname);
 extern int snprintf(char* str, unsigned long size, const char* format, ...);
 
 #define DSERVER_TEST_TRACE_FILE "DSERVER_TEST_TRACE_FILE"
+#define DSERVER_TEST_FAULT_FILE "DSERVER_TEST_FAULT_FILE"
+#define DSERVER_O_RDONLY 00000000
 #define DSERVER_O_WRONLY 00000001
 #define DSERVER_O_CREAT 00000100
 #define DSERVER_O_APPEND 00002000
@@ -34,6 +38,55 @@ static void dtape_test_trace_line(const char* line) {
 	write(fd, line, dtape_test_trace_strlen(line));
 	write(fd, "\n", 1);
 	close(fd);
+}
+
+static int dtape_test_trace_streq(const char* left, const char* right) {
+	unsigned long index = 0;
+	if (!left || !right) {
+		return 0;
+	}
+	while (left[index] != '\0' && right[index] != '\0') {
+		if (left[index] != right[index]) {
+			return 0;
+		}
+		++index;
+	}
+	return left[index] == '\0' && right[index] == '\0';
+}
+
+int dtape_test_consume_fault(const char* name) {
+	const char* path = getenv(DSERVER_TEST_FAULT_FILE);
+	if (!path || path[0] == '\0' || !name || name[0] == '\0') {
+		return 0;
+	}
+
+	int fd = open(path, DSERVER_O_RDONLY | DSERVER_O_CLOEXEC);
+	if (fd < 0) {
+		return 0;
+	}
+
+	char buffer[128] = {};
+	long count = read(fd, buffer, sizeof(buffer) - 1);
+	close(fd);
+	if (count <= 0) {
+		return 0;
+	}
+	while (count > 0 && (
+	    buffer[count - 1] == '\n' ||
+	    buffer[count - 1] == '\r' ||
+	    buffer[count - 1] == ' ' ||
+	    buffer[count - 1] == '\t')) {
+		buffer[--count] = '\0';
+	}
+	if (!dtape_test_trace_streq(buffer, name)) {
+		return 0;
+	}
+
+	unlink(path);
+	char line[160];
+	snprintf(line, sizeof(line), "test_fault.consume name=%s", name);
+	dtape_test_trace_line(line);
+	return 1;
 }
 
 void dtape_test_trace_wait_timer(
