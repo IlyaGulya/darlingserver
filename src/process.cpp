@@ -26,6 +26,7 @@
 #include <darlingserver/logging.hpp>
 #include <darlingserver/test-diagnostics.hpp>
 
+#include <cstdlib>
 #include <fstream>
 #include <regex>
 
@@ -441,6 +442,13 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 				"process.checkin.fork_notify_parent child=" + std::to_string(nsid()) +
 				" parent=" + std::to_string(parent->nsid())
 			);
+			if (TestDiagnostics::consumeFault("fork.drop_checkin")) {
+				TestDiagnostics::traceLine(
+					"process.checkin.fork_drop child=" + std::to_string(nsid()) +
+					" parent=" + std::to_string(parent->nsid())
+				);
+				return;
+			}
 			parent->_forkChildCheckin.markChildCheckedIn();
 			if (TestDiagnostics::consumeFault("fork.skip_checkin_semaphore")) {
 				TestDiagnostics::traceLine(
@@ -486,21 +494,50 @@ void DarlingServer::Process::unregisterKqchan(std::shared_ptr<Kqchan> kqchan) {
 
 bool DarlingServer::Process::waitForChildAfterFork() {
 	// this function is always called within a microthread
-	processLog.info() << *this << ": waiting up to " << ForkCheckinWaitTimeoutSeconds
+	unsigned int timeoutSeconds = ForkCheckinWaitTimeoutSeconds;
+	if (const char* value = std::getenv("DSERVER_TEST_FORK_CHECKIN_TIMEOUT_SECONDS"); value && value[0] != '\0') {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(value, &end, 10);
+		if (end != value && *end == '\0' && parsed > 0 && parsed <= 60) {
+			timeoutSeconds = static_cast<unsigned int>(parsed);
+		}
+	}
+
+	processLog.info() << *this << ": waiting up to " << timeoutSeconds
 			<< " seconds for fork child checkin" << processLog.endLog;
 
-	switch (_forkChildCheckin.wait(_dtapeForkWaitSemaphore)) {
+	switch (_forkChildCheckin.wait(_dtapeForkWaitSemaphore, timeoutSeconds)) {
 		case ForkCheckinWaitResult::Observed:
 			processLog.info() << *this << ": fork child checkin observed" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.fork_wait result=observed pid=" + std::to_string(id()) +
+				" nsid=" + std::to_string(nsid()) +
+				" timeout=" + std::to_string(timeoutSeconds)
+			);
 			return true;
 		case ForkCheckinWaitResult::Interrupted:
+			TestDiagnostics::traceLine(
+				"process.fork_wait result=interrupted pid=" + std::to_string(id()) +
+				" nsid=" + std::to_string(nsid()) +
+				" timeout=" + std::to_string(timeoutSeconds)
+			);
 			return false;
 		case ForkCheckinWaitResult::TimedOut:
-			processLog.error() << *this << ": timed out waiting " << ForkCheckinWaitTimeoutSeconds
+			processLog.error() << *this << ": timed out waiting " << timeoutSeconds
 					<< " seconds for fork child checkin" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.fork_wait result=timed_out pid=" + std::to_string(id()) +
+				" nsid=" + std::to_string(nsid()) +
+				" timeout=" + std::to_string(timeoutSeconds)
+			);
 			return false;
 		default:
 			processLog.error() << *this << ": failed while waiting for fork child checkin" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.fork_wait result=error pid=" + std::to_string(id()) +
+				" nsid=" + std::to_string(nsid()) +
+				" timeout=" + std::to_string(timeoutSeconds)
+			);
 			return false;
 	}
 };
