@@ -26,6 +26,7 @@
 #include <darlingserver/server.hpp>
 #include <darlingserver/logging.hpp>
 #include <darlingserver/metrics.hpp>
+#include <darlingserver/test-diagnostics.hpp>
 #include <filesystem>
 #include <fstream>
 
@@ -659,6 +660,7 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	_rwlock.lock();
 	// Consume a wake that arrived before suspend() marked us suspended.
 	if (microthreadConsumePendingResume(_resumePermit)) {
+		TestDiagnostics::traceLine("microthread.suspend.consume_pending_resume");
 		_rwlock.unlock();
 		if (unlockMe) {
 			libsimple_lock_unlock(unlockMe);
@@ -675,6 +677,7 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	_rwlock.lock();
 	// Consume a wake that arrived while the resume context was being captured.
 	if (microthreadConsumeResumeDuringSuspend(_suspended, _resumePermit)) {
+		TestDiagnostics::traceLine("microthread.suspend.consume_resume_during_suspend");
 		_rwlock.unlock();
 		if (unlockMeWhenSuspending) {
 			libsimple_lock_unlock(unlockMeWhenSuspending);
