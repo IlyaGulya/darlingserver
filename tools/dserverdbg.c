@@ -12,6 +12,7 @@
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 
 typedef uint32_t mach_port_type_t;
 typedef uint32_t mach_port_right_t;
@@ -49,6 +50,7 @@ typedef enum dserverdbg_command {
 	dserverdbg_command_lspset,
 	dserverdbg_command_lsmsg,
 	dserverdbg_command_uidgid_fault,
+	dserverdbg_command_fork_wait_sticky,
 } dserverdbg_command_t;
 
 struct sockaddr_un __dserver_socket_address_data = {0};
@@ -238,6 +240,107 @@ static int run_uidgid_fault_oracle(void) {
 	return 1;
 }
 
+static int write_fault_line(const char* line) {
+	const char* path = getenv("DSERVER_TEST_FAULT_FILE");
+	if (!path || path[0] == '\0') {
+		fprintf(stderr, "DSERVERDBG_FAULT_FILE=missing\n");
+		return 1;
+	}
+
+	FILE* file = fopen(path, "w");
+	if (!file) {
+		int status = errno;
+		fprintf(stderr, "DSERVERDBG_FAULT_WRITE_RC=%d (%s)\n", status, strerror(status));
+		return status;
+	}
+
+	if (fputs(line, file) < 0 || fputc('\n', file) < 0) {
+		int status = errno;
+		fclose(file);
+		fprintf(stderr, "DSERVERDBG_FAULT_WRITE_RC=%d (%s)\n", status, strerror(status));
+		return status;
+	}
+	if (fclose(file) != 0) {
+		int status = errno;
+		fprintf(stderr, "DSERVERDBG_FAULT_CLOSE_RC=%d (%s)\n", status, strerror(status));
+		return status;
+	}
+
+	printf("DSERVERDBG_FAULT_WRITTEN=%s\n", line);
+	return 0;
+}
+
+static int run_fork_wait_sticky_oracle(void) {
+	int status = 0;
+	pid_t parent_pid = getpid();
+
+	status = set_receive_timeout(__dserver_main_thread_socket_fd, 3);
+	if (status != 0) {
+		fprintf(stderr, "DSERVERDBG_RECV_TIMEOUT_SETUP_RC=%d (%s)\n", status, strerror(status));
+		return 1;
+	}
+
+	status = dserver_rpc_checkin(false, NULL, -1);
+	printf("DSERVERDBG_PARENT_CHECKIN_RC=%d\n", status);
+	printf("DSERVERDBG_PARENT_PID=%d\n", parent_pid);
+	if (status != 0) {
+		return 1;
+	}
+
+	char fault[128];
+	snprintf(fault, sizeof(fault), "fork.interrupt_wait parent=%d", parent_pid);
+	status = write_fault_line(fault);
+	if (status != 0) {
+		return 1;
+	}
+
+	status = dserver_rpc_fork_wait_for_child();
+	printf("DSERVERDBG_FORK_FIRST_WAIT_RC=%d\n", status);
+	if (status != -ETIMEDOUT) {
+		return 1;
+	}
+
+	snprintf(fault, sizeof(fault), "fork.skip_checkin_semaphore parent=%d", parent_pid);
+	status = write_fault_line(fault);
+	if (status != 0) {
+		return 1;
+	}
+	fflush(stdout);
+
+	pid_t child = fork();
+	if (child < 0) {
+		status = errno;
+		fprintf(stderr, "DSERVERDBG_FORK_RC=%d (%s)\n", status, strerror(status));
+		return 1;
+	}
+	if (child == 0) {
+		int child_status = dserver_rpc_checkin(true, NULL, -1);
+		printf("DSERVERDBG_CHILD_CHECKIN_RC=%d\n", child_status);
+		fflush(stdout);
+		_exit(child_status == 0 ? 0 : 1);
+	}
+
+	int child_status = 0;
+	if (waitpid(child, &child_status, 0) != child) {
+		status = errno;
+		fprintf(stderr, "DSERVERDBG_WAITPID_RC=%d (%s)\n", status, strerror(status));
+		return 1;
+	}
+	printf("DSERVERDBG_CHILD_EXIT_STATUS=%d\n", child_status);
+	if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
+		return 1;
+	}
+
+	status = dserver_rpc_fork_wait_for_child();
+	printf("DSERVERDBG_FORK_SECOND_WAIT_RC=%d\n", status);
+	if (status == 0) {
+		printf("DSERVERDBG_FORK_WAIT_STICKY_OK\n");
+		return 0;
+	}
+
+	return 1;
+}
+
 // borrowed from `src/startup/darling.c`
 static void missingSetuidRoot(void)
 {
@@ -283,6 +386,35 @@ out:
 	return status;
 }
 
+static int run_direct_fork_wait_sticky_command(uid_t original_uid) {
+	char* prefix_path = get_prefix_path(original_uid);
+	int status = 1;
+
+	if (!prefix_path) {
+		fprintf(stderr, "Failed to determine prefix path\n");
+		return 1;
+	}
+
+	__dserver_socket_address_data.sun_family = AF_UNIX;
+	snprintf(__dserver_socket_address_data.sun_path, sizeof(__dserver_socket_address_data.sun_path), "%s/.darlingserver.sock", prefix_path);
+
+	__dserver_main_thread_socket_fd = setup_socket();
+	if (__dserver_main_thread_socket_fd < 0) {
+		fprintf(stderr, "Failed to set up darlingserver client socket\n");
+		goto out;
+	}
+
+	status = run_fork_wait_sticky_oracle();
+
+out:
+	if (__dserver_main_thread_socket_fd >= 0) {
+		close(__dserver_main_thread_socket_fd);
+		__dserver_main_thread_socket_fd = -1;
+	}
+	free(prefix_path);
+	return status;
+}
+
 int main(int argc, char** argv) {
 	char* prefix_path = NULL;
 	dserverdbg_command_t command = dserverdbg_command_ps;
@@ -305,6 +437,13 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 		return run_direct_uidgid_fault_command(getuid());
+	}
+	if (argc > 1 && strcmp(argv[1], "fork-wait-sticky") == 0) {
+		if (argc > 2) {
+			fprintf(stderr, "Expected 1 argument (subcommand); got %d arguments\n", argc);
+			return 1;
+		}
+		return run_direct_fork_wait_sticky_command(getuid());
 	}
 
 	if (geteuid() != 0) {
@@ -350,6 +489,8 @@ int main(int argc, char** argv) {
 			command = dserverdbg_command_lsmsg;
 		} else if (strcmp(argv[1], "uidgid-fault") == 0) {
 			command = dserverdbg_command_uidgid_fault;
+		} else if (strcmp(argv[1], "fork-wait-sticky") == 0) {
+			command = dserverdbg_command_fork_wait_sticky;
 		} else {
 			fprintf(stderr, "Unknown subcommand: %s\n", argv[1]);
 			return 1;
@@ -371,6 +512,7 @@ int main(int argc, char** argv) {
 			command_pid = atoi(argv[2]);
 			break;
 		case dserverdbg_command_uidgid_fault:
+		case dserverdbg_command_fork_wait_sticky:
 			if (argc > 2) {
 				fprintf(stderr, "Expected 1 argument (subcommand); got %d arguments\n", argc);
 				return 1;
@@ -406,6 +548,9 @@ int main(int argc, char** argv) {
 			break;
 		case dserverdbg_command_uidgid_fault:
 			status = run_uidgid_fault_oracle();
+			goto out;
+		case dserverdbg_command_fork_wait_sticky:
+			status = run_fork_wait_sticky_oracle();
 			goto out;
 	}
 
