@@ -507,6 +507,13 @@ bool DarlingServer::Process::waitForChildAfterFork() {
 	processLog.info() << *this << ": waiting up to " << timeoutSeconds
 			<< " seconds for fork child checkin" << processLog.endLog;
 
+	std::string interruptFault = "fork.interrupt_wait parent=" + std::to_string(nsid());
+	if (TestDiagnostics::consumeFault(interruptFault.c_str())) {
+		TestDiagnostics::traceLine(
+			"process.fork_wait.force_interrupted parent=" + std::to_string(nsid())
+		);
+		return false;
+	}
 	switch (_forkChildCheckin.wait(_dtapeForkWaitSemaphore, timeoutSeconds)) {
 		case ForkCheckinWaitResult::Observed:
 			processLog.info() << *this << ": fork child checkin observed" << processLog.endLog;
