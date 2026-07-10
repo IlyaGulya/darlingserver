@@ -598,6 +598,10 @@ bool DarlingServer::MessageQueue::receiveMany(int socket) {
 		}
 
 		for (size_t i = 0; i < ret; ++i) {
+			if ((mmsgs[i].msg_hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
+				continue;
+			}
+
 			messages[i].rawHeader() = mmsgs[i].msg_hdr;
 			messages[i].data().resize(mmsgs[i].msg_len);
 			messages[i].setAddress(Address(*(const struct sockaddr_un*)mmsgs[i].msg_hdr.msg_name, mmsgs[i].msg_hdr.msg_namelen));
