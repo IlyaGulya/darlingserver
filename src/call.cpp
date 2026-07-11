@@ -1192,6 +1192,8 @@ void DarlingServer::Call::S2CPerform::processCall() {
 
 void DarlingServer::Call::SetExecutablePath::processCall() {
 	int code = 0;
+	std::string path;
+	bool pathSet = false;
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
@@ -1200,13 +1202,19 @@ void DarlingServer::Call::SetExecutablePath::processCall() {
 			if (!process->readMemory((uintptr_t)_body.buffer, tmpstr.data(), _body.buffer_size, &code)) {
 				code = -code;
 			} else {
-				process->setExecutablePath(tmpstr.c_str());
+				path = tmpstr.c_str();
+				process->setExecutablePath(path);
+				pathSet = true;
 			}
 		} else {
 			code = -ESRCH;
 		}
 	} else {
 		code = -ESRCH;
+	}
+
+	if (TestDiagnostics::enabled()) {
+		TestDiagnostics::traceExecutablePath(_header.pid, _header.tid, pathSet ? path : std::string(), code);
 	}
 
 	_sendReply(code);
