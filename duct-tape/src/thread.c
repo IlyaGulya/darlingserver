@@ -182,6 +182,15 @@ void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, 
 	thread_unlock(&thread->xnu_thread);
 };
 
+void dtape_thread_cancel_state_snapshot(
+	const dtape_thread_t* thread,
+	dtape_thread_cancel_state_snapshot_t* snapshot
+) {
+	snapshot->disabled = thread->cancel.disable;
+	snapshot->pending = thread->cancel.pending;
+	snapshot->canceled = thread->cancel.canceled;
+}
+
 // Implements XNU's __pthread_canceled(action) (bsd/kern/kern_sig.c) on the
 // duct-tape thread's cancellation bits. Operates on the *current* thread (the
 // caller of the syscall), exactly like the XNU version which uses

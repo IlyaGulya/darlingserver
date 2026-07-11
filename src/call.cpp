@@ -763,11 +763,37 @@ void DarlingServer::Call::PthreadCanceled::processCall() {
 	// broke libpthread's cancellation handshake and made cancelable syscalls
 	// (brew's portable-ruby) livelock re-issuing this call ~670x/sec.
 	int code = -ESRCH;
+	dtape_thread_cancel_state_snapshot_t before = {};
+	dtape_thread_cancel_state_snapshot_t after = {};
+	bool stateKnown = false;
+	const bool trace = TestDiagnostics::enabled();
 
 	if (auto thread = _thread.lock()) {
+		stateKnown = true;
+		if (trace) {
+			dtape_thread_cancel_state_snapshot(thread->_dtapeThread, &before);
+		}
 		code = -dtape_thread_canceled(thread->_dtapeThread, _body.action);
+		if (trace) {
+			dtape_thread_cancel_state_snapshot(thread->_dtapeThread, &after);
+		}
 	}
 
+	if (trace) {
+		TestDiagnostics::tracePthreadCanceled(
+			_header.pid,
+			_header.tid,
+			_body.action,
+			stateKnown,
+			before.disabled,
+			before.pending,
+			before.canceled,
+			after.disabled,
+			after.pending,
+			after.canceled,
+			code
+		);
+	}
 	_sendReply(code);
 };
 
@@ -775,13 +801,39 @@ void DarlingServer::Call::PthreadMarkcancel::processCall() {
 	// Implements XNU __pthread_markcancel(thread_port): arm the cancel-pending
 	// bit on the target thread (the kernel side of pthread_cancel). dar-gwn.6.3.
 	int code = 0;
+	dtape_thread_cancel_state_snapshot_t before = {};
+	dtape_thread_cancel_state_snapshot_t after = {};
+	bool targetKnown = false;
+	const bool trace = TestDiagnostics::enabled();
 
 	if (auto targetThread = Thread::threadForPort(_body.thread_port)) {
+		targetKnown = true;
+		if (trace) {
+			dtape_thread_cancel_state_snapshot(targetThread->_dtapeThread, &before);
+		}
 		code = -dtape_thread_markcancel(targetThread->_dtapeThread);
+		if (trace) {
+			dtape_thread_cancel_state_snapshot(targetThread->_dtapeThread, &after);
+		}
 	} else {
 		code = -ESRCH;
 	}
 
+	if (trace) {
+		TestDiagnostics::tracePthreadMarkcancel(
+			_header.pid,
+			_header.tid,
+			_body.thread_port,
+			targetKnown,
+			before.disabled,
+			before.pending,
+			before.canceled,
+			after.disabled,
+			after.pending,
+			after.canceled,
+			code
+		);
+	}
 	_sendReply(code);
 };
 
