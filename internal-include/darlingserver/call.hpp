@@ -26,6 +26,7 @@
 #include <darlingserver/message.hpp>
 #include <darlingserver/registry.hpp>
 #include <darlingserver/logging.hpp>
+#include <darlingserver/test-diagnostics.hpp>
 
 #include <memory>
 
