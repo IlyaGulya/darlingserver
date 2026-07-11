@@ -1,5 +1,6 @@
 #include <darlingserver/test-diagnostics.hpp>
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -29,6 +30,31 @@ static const char* semaphoreOutcome(int resultCode) {
 static std::string semaphoreNames(unsigned int waitName, bool hasSignalName, unsigned int signalName) {
 	std::string names = " wait_name=" + std::to_string(waitName) + " signal_name=";
 	return names + (hasSignalName ? std::to_string(signalName) : "none");
+}
+
+static std::string cancellationState(
+	bool known,
+	bool disabled,
+	bool pending,
+	bool canceled
+) {
+	if (!known) {
+		return "unavailable";
+	}
+	return std::to_string(disabled) + ":" + std::to_string(pending) + ":" + std::to_string(canceled);
+}
+
+static const char* pthreadCancelOutcome(int resultCode) {
+	if (resultCode == 0) {
+		return "success";
+	}
+	if (resultCode == -EINVAL) {
+		return "not-canceled";
+	}
+	if (resultCode == -ESRCH) {
+		return "missing-thread";
+	}
+	return "error";
 }
 
 bool enabled() {
@@ -146,6 +172,66 @@ void traceSemaphoreCallReply(
 		semaphoreNames(waitName, hasSignalName, signalName) +
 		" code=" + std::to_string(resultCode) +
 		" outcome=" + semaphoreOutcome(resultCode) +
+		" terminal=reply-enqueued"
+	);
+}
+
+void tracePthreadCanceled(
+	int pid,
+	int tid,
+	int action,
+	bool stateKnown,
+	bool disabledBefore,
+	bool pendingBefore,
+	bool canceledBefore,
+	bool disabledAfter,
+	bool pendingAfter,
+	bool canceledAfter,
+	int resultCode
+) {
+	traceLine(
+		"rpc.pthread_canceled operation=pthread_canceled" +
+		std::string(" pid=") + std::to_string(pid) +
+		" tid=" + std::to_string(tid) +
+		" action=" + std::to_string(action) +
+		" state_before=" + cancellationState(
+			stateKnown, disabledBefore, pendingBefore, canceledBefore
+		) +
+		" state_after=" + cancellationState(
+			stateKnown, disabledAfter, pendingAfter, canceledAfter
+		) +
+		" code=" + std::to_string(resultCode) +
+		" outcome=" + pthreadCancelOutcome(resultCode) +
+		" terminal=reply-enqueued"
+	);
+}
+
+void tracePthreadMarkcancel(
+	int pid,
+	int tid,
+	unsigned int targetPort,
+	bool targetKnown,
+	bool disabledBefore,
+	bool pendingBefore,
+	bool canceledBefore,
+	bool disabledAfter,
+	bool pendingAfter,
+	bool canceledAfter,
+	int resultCode
+) {
+	traceLine(
+		"rpc.pthread_canceled operation=pthread_markcancel" +
+		std::string(" pid=") + std::to_string(pid) +
+		" tid=" + std::to_string(tid) +
+		" target_port=" + std::to_string(targetPort) +
+		" state_before=" + cancellationState(
+			targetKnown, disabledBefore, pendingBefore, canceledBefore
+		) +
+		" state_after=" + cancellationState(
+			targetKnown, disabledAfter, pendingAfter, canceledAfter
+		) +
+		" code=" + std::to_string(resultCode) +
+		" outcome=" + pthreadCancelOutcome(resultCode) +
 		" terminal=reply-enqueued"
 	);
 }
