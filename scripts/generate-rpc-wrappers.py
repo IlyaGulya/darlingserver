@@ -972,6 +972,12 @@ for call in calls:
 	flags = call[3] if len(call) >= 4 else 0
 	camel_name = to_camel_case(call_name)
 	fd_count_in_reply = 0
+	semaphore_trace = call_name in (
+		'semaphore_signal',
+		'semaphore_wait_signal',
+		'semaphore_timedwait',
+		'semaphore_timedwait_signal',
+	)
 
 	internal_header.write(textwrap.indent(textwrap.dedent("""\
 		class Call::{1}: public Call, public std::enable_shared_from_this<Call::{1}> {{ \\
@@ -999,6 +1005,23 @@ for call in calls:
 			continue
 
 		internal_header.write("\t\t\t_body." + param_name + " = requestMessage.extractDescriptorAtIndex(_body." + param_name + "); \\\n")
+	if semaphore_trace:
+		has_signal_name = call_name in ('semaphore_signal', 'semaphore_wait_signal', 'semaphore_timedwait_signal')
+		has_timeout = call_name in ('semaphore_timedwait', 'semaphore_timedwait_signal')
+		wait_name = '0' if call_name == 'semaphore_signal' else '_body.wait_name'
+		signal_name = '_body.signal_name'
+		sec = '_body.sec' if has_timeout else '0'
+		nsec = '_body.nsec' if has_timeout else '0'
+		internal_header.write(
+			"\t\t\tTestDiagnostics::traceSemaphoreCallBegin(\"{0}\", _header.pid, _header.tid, {1}, {2}, {3}, {4}, {5}); \\\n".format(
+				call_name,
+				wait_name,
+				'true' if has_signal_name else 'false',
+				signal_name if has_signal_name else '0',
+				sec,
+				nsec,
+			)
+		)
 	internal_header.write("\t\t}; \\\n")
 
 	internal_header.write("\t\t~" + camel_name + "() { \\\n")
@@ -1079,6 +1102,18 @@ for call in calls:
 	if len(reply_parameters) == 0:
 		internal_header.write("\tpublic: \\\n")
 		internal_header.write("\t\tvoid sendBasicReply(int resultCode) override { \\\n")
+		if semaphore_trace:
+			has_signal_name = call_name in ('semaphore_signal', 'semaphore_wait_signal', 'semaphore_timedwait_signal')
+			wait_name = '0' if call_name == 'semaphore_signal' else '_body.wait_name'
+			signal_name = '_body.signal_name'
+			internal_header.write(
+				"\t\t\tTestDiagnostics::traceSemaphoreCallReply(\"{0}\", _header.pid, _header.tid, {1}, {2}, {3}, resultCode); \\\n".format(
+					call_name,
+					wait_name,
+					'true' if has_signal_name else 'false',
+					signal_name if has_signal_name else '0',
+				)
+			)
 		internal_header.write("\t\t\t_sendReply(resultCode); \\\n")
 		internal_header.write("\t\t}; \\\n")
 

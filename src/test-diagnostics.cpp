@@ -13,6 +13,24 @@ static constexpr const char* TraceEnv = "DSERVER_TEST_TRACE_FILE";
 static constexpr const char* FaultEnv = "DSERVER_TEST_FAULT_FILE";
 static std::mutex traceMutex;
 
+static const char* semaphoreOutcome(int resultCode) {
+	switch (resultCode) {
+		case 0:
+			return "success";
+		case 14: // KERN_ABORTED
+			return "interrupted";
+		case 49: // KERN_OPERATION_TIMED_OUT
+			return "timeout";
+		default:
+			return "error";
+	}
+}
+
+static std::string semaphoreNames(unsigned int waitName, bool hasSignalName, unsigned int signalName) {
+	std::string names = " wait_name=" + std::to_string(waitName) + " signal_name=";
+	return names + (hasSignalName ? std::to_string(signalName) : "none");
+}
+
 bool enabled() {
 	return std::getenv(TraceEnv) != nullptr;
 }
@@ -90,6 +108,46 @@ void traceLine(const std::string& line) {
 	}
 
 	close(fd);
+}
+
+void traceSemaphoreCallBegin(
+	const char* operation,
+	int pid,
+	int tid,
+	unsigned int waitName,
+	bool hasSignalName,
+	unsigned int signalName,
+	unsigned int sec,
+	unsigned int nsec
+) {
+	traceLine(
+		std::string("rpc.semaphore.begin operation=") + operation +
+		" pid=" + std::to_string(pid) +
+		" tid=" + std::to_string(tid) +
+		semaphoreNames(waitName, hasSignalName, signalName) +
+		" sec=" + std::to_string(sec) +
+		" nsec=" + std::to_string(nsec)
+	);
+}
+
+void traceSemaphoreCallReply(
+	const char* operation,
+	int pid,
+	int tid,
+	unsigned int waitName,
+	bool hasSignalName,
+	unsigned int signalName,
+	int resultCode
+) {
+	traceLine(
+		std::string("rpc.semaphore.reply operation=") + operation +
+		" pid=" + std::to_string(pid) +
+		" tid=" + std::to_string(tid) +
+		semaphoreNames(waitName, hasSignalName, signalName) +
+		" code=" + std::to_string(resultCode) +
+		" outcome=" + semaphoreOutcome(resultCode) +
+		" terminal=reply-enqueued"
+	);
 }
 
 }
