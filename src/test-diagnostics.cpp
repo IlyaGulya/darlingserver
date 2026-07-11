@@ -1,6 +1,7 @@
 #include <darlingserver/test-diagnostics.hpp>
 
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -55,6 +56,24 @@ static const char* pthreadCancelOutcome(int resultCode) {
 		return "missing-thread";
 	}
 	return "error";
+}
+
+static std::string traceValue(const std::string& value) {
+	static constexpr char Hex[] = "0123456789abcdef";
+	std::string escaped;
+	escaped.reserve(value.size());
+
+	for (unsigned char character : value) {
+		if (std::isalnum(character) || character == '/' || character == '.' || character == '-' || character == '_') {
+			escaped.push_back(static_cast<char>(character));
+		} else {
+			escaped += "\\x";
+			escaped.push_back(Hex[character >> 4]);
+			escaped.push_back(Hex[character & 0x0f]);
+		}
+	}
+
+	return escaped;
 }
 
 bool enabled() {
@@ -232,6 +251,17 @@ void tracePthreadMarkcancel(
 		) +
 		" code=" + std::to_string(resultCode) +
 		" outcome=" + pthreadCancelOutcome(resultCode) +
+		" terminal=reply-enqueued"
+	);
+}
+
+void traceExecutablePath(int pid, int tid, const std::string& path, int resultCode) {
+	traceLine(
+		"process.executable_path operation=set_executable_path" +
+		std::string(" pid=") + std::to_string(pid) +
+		" tid=" + std::to_string(tid) +
+		" path=" + traceValue(path) +
+		" code=" + std::to_string(resultCode) +
 		" terminal=reply-enqueued"
 	);
 }

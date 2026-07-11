@@ -52,5 +52,6 @@ void tracePthreadMarkcancel(
 	bool canceledAfter,
 	int resultCode
 );
+void traceExecutablePath(int pid, int tid, const std::string& path, int resultCode);
 
 }
