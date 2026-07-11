@@ -62,6 +62,18 @@ void dtape_semaphore_destroy(dtape_semaphore_t* semaphore);
 void dtape_thread_entering(dtape_thread_t* thread);
 void dtape_thread_exiting(dtape_thread_t* thread);
 void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, uintptr_t dispatch_qaddr);
+
+typedef struct dtape_thread_cancel_state_snapshot {
+	bool disabled;
+	bool pending;
+	bool canceled;
+} dtape_thread_cancel_state_snapshot_t;
+
+// Captures the cancellation state for diagnostics without changing it.
+void dtape_thread_cancel_state_snapshot(
+	const dtape_thread_t* thread,
+	dtape_thread_cancel_state_snapshot_t* snapshot
+);
 /**
  * Implements __pthread_canceled(action) for the current thread. See dar-gwn.6.3.
  * Returns the XNU-style code (0 or EINVAL); the caller negates it for the guest.
