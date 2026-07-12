@@ -122,6 +122,19 @@ add_executable(darlingserver
 	src/test-diagnostics.cpp
 )
 
+add_executable(dserver_process_identity_tests
+	tests/process_identity_test.cpp
+)
+
+target_compile_options(dserver_process_identity_tests PRIVATE
+	-std=c++17
+)
+
+add_custom_target(dserver_process_identity_tests_run
+	COMMAND $<TARGET_FILE:dserver_process_identity_tests>
+	DEPENDS dserver_process_identity_tests
+)
+
 add_dependencies(darlingserver
 	generate_dserver_rpc_wrappers
 	rtsig_h

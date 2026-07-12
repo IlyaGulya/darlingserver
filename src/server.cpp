@@ -441,8 +441,9 @@ struct DTapeHooks {
 	};
 };
 
-DarlingServer::Server::Server(std::string prefix):
+DarlingServer::Server::Server(std::string prefix, pid_t rootlessInitHostPID):
 	_prefix(prefix),
+	_rootlessInitHostPID(rootlessInitHostPID),
 	_socketPath(_prefix + "/.darlingserver.sock"),
 	// abstract-namespace name for the stat socket (see the stat-socket setup below for
 	// why abstract and not a pathname). Keyed off the prefix so distinct prefixes differ.
@@ -840,6 +841,10 @@ DarlingServer::Server& DarlingServer::Server::sharedInstance() {
 
 std::string DarlingServer::Server::prefix() const {
 	return _prefix;
+};
+
+pid_t DarlingServer::Server::namespaceIDForPeer(pid_t peerHostPID, pid_t reportedNamespaceID) const {
+	return ProcessIdentity::namespaceIDForPeer(_rootlessInitHostPID, peerHostPID, reportedNamespaceID);
 };
 
 void DarlingServer::Server::_worker(std::shared_ptr<Thread> thread) {
