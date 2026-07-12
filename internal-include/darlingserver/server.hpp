@@ -27,6 +27,7 @@
 #include <darlingserver/message.hpp>
 #include <darlingserver/workers.hpp>
 #include <darlingserver/call.hpp>
+#include <darlingserver/process-identity.hpp>
 #include <darlingserver/registry.hpp>
 #include <darlingserver/utility.hpp>
 #include <darlingserver/monitor.hpp>
@@ -39,6 +40,7 @@ namespace DarlingServer {
 	private:
 		int _listenerSocket;
 		std::string _prefix;
+		pid_t _rootlessInitHostPID;
 		std::string _socketPath;
 		// perf #0 (dar-dar6x4-perf-5dq.6): dedicated stat socket. A SOCK_STREAM listener in
 		// the ABSTRACT namespace (the server is in a private mount namespace, so a pathname
@@ -71,7 +73,7 @@ namespace DarlingServer {
 		friend struct ::DTapeHooks;
 
 	public:
-		Server(std::string prefix);
+		Server(std::string prefix, pid_t rootlessInitHostPID = 0);
 		~Server();
 
 		Server(const Server&) = delete;
@@ -84,6 +86,7 @@ namespace DarlingServer {
 		void monitorProcess(std::shared_ptr<Process> process);
 
 		std::string prefix() const;
+		pid_t namespaceIDForPeer(pid_t peerHostPID, pid_t reportedNamespaceID) const;
 
 		static Server& sharedInstance();
 

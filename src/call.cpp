@@ -62,8 +62,10 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 	}
 
 	if ((header->number & DSERVER_CALL_UNMANAGED_FLAG) == 0) {
-		// now let's lookup (and possibly create) the process and thread making this call
-		process = processRegistry().registerIfAbsent(header->pid, [&]() {
+		const auto namespaceID = Server::sharedInstance().namespaceIDForPeer(requestMessage.pid(), header->pid);
+
+		// Now look up (and possibly create) the process and thread making this call.
+		process = processRegistry().registerIfAbsent(namespaceID, [&]() {
 			std::shared_ptr<Process> tmp = nullptr;
 
 			if (TestDiagnostics::consumeFault("ingest.process_register_fail")) {
@@ -81,7 +83,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			}
 
 			try {
-				tmp = std::make_shared<Process>(requestMessage.pid(), header->pid, static_cast<Process::Architecture>(header->architecture), lifetimePipe);
+				tmp = std::make_shared<Process>(requestMessage.pid(), namespaceID, static_cast<Process::Architecture>(header->architecture), lifetimePipe);
 			} catch (std::system_error e) {
 				return tmp;
 			}
