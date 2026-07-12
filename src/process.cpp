@@ -19,6 +19,7 @@
 
 #include <darlingserver/process.hpp>
 #include <darlingserver/fork-checkin.hpp>
+#include <darlingserver/process-identity.hpp>
 #include <darlingserver/registry.hpp>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -307,7 +308,7 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 			auto thread = it->second.lock();
 			lock.unlock();
 			if (thread) {
-				if (thread->_nstid == _nspid) {
+				if (ProcessIdentity::isMainThread(thread->_nstid, thread->_tid, _nspid, _pid)) {
 					mainThread = thread;
 				} else {
 					thread->_process = nullptr;

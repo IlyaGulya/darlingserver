@@ -252,7 +252,7 @@ void darlingPreInit(const char* prefix)
 	}
 }
 
-void spawnLaunchd(const char* prefix)
+void spawnLaunchd(const char* prefix, bool rootless)
 {
 	puts("Bootstrapping the container with launchd...");
 
@@ -268,6 +268,9 @@ void spawnLaunchd(const char* prefix)
 
 	setenv("__mldr_DYLD_ROOT_PATH", LIBEXEC_PATH, 1);
 	setenv("__mldr_sockpath", tmp.c_str(), 1);
+	if (rootless) {
+		setenv("__mldr_rootless_pid1", "1", 1);
+	}
 	execl(DarlingServer::Config::defaultMldrPath.data(), "mldr!" LIBEXEC_PATH "/usr/libexec/darling/vchroot", "vchroot", prefix, initPath, NULL);
 
 	fprintf(stderr, "Failed to exec launchd: %s\n", strerror(errno));
@@ -324,6 +327,34 @@ static bool shouldUseOverlayFs() {
 	return shouldUse;
 }
 
+static bool shouldUseEunionPrefix() {
+	return testEnvVar("DARLING_EUNION");
+}
+
+static void setupEunionPrefix(const char* prefix) {
+	char marker[4096];
+
+	if (snprintf(marker, sizeof(marker), "%s/.union-work", prefix) >= (int)sizeof(marker)) {
+		fprintf(stderr, "E-UNION work directory path is too long for prefix %s\n", prefix);
+		exit(1);
+	}
+
+	if (mkdir(marker, 0700) == -1 && errno != EEXIST) {
+		fprintf(stderr, "Cannot create E-UNION work directory %s: %s\n", marker, strerror(errno));
+		exit(1);
+	}
+
+	struct stat st;
+	if (lstat(marker, &st) == -1) {
+		fprintf(stderr, "Cannot stat E-UNION work directory %s: %s\n", marker, strerror(errno));
+		exit(1);
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "E-UNION work path exists but is not a directory: %s\n", marker);
+		exit(1);
+	}
+}
+
 static int compareTimespec(const timespec& a, const timespec& b) {
 	if (a.tv_sec != b.tv_sec) {
 		return (a.tv_sec > b.tv_sec) ? 1 : -1;
@@ -334,7 +365,7 @@ static int compareTimespec(const timespec& a, const timespec& b) {
 	}
 }
 
-static void copyAndSetAttributes(std::string& fromPath, std::string& toPath) {
+static void copyAndSetAttributes(std::string& fromPath, std::string& toPath, bool preserveOwnership) {
 	struct stat fromStat, toStat;
 	if (lstat(fromPath.c_str(), &fromStat) == -1) {
 		fprintf(stderr, "Failed to stat file %s: %s\n", fromPath.c_str(), strerror(errno));
@@ -382,7 +413,7 @@ static void copyAndSetAttributes(std::string& fromPath, std::string& toPath) {
 				fromPath.append(entry->d_name);
 				toPath.append(entry->d_name);
 
-				copyAndSetAttributes(fromPath, toPath);
+				copyAndSetAttributes(fromPath, toPath, preserveOwnership);
 
 				fromPath.resize(oldFromSize);
 				toPath.resize(oldToSize);
@@ -434,7 +465,7 @@ static void copyAndSetAttributes(std::string& fromPath, std::string& toPath) {
 			fprintf(stderr, "Failed to set timestamp for %s: %s\n", toPath.c_str(), strerror(errno));
 			abort();
     	}
-		if (fchownat(-1, toPath.c_str(), fromStat.st_uid, fromStat.st_gid, AT_SYMLINK_NOFOLLOW) == -1) {
+		if (preserveOwnership && fchownat(-1, toPath.c_str(), fromStat.st_uid, fromStat.st_gid, AT_SYMLINK_NOFOLLOW) == -1) {
 			fprintf(stderr, "Failed to set owner for %s: %s\n", toPath.c_str(), strerror(errno));
 			abort();
 		}
@@ -448,7 +479,12 @@ static void copyAndSetAttributes(std::string& fromPath, std::string& toPath) {
 	}
 }
 
-static void temp_drop_privileges(uid_t uid, gid_t gid) {
+static bool rootlessModeEnabled() {
+	return testEnvVar("DARLING_ROOTLESS");
+}
+
+static void temp_drop_privileges(uid_t uid, gid_t gid, bool rootless) {
+	if (rootless) return;
 	// it's important to drop GID first, because non-root users can't change their GID
 	if (setresgid(gid, gid, 0) < 0) {
 		fprintf(stderr, "Failed to temporarily drop group privileges\n");
@@ -460,7 +496,8 @@ static void temp_drop_privileges(uid_t uid, gid_t gid) {
 	}
 };
 
-static void perma_drop_privileges(uid_t uid, gid_t gid) {
+static void perma_drop_privileges(uid_t uid, gid_t gid, bool rootless) {
+	if (rootless) return;
 	if (setresgid(gid, gid, gid) < 0) {
 		fprintf(stderr, "Failed to drop group privileges\n");
 		exit(1);
@@ -471,7 +508,8 @@ static void perma_drop_privileges(uid_t uid, gid_t gid) {
 	}
 };
 
-static void regain_privileges() {
+static void regain_privileges(bool rootless) {
+	if (rootless) return;
 	if (seteuid(0) < 0) {
 		fprintf(stderr, "Failed to regain root EUID\n");
 		exit(1);
@@ -537,17 +575,22 @@ int main(int argc, char** argv) {
 	}
 
 	prefix_length = strlen(prefix);
+	const bool rootless = rootlessModeEnabled();
 
-	if (getuid() != 0 || getgid() != 0) {
+	if (!rootless && (getuid() != 0 || getgid() != 0)) {
 		fprintf(stderr, "darlingserver needs to start as root\n");
+		exit(1);
+	}
+	if (rootless && prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
+		fprintf(stderr, "Cannot enable rootless child reaping: %s\n", strerror(errno));
 		exit(1);
 	}
 
 	// temporarily drop privileges to perform some prefix work
-	temp_drop_privileges(originalUID, originalGID);
+	temp_drop_privileges(originalUID, originalGID, rootless);
 	setupUserHome(prefix, originalUID);
 	//setupCoredumpPattern();
-	regain_privileges();
+	regain_privileges(rootless);
 
 	// read the default rlimit so we can restore it for our children
 	if (getrlimit(RLIMIT_NOFILE, &default_limit) != 0) {
@@ -595,29 +638,39 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	// Since overlay cannot be mounted inside user namespaces, we have to setup a new mount namespace
-	// and do the mount while we can be root
-	if (unshare(CLONE_NEWNS) != 0)
-	{
-		fprintf(stderr, "Cannot unshare PID and mount namespaces: %s\n", strerror(errno));
+	if (!rootless) {
+		// Since overlay cannot be mounted inside user namespaces, we have to setup a new mount namespace
+		// and do the mount while we can be root
+		if (unshare(CLONE_NEWNS) != 0)
+		{
+			fprintf(stderr, "Cannot unshare PID and mount namespaces: %s\n", strerror(errno));
+			exit(1);
+		}
+
+		int shmMountFlags = MS_NOSUID | MS_NODEV;
+		// Workaround for dumb Microsoft bug: https://github.com/microsoft/WSL/issues/8777
+		if (!isOnWsl1())
+		{
+			shmMountFlags |= MS_NOEXEC;
+		}
+
+		umount("/dev/shm");
+		if (mount("tmpfs", "/dev/shm", "tmpfs", shmMountFlags, NULL) != 0)
+		{
+			fprintf(stderr, "Cannot mount new /dev/shm: %s\n", strerror(errno));
+			exit(1);
+		}
+	}
+	const bool useOverlayFs = !rootless && shouldUseOverlayFs();
+	const bool useEunionPrefix = !useOverlayFs && shouldUseEunionPrefix();
+	if (rootless && !useEunionPrefix) {
+		fprintf(stderr,
+			"Rootless no-mount startup requires DARLING_EUNION=1; "
+			"copy-mode would modify the shared template tree\n");
 		exit(1);
 	}
 
-	int shmMountFlags = MS_NOSUID | MS_NODEV;
-	// Workaround for dumb Microsoft bug: https://github.com/microsoft/WSL/issues/8777
-	if (!isOnWsl1())
-	{
-		shmMountFlags |= MS_NOEXEC;
-	}
-
-	umount("/dev/shm");
-	if (mount("tmpfs", "/dev/shm", "tmpfs", shmMountFlags, NULL) != 0)
-	{
-		fprintf(stderr, "Cannot mount new /dev/shm: %s\n", strerror(errno));
-		exit(1);
-	}
-
-	if (shouldUseOverlayFs()) {
+	if (useOverlayFs) {
 		// Because systemd marks / as MS_SHARED and we would inherit this into the overlay mount,
 		// causing it not to be unmounted once the init process dies.
 		if (mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) != 0)
@@ -648,14 +701,16 @@ int main(int argc, char** argv) {
 
 	mount_ok:
 		free(opts);
+	} else if (useEunionPrefix) {
+		setupEunionPrefix(prefix);
 	} else {
 		std::string fromPath = LIBEXEC_PATH;
 		std::string toPath = prefix;
-		copyAndSetAttributes(fromPath, toPath);
+		copyAndSetAttributes(fromPath, toPath, !rootless);
 	}
 
 	// This is executed once at prefix creation
-	if (fix_permissions) {
+	if (fix_permissions && !rootless) {
 		const char* extra_paths[] = {
 			"/private/etc/passwd",
 			"/private/etc/master.passwd",
@@ -675,9 +730,9 @@ int main(int argc, char** argv) {
 	}
 
 	// temporarily drop privileges and do some prefix work
-	temp_drop_privileges(originalUID, originalGID);
+	temp_drop_privileges(originalUID, originalGID, rootless);
 	darlingPreInit(prefix);
-	regain_privileges();
+	regain_privileges(rootless);
 
 	// Tell the parent we're ready
 	write(pipefd, ".", 1);
@@ -688,9 +743,13 @@ int main(int argc, char** argv) {
 		exit(1);
 	}
 
-	// we have to use `clone` rather than `fork` to create the process in its own PID namespace
-	// and still be able to spawn new processes and threads of our own
-	launchdGlobalPID = syscall(SYS_clone, CLONE_NEWPID | SIGCHLD, NULL, NULL, NULL, 0);
+	if (rootless) {
+		launchdGlobalPID = fork();
+	} else {
+		// we have to use `clone` rather than `fork` to create the process in its own PID namespace
+		// and still be able to spawn new processes and threads of our own
+		launchdGlobalPID = syscall(SYS_clone, CLONE_NEWPID | SIGCHLD, NULL, NULL, NULL, 0);
+	}
 
 	if (launchdGlobalPID < 0) {
 		fprintf(stderr, "Failed to fork to start launchd: %s\n", strerror(errno));
@@ -701,17 +760,18 @@ int main(int argc, char** argv) {
 
 		close(childWaitFDs[1]);
 
-		snprintf(putOld, sizeof(putOld), "%s/proc", prefix);
+		if (!rootless) {
+			snprintf(putOld, sizeof(putOld), "%s/proc", prefix);
 
-		// mount procfs for our new PID namespace
-		if (mount("proc", putOld, "proc", 0, "") != 0)
-		{
-			fprintf(stderr, "Cannot mount procfs: %s\n", strerror(errno));
-			exit(1);
+			// mount procfs for our new PID namespace
+			if (mount("proc", putOld, "proc", 0, "") != 0)
+			{
+				fprintf(stderr, "Cannot mount procfs: %s\n", strerror(errno));
+				exit(1);
+			}
 		}
-
 		// drop our privileges now
-		perma_drop_privileges(originalUID, originalGID);
+		perma_drop_privileges(originalUID, originalGID, rootless);
 		prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
 
 		// dar-pot: bind this launchd's lifetime to darlingserver's. We are PID 1
@@ -742,7 +802,7 @@ int main(int argc, char** argv) {
 		read(childWaitFDs[0], buf, 1);
 		close(childWaitFDs[0]);
 
-		spawnLaunchd(prefix);
+		spawnLaunchd(prefix, rootless);
 		__builtin_unreachable();
 	}
 
@@ -750,7 +810,7 @@ int main(int argc, char** argv) {
 	close(childWaitFDs[0]);
 
 	// drop our privileges
-	perma_drop_privileges(originalUID, originalGID);
+	perma_drop_privileges(originalUID, originalGID, rootless);
 	prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
 
 #if DSERVER_ASAN
@@ -763,7 +823,7 @@ int main(int argc, char** argv) {
 #endif
 
 	// create the server
-	auto server = new DarlingServer::Server(prefix);
+	auto server = new DarlingServer::Server(prefix, rootless ? launchdGlobalPID : 0);
 
 	// tell the child to go ahead; the socket has been created
 	write(childWaitFDs[1], ".", 1);
