@@ -16,12 +16,12 @@ require_grep "_pendingStandardSignalMask" "$thread_h" \
 send_signal_body="$(sed -n '/void DarlingServer::Thread::sendSignal/,/^};/p' "$thread_cpp")"
 process_signal_body="$(sed -n '/void DarlingServer::Thread::processSignal/,/dtape_thread_process_signal/p' "$thread_cpp")"
 
-require_text "signal != SIGCHLD && signal != SIGUSR1" "$send_signal_body" \
-	"sendSignal does not exempt SIGCHLD/SIGUSR1 from coalescing"
-require_text "_pendingStandardSignalMask & bit" "$send_signal_body" \
-	"sendSignal does not drop duplicate pending standard signals"
-require_text "_pendingStandardSignalMask |= bit" "$send_signal_body" \
-	"sendSignal does not mark standard signals pending before tgkill"
+require_text "signal != SIGCHLD" "$send_signal_body" \
+	"sendSignal does not retain SIGCHLD's exceptional delivery semantics"
+require_not_grep "SIGUSR1" <(printf '%s\n' "$send_signal_body") \
+	"sendSignal still exempts SIGUSR1 from standard-signal coalescing"
+require_text "_markCoalescedStandardSignalPendingLocked" "$send_signal_body" \
+	"sendSignal does not call the production standard-signal suppression helper"
 require_text "_pendingStandardSignalMask &= ~(1ull << signal)" "$send_signal_body" \
 	"sendSignal does not clear pending mask on tgkill/process errors"
 require_text "StandardSignalPendingClear" "$process_signal_body" \

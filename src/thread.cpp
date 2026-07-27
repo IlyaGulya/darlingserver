@@ -2960,13 +2960,11 @@ void DarlingServer::Thread::sendSignal(int signal) const {
 		return;
 	}
 	bool markedPending = false;
-	if (signal > 0 && signal < 32 && signal != SIGCHLD && signal != SIGUSR1) {
+	if (signal > 0 && signal < 32 && signal != SIGCHLD) {
 		std::unique_lock lock(_rwlock);
-		uint64_t bit = 1ull << signal;
-		if (_pendingStandardSignalMask & bit) {
+		if (!_markCoalescedStandardSignalPendingLocked(_pendingStandardSignalMask, signal)) {
 			return;
 		}
-		_pendingStandardSignalMask |= bit;
 		markedPending = true;
 	}
 	if (_process) {

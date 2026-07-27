@@ -178,6 +178,23 @@ add_custom_target(dserver_stack_pool_tests_run
 	DEPENDS dserver_stack_pool_tests
 )
 
+add_executable(dserver_standard_signal_coalescing_tests
+	tests/standard-signal-coalescing.cpp
+)
+
+target_compile_options(dserver_standard_signal_coalescing_tests PRIVATE
+	-std=c++17
+)
+
+target_link_libraries(dserver_standard_signal_coalescing_tests PRIVATE
+	darlingserver_duct_tape
+)
+
+add_custom_target(dserver_standard_signal_coalescing_tests_run
+	COMMAND $<TARGET_FILE:dserver_standard_signal_coalescing_tests>
+	DEPENDS dserver_standard_signal_coalescing_tests
+)
+
 add_dependencies(darlingserver
 	generate_dserver_rpc_wrappers
 	rtsig_h

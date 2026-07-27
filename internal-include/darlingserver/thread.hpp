@@ -163,6 +163,19 @@ namespace DarlingServer {
 		// Consume one deliverable pending wake (preferring the innermost park kinds) and drop
 		// any stale pendings encountered. Returns true if a wake was consumed. _rwlock held.
 		bool _consumePendingWakeLocked();
+		// Standard signals are level-like while one delivery is pending.  The caller
+		// holds _rwlock and has already excluded SIGCHLD and non-standard signals.
+		// Returns false when the same standard signal is already pending; otherwise
+		// records it and returns true.  Kept separate so the exact production
+		// duplicate-suppression decision has a deterministic test seam.
+		static bool _markCoalescedStandardSignalPendingLocked(uint64_t& pendingMask, int signal) {
+			uint64_t bit = 1ull << signal;
+			if (pendingMask & bit) {
+				return false;
+			}
+			pendingMask |= bit;
+			return true;
+		}
 		// The two production suspend() consume windows.  Kept as locked helpers so
 		// deterministic tests exercise the exact implementation, not a model.
 		bool _consumeWakeBeforeSuspendLocked();
