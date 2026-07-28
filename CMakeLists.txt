@@ -5,6 +5,9 @@ cmake_minimum_required(VERSION 3.13)
 option(DSERVER_TOOLS "Build darlingserver tools (for debugging)" OFF)
 option(DSERVER_ASAN "Build darlingserver with ASAN" OFF)
 option(DSERVER_UBSAN "Build darlingserver with UBSAN" OFF)
+option(DARLING_EUNION
+	"Enable E-UNION union-in-vchroot prefix assembly (experimental)"
+	OFF)
 
 if (DSERVER_TOOLS)
 	add_subdirectory(tools)
@@ -120,6 +123,10 @@ add_executable(darlingserver
 	src/stack-pool.cpp
 	src/metrics.cpp
 	src/test-diagnostics.cpp
+	src/runtime-mode.cpp
+)
+target_compile_definitions(darlingserver PRIVATE
+	DARLING_RUNTIME_EUNION_CAPABLE=$<BOOL:${DARLING_EUNION}>
 )
 
 add_executable(dserver_process_identity_tests
@@ -133,6 +140,17 @@ target_compile_options(dserver_process_identity_tests PRIVATE
 add_custom_target(dserver_process_identity_tests_run
 	COMMAND $<TARGET_FILE:dserver_process_identity_tests>
 	DEPENDS dserver_process_identity_tests
+)
+
+add_executable(dserver_runtime_mode_tests
+	tests/runtime_mode_test.cpp
+	src/runtime-mode.cpp
+)
+target_compile_options(dserver_runtime_mode_tests PRIVATE
+	-std=c++17
+)
+target_include_directories(dserver_runtime_mode_tests PRIVATE
+	include
 )
 
 add_dependencies(darlingserver

@@ -441,8 +441,13 @@ struct DTapeHooks {
 	};
 };
 
-DarlingServer::Server::Server(std::string prefix, pid_t rootlessInitHostPID):
+DarlingServer::Server::Server(
+	std::string prefix,
+	int prefixFD,
+	pid_t rootlessInitHostPID
+):
 	_prefix(prefix),
+	_prefixFD(prefixFD),
 	_rootlessInitHostPID(rootlessInitHostPID),
 	_socketPath(_prefix + "/.darlingserver.sock"),
 	// abstract-namespace name for the stat socket (see the stat-socket setup below for
@@ -455,8 +460,14 @@ DarlingServer::Server::Server(std::string prefix, pid_t rootlessInitHostPID):
 	// perf #0 (dar-dar6x4-perf-5dq.6): record the server start time for uptime.
 	Metrics::shared().startMonoUs = Metrics::nowMonoUs();
 
-	// remove the old socket (if it exists)
-	unlink(_socketPath.c_str());
+	// Remove the old socket relative to the already-retained prefix. The path
+	// spelling is used only by bind(2), which has no *at variant.
+	if (unlinkat(prefixFD, ".darlingserver.sock", 0) == -1 &&
+		errno != ENOENT) {
+		throw std::system_error(
+			errno, std::generic_category(),
+			"Failed to remove stale server socket");
+	}
 
 	// create the socket
 	_listenerSocket = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -576,7 +587,11 @@ DarlingServer::Server::~Server() {
 	close(_epollFD);
 	close(_wakeupFD);
 	close(_listenerSocket);
-	unlink(_socketPath.c_str());
+	if (unlinkat(_prefixFD, ".darlingserver.sock", 0) == -1 &&
+		errno != ENOENT) {
+		fprintf(stderr, "Failed to remove server socket: %s\n",
+			strerror(errno));
+	}
 	if (_statListenerSocket >= 0) {
 		// abstract socket: no filesystem entry to unlink; closing frees the name.
 		close(_statListenerSocket);
@@ -841,6 +856,10 @@ DarlingServer::Server& DarlingServer::Server::sharedInstance() {
 
 std::string DarlingServer::Server::prefix() const {
 	return _prefix;
+};
+
+int DarlingServer::Server::prefixFD() const {
+	return _prefixFD;
 };
 
 pid_t DarlingServer::Server::namespaceIDForPeer(pid_t peerHostPID, pid_t reportedNamespaceID) const {

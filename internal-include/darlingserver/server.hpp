@@ -40,6 +40,7 @@ namespace DarlingServer {
 	private:
 		int _listenerSocket;
 		std::string _prefix;
+		int _prefixFD;
 		pid_t _rootlessInitHostPID;
 		std::string _socketPath;
 		// perf #0 (dar-dar6x4-perf-5dq.6): dedicated stat socket. A SOCK_STREAM listener in
@@ -73,7 +74,10 @@ namespace DarlingServer {
 		friend struct ::DTapeHooks;
 
 	public:
-		Server(std::string prefix, pid_t rootlessInitHostPID = 0);
+		Server(
+			std::string prefix,
+			int prefixFD,
+			pid_t rootlessInitHostPID = 0);
 		~Server();
 
 		Server(const Server&) = delete;
@@ -86,6 +90,7 @@ namespace DarlingServer {
 		void monitorProcess(std::shared_ptr<Process> process);
 
 		std::string prefix() const;
+		int prefixFD() const;
 		pid_t namespaceIDForPeer(pid_t peerHostPID, pid_t reportedNamespaceID) const;
 
 		static Server& sharedInstance();
