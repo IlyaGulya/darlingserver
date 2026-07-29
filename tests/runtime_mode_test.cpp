@@ -7,6 +7,7 @@
 #include <iostream>
 #include <string>
 #include <sys/stat.h>
+#include <type_traits>
 #include <unistd.h>
 
 using namespace DarlingServer;
@@ -45,11 +46,26 @@ static void requireFailure(bool capable)
 	require(false, "invalid runtime environment was accepted");
 }
 
-static void writeMarker(const std::filesystem::path& directory)
+static void writeState(const std::filesystem::path& directory)
 {
-	std::ofstream output(directory / ".darling-runtime-mode-v1");
-	output << "DARLING_RUNTIME_MODE_V1=rootless-eunion\n";
-	require(output.good(), "write runtime mode marker fixture");
+	struct stat status;
+	require(stat(directory.c_str(), &status) == 0,
+		"stat runtime prefix state fixture");
+	std::ofstream output(directory / ".darling-prefix-state-v2");
+	output << "DARLING_PREFIX_STATE_V2\n";
+	output << "schema_version=2\n";
+	output << "runtime_mode=rootless-eunion\n";
+	output << "generation=1\n";
+	output << "prefix_device=" << status.st_dev << '\n';
+	output << "prefix_inode=" << status.st_ino << '\n';
+	output << "owner_uid=" << getuid() << '\n';
+	output << "owner_gid=" << getgid() << '\n';
+	output << "provenance=darling-runtime-prefix-lifecycle-v2\n";
+	require(output.good(), "write typed runtime prefix state fixture");
+	output.close();
+	require(chmod(
+			(directory / ".darling-prefix-state-v2").c_str(), 0600) == 0,
+		"restrict typed runtime prefix state fixture");
 }
 
 static void requireRejectedPrefixFD(
@@ -61,16 +77,45 @@ static void requireRejectedPrefixFD(
 )
 {
 	try {
-		validateRuntimeModePrefixFD(
-			prefixFD, parentFD, leaf, workdirFD,
-			RuntimeMode::RootlessEunion);
+		InheritedRuntimePrefix inherited(
+			dup(prefixFD), dup(parentFD), leaf, dup(workdirFD));
+		(void)anchorRuntimeModePrefix(
+			std::move(inherited), RuntimeMode::RootlessEunion,
+			getuid(), getgid());
 		require(false, message);
 	} catch (const RuntimeModeError&) {
 	}
 }
 
+static RuntimePrefixCapability requireAnchoredPrefix(
+	int prefixFD,
+	int parentFD,
+	const char* leaf,
+	int workdirFD,
+	RuntimeMode mode = RuntimeMode::RootlessEunion
+)
+{
+	const int prefixCopy = dup(prefixFD);
+	const int parentCopy = dup(parentFD);
+	const int workdirCopy = dup(workdirFD);
+	require(prefixCopy >= 0 && parentCopy >= 0 && workdirCopy >= 0,
+		"duplicate inherited descriptor fixture");
+	InheritedRuntimePrefix inherited(
+		prefixCopy, parentCopy, leaf, workdirCopy);
+	return anchorRuntimeModePrefix(
+		std::move(inherited), mode, getuid(), getgid());
+}
+
 int main()
 {
+	static_assert(!std::is_copy_constructible_v<InheritedRuntimePrefix>);
+	static_assert(!std::is_copy_assignable_v<InheritedRuntimePrefix>);
+	static_assert(std::is_nothrow_move_constructible_v<InheritedRuntimePrefix>);
+	static_assert(!std::is_copy_constructible_v<RuntimePrefixCapability>);
+	static_assert(!std::is_copy_assignable_v<RuntimePrefixCapability>);
+	static_assert(std::is_nothrow_move_constructible_v<RuntimePrefixCapability>);
+	static_assert(sizeof(RuntimePrefixCapability) == 2 * sizeof(int));
+
 	requireMode("privileged-overlay", RuntimeMode::PrivilegedOverlay);
 	requireMode("privileged-copy", RuntimeMode::PrivilegedCopy);
 	requireMode("privileged-eunion", RuntimeMode::PrivilegedEunion);
@@ -107,8 +152,11 @@ int main()
 	const std::filesystem::path workdir =
 		std::filesystem::path(root) / "prefix.workdir";
 	std::filesystem::create_directory(workdir);
+	require(chmod(prefix.c_str(), 0755) == 0 &&
+			chmod(workdir.c_str(), 0755) == 0,
+		"normalize prefix fixture directory modes");
 	const std::string marker =
-		(prefix / ".darling-runtime-mode-v1").string();
+		(prefix / ".darling-prefix-state-v2").string();
 	const int parentFD =
 		open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	const int prefixFD =
@@ -119,20 +167,18 @@ int main()
 		"open prefix fixture descriptors");
 
 	try {
-		validateRuntimeModePrefixFD(
-			prefixFD, parentFD, "prefix", workdirFD,
-			RuntimeMode::RootlessEunion);
+		(void)requireAnchoredPrefix(
+			prefixFD, parentFD, "prefix", workdirFD);
 		require(false, "missing marker was accepted");
 	} catch (const RuntimeModeError&) {
 		require(!std::filesystem::exists(marker),
 			"missing-marker validation mutated the prefix");
 	}
 
-	writeMarker(prefix);
-	validateRuntimeModePrefixFD(
-		prefixFD, parentFD, "prefix", workdirFD,
-		RuntimeMode::RootlessEunion);
-	const std::string retainedAlias = runtimePrefixProcPath(prefixFD);
+	writeState(prefix);
+	auto validated = requireAnchoredPrefix(
+		prefixFD, parentFD, "prefix", workdirFD);
+	const std::string retainedAlias = validated.prefixProcPath();
 	struct stat aliasStatus;
 	struct stat prefixStatus;
 	require(stat(retainedAlias.c_str(), &aliasStatus) == 0,
@@ -142,7 +188,7 @@ int main()
 		aliasStatus.st_ino == prefixStatus.st_ino,
 		"retained prefix alias does not name exact descriptor");
 	try {
-		validateRuntimeModePrefixFD(
+		(void)requireAnchoredPrefix(
 			prefixFD, parentFD, "prefix", workdirFD,
 			RuntimeMode::PrivilegedOverlay);
 		require(false, "mismatched marker was accepted");
@@ -150,13 +196,13 @@ int main()
 		std::ifstream input(marker);
 		std::string content;
 		std::getline(input, content);
-		require(content == "DARLING_RUNTIME_MODE_V1=rootless-eunion",
-			"mismatch validation mutated the marker");
+		require(content == "DARLING_PREFIX_STATE_V2",
+			"mismatch validation mutated the typed state");
 	}
 
 	std::filesystem::path target = std::filesystem::path(root) / "target";
 	std::filesystem::create_directories(target);
-	writeMarker(target);
+	writeState(target);
 	std::filesystem::path sentinel = target / "sentinel";
 	{
 		std::ofstream output(sentinel);
@@ -186,9 +232,8 @@ int main()
 	require(unlink(prefix.c_str()) == 0 &&
 		rename(parked.c_str(), prefix.c_str()) == 0,
 		"restore inspected prefix fixture");
-	validateRuntimeModePrefixFD(
-		prefixFD, parentFD, "prefix", workdirFD,
-		RuntimeMode::RootlessEunion);
+	(void)requireAnchoredPrefix(
+		prefixFD, parentFD, "prefix", workdirFD);
 	const std::filesystem::path parkedWorkdir =
 		std::filesystem::path(root) / "prefix.workdir.parked";
 	require(rename(workdir.c_str(), parkedWorkdir.c_str()) == 0,
@@ -201,9 +246,8 @@ int main()
 	require(unlink(workdir.c_str()) == 0 &&
 		rename(parkedWorkdir.c_str(), workdir.c_str()) == 0,
 		"restore inspected workdir fixture");
-	validateRuntimeModePrefixFD(
-		prefixFD, parentFD, "prefix", workdirFD,
-		RuntimeMode::RootlessEunion);
+	(void)requireAnchoredPrefix(
+		prefixFD, parentFD, "prefix", workdirFD);
 
 	std::filesystem::remove(marker);
 	require(symlink(target.c_str(), marker.c_str()) == 0,

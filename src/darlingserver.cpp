@@ -34,6 +34,7 @@
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <iostream>
+#include <utility>
 #include <linux/sched.h>
 #include <linux/fs.h>
 #include <sys/syscall.h>
@@ -989,9 +990,6 @@ static void handle_sigusr1(int signum) {
 
 int main(int argc, char** argv) {
 	const char* prefix = NULL;
-	int prefixFD = -1;
-	int prefixParentFD = -1;
-	int workdirFD = -1;
 	uid_t originalUID = -1;
 	gid_t originalGID = -1;
 	int pipefd = -1;
@@ -1017,9 +1015,6 @@ int main(int argc, char** argv) {
 	}
 #endif
 
-	prefixFD = parseInheritedFD(argv[1], "prefix");
-	prefixParentFD = parseInheritedFD(argv[2], "prefix parent");
-	workdirFD = parseInheritedFD(argv[4], "prefix workdir");
 	sscanf(argv[5], "%d", &originalUID);
 	sscanf(argv[6], "%d", &originalGID);
 	sscanf(argv[7], "%d", &pipefd);
@@ -1031,24 +1026,29 @@ int main(int argc, char** argv) {
 	DarlingServer::RuntimeMode runtimeMode;
 	std::string prefixPath;
 	std::string workdirPath;
+	DarlingServer::RuntimePrefixCapability runtimePrefix = [&]() {
 	try {
 		runtimeMode = DarlingServer::requireRuntimeModeFromEnvironment(
 			DARLING_RUNTIME_EUNION_CAPABLE != 0);
-		DarlingServer::validateRuntimeModePrefixFD(
-			prefixFD, prefixParentFD, argv[3], workdirFD, runtimeMode);
-		prefixPath = DarlingServer::runtimePrefixProcPath(prefixFD);
-		workdirPath = DarlingServer::runtimePrefixProcPath(workdirFD);
+		DarlingServer::InheritedRuntimePrefix inherited(
+			parseInheritedFD(argv[1], "prefix"),
+			parseInheritedFD(argv[2], "prefix parent"),
+			argv[3],
+			parseInheritedFD(argv[4], "prefix workdir")
+		);
+		auto anchored = DarlingServer::anchorRuntimeModePrefix(
+			std::move(inherited), runtimeMode, originalUID, originalGID);
+		prefixPath = anchored.prefixProcPath();
+		workdirPath = anchored.workdirProcPath();
+		return anchored;
 	} catch (const DarlingServer::RuntimeModeError& error) {
 		fprintf(stderr, "Cannot select Darling runtime mode: %s\n",
 			error.what());
 		exit(1);
 	}
-	if (close(prefixParentFD) == -1) {
-		fprintf(stderr, "Cannot close inherited prefix parent descriptor: %s\n",
-			strerror(errno));
-		exit(1);
-	}
-	prefixParentFD = -1;
+	}();
+	const int prefixFD = runtimePrefix.prefixFD();
+	const int workdirFD = runtimePrefix.workdirFD();
 	makeDescriptorCloseOnExec(prefixFD, "prefix");
 	makeDescriptorCloseOnExec(workdirFD, "prefix workdir");
 	prefix = prefixPath.c_str();
