@@ -1003,7 +1003,7 @@ int main(int argc, char** argv) {
 
 	char *opts;
 	char putOld[4096];
-	if (argc != 9) {
+	if (argc != 11) {
 		fprintf(stderr, "darlingserver is not meant to be started manually\n");
 		exit(1);
 	}
@@ -1015,11 +1015,11 @@ int main(int argc, char** argv) {
 	}
 #endif
 
-	sscanf(argv[5], "%d", &originalUID);
-	sscanf(argv[6], "%d", &originalGID);
-	sscanf(argv[7], "%d", &pipefd);
+	sscanf(argv[7], "%d", &originalUID);
+	sscanf(argv[8], "%d", &originalGID);
+	sscanf(argv[9], "%d", &pipefd);
 
-	if (argv[8][0] == '1') {
+	if (argv[10][0] == '1') {
 		fix_permissions = true;
 	}
 
@@ -1034,7 +1034,9 @@ int main(int argc, char** argv) {
 			parseInheritedFD(argv[1], "prefix"),
 			parseInheritedFD(argv[2], "prefix parent"),
 			argv[3],
-			parseInheritedFD(argv[4], "prefix workdir")
+			parseInheritedFD(argv[4], "prefix workdir"),
+			parseInheritedFD(argv[5], "prefix sidecar"),
+			parseInheritedFD(argv[6], "prefix lifecycle lock")
 		);
 		auto anchored = DarlingServer::anchorRuntimeModePrefix(
 			std::move(inherited), runtimeMode, originalUID, originalGID);
@@ -1049,8 +1051,12 @@ int main(int argc, char** argv) {
 	}();
 	const int prefixFD = runtimePrefix.prefixFD();
 	const int workdirFD = runtimePrefix.workdirFD();
+	const int sidecarFD = runtimePrefix.sidecarFD();
+	const int lifecycleLockFD = runtimePrefix.lifecycleLockFD();
 	makeDescriptorCloseOnExec(prefixFD, "prefix");
 	makeDescriptorCloseOnExec(workdirFD, "prefix workdir");
+	makeDescriptorCloseOnExec(sidecarFD, "prefix sidecar");
+	makeDescriptorCloseOnExec(lifecycleLockFD, "prefix lifecycle lock");
 	prefix = prefixPath.c_str();
 	const bool rootless = DarlingServer::runtimeModeIsRootless(runtimeMode);
 

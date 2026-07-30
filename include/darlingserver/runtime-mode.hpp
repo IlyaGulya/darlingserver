@@ -29,7 +29,9 @@ public:
 		int prefixFD,
 		int parentFD,
 		const char* leaf,
-		int workdirFD
+		int workdirFD,
+		int sidecarFD,
+		int lifecycleLockFD
 	);
 	~InheritedRuntimePrefix();
 	InheritedRuntimePrefix(const InheritedRuntimePrefix&) = delete;
@@ -50,6 +52,8 @@ private:
 	int parentFD_;
 	std::array<char, NAME_MAX + 1> leaf_;
 	int workdirFD_;
+	int sidecarFD_;
+	int lifecycleLockFD_;
 };
 
 class RuntimePrefixCapability final {
@@ -62,8 +66,11 @@ public:
 
 	int prefixFD() const noexcept;
 	int workdirFD() const noexcept;
+	int sidecarFD() const noexcept;
+	int lifecycleLockFD() const noexcept;
 	std::string prefixProcPath() const;
 	std::string workdirProcPath() const;
+	std::string sidecarProcPath() const;
 
 private:
 	friend RuntimePrefixCapability anchorRuntimeModePrefix(
@@ -72,10 +79,14 @@ private:
 		uid_t,
 		gid_t
 	);
-	RuntimePrefixCapability(int prefixFD, int workdirFD) noexcept;
+	RuntimePrefixCapability(
+		int prefixFD, int workdirFD, int sidecarFD,
+		int lifecycleLockFD) noexcept;
 
 	int prefixFD_;
 	int workdirFD_;
+	int sidecarFD_;
+	int lifecycleLockFD_;
 };
 
 RuntimeMode requireRuntimeModeFromEnvironment(bool eunionCapable);
