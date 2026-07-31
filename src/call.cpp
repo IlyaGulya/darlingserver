@@ -550,6 +550,28 @@ void DarlingServer::Call::VchrootPath::processCall() {
 	_sendReply(code, fullLength);
 };
 
+void DarlingServer::Call::VchrootDirectory::processCall() {
+	int code = 0;
+	int directoryFD = -1;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			std::shared_lock lock(process->_rwlock);
+			if (process->_vchrootDescriptor) {
+				directoryFD = process->_vchrootDescriptor->fd();
+			} else {
+				code = -ENOENT;
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, directoryFD);
+};
+
 void DarlingServer::Call::TaskSelfTrap::processCall() {
 	const auto taskSelfPort = dtape_task_self_trap();
 	_sendReply(0, taskSelfPort);

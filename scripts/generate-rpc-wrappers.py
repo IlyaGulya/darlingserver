@@ -136,6 +136,14 @@ calls = [
 		('length', 'uint64_t'),
 	]),
 
+	# Return a duplicated capability for the process's already-validated
+	# vchroot directory. mldr passes this descriptor through the Mach apple
+	# vector so every new image can anchor E-UNION before its first path
+	# syscall; no pathname is reopened at this boundary.
+	('vchroot_directory', [], [
+		('directory_fd', '@fd'),
+	]),
+
 	('kprintf', [
 		('string', 'const char*', 'uint64_t'),
 		('string_length', 'uint64_t'),
