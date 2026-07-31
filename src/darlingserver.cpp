@@ -521,14 +521,28 @@ void spawnLaunchd(
 	unsetenv("DARLING_ROOTLESS");
 	unsetenv("DARLING_NOOVERLAYFS");
 	unsetenv("DARLING_EUNION");
+	const int mldrPrefixFD = fcntl(prefixFD, F_DUPFD_CLOEXEC, 3);
 	const int prefixFlags = fcntl(prefixFD, F_GETFD);
-	if (prefixFlags == -1 ||
-		fcntl(prefixFD, F_SETFD, prefixFlags & ~FD_CLOEXEC) == -1) {
+	const int mldrPrefixFlags =
+		mldrPrefixFD >= 0 ? fcntl(mldrPrefixFD, F_GETFD) : -1;
+	if (mldrPrefixFD < 0 || prefixFlags == -1 || mldrPrefixFlags == -1 ||
+		fcntl(prefixFD, F_SETFD, prefixFlags & ~FD_CLOEXEC) == -1 ||
+		fcntl(mldrPrefixFD, F_SETFD,
+			mldrPrefixFlags & ~FD_CLOEXEC) == -1) {
 		fprintf(stderr, "Failed to retain trusted prefix descriptor for launchd: %s\n",
 			strerror(errno));
 		abort();
 	}
-	execl(DarlingServer::Config::defaultMldrPath.data(), "mldr!" LIBEXEC_PATH "/usr/libexec/darling/vchroot", "vchroot", prefix, initPath, NULL);
+	char prefixFDString[32];
+	char mldrPrefixFDEnvironment[64];
+	snprintf(prefixFDString, sizeof(prefixFDString), "%d", prefixFD);
+	snprintf(mldrPrefixFDEnvironment, sizeof(mldrPrefixFDEnvironment),
+		"%d", mldrPrefixFD);
+	setenv("__mldr_vchroot_fd", mldrPrefixFDEnvironment, 1);
+
+	execl(DarlingServer::Config::defaultMldrPath.data(),
+		"mldr!" LIBEXEC_PATH "/usr/libexec/darling/vchroot",
+		"vchroot", prefixFDString, initPath, NULL);
 
 	fprintf(stderr, "Failed to exec launchd: %s\n", strerror(errno));
 	abort();
