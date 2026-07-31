@@ -558,7 +558,15 @@ void DarlingServer::Call::VchrootDirectory::processCall() {
 		if (auto process = thread->process()) {
 			std::shared_lock lock(process->_rwlock);
 			if (process->_vchrootDescriptor) {
-				directoryFD = process->_vchrootDescriptor->fd();
+				// Reply Message owns every descriptor passed to _sendReply() and
+				// closes it after sendmsg().  Never lend the Process-owned
+				// capability directly: doing so invalidates _vchrootDescriptor
+				// before the next image can send its received duplicate back via
+				// dserver_rpc_vchroot().
+				directoryFD = fcntl(
+					process->_vchrootDescriptor->fd(), F_DUPFD_CLOEXEC, 0);
+				if (directoryFD < 0)
+					code = -errno;
 			} else {
 				code = -ENOENT;
 			}
