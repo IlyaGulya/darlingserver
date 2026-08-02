@@ -472,26 +472,33 @@ static void wipeDirFD(int directoryFD)
 	closedir(dir);
 }
 
-void darlingPreInit(int prefixFD)
+void darlingPreInit(int prefixFD, bool useEunionPrefix)
 {
 	// TODO: Run /usr/libexec/makewhatis
-	const char* dirs[] = {
-		"tmp",
-		"run"
-	};
-	const int varFD = openDirectoryAt(prefixFD, "var", true);
-	if (varFD == -1) {
-		return;
-	}
-	for (size_t i = 0; i < sizeof(dirs)/sizeof(dirs[0]); i++)
-	{
-		const int childFD = openDirectoryAt(varFD, dirs[i], true);
-		if (childFD != -1) {
-			wipeDirFD(childFD);
-			close(childFD);
+	// E-UNION removals must flow through the guest syscall layer so the
+	// sidecar record and backing object are changed by one transaction.
+	// Host-side pre-init cleanup would remove only the backing object and
+	// leave a stale INDEX record.  The guest launchctl boot path owns the
+	// equivalent /var/tmp and /var/run cleanup for this mode.
+	if (!useEunionPrefix) {
+		const char* dirs[] = {
+			"tmp",
+			"run"
+		};
+		const int varFD = openDirectoryAt(prefixFD, "var", true);
+		if (varFD == -1) {
+			return;
 		}
+		for (size_t i = 0; i < sizeof(dirs)/sizeof(dirs[0]); i++)
+		{
+			const int childFD = openDirectoryAt(varFD, dirs[i], true);
+			if (childFD != -1) {
+				wipeDirFD(childFD);
+				close(childFD);
+			}
+		}
+		close(varFD);
 	}
-	close(varFD);
 }
 
 void spawnLaunchd(
@@ -1229,7 +1236,7 @@ int main(int argc, char** argv) {
 
 	// temporarily drop privileges and do some prefix work
 	temp_drop_privileges(originalUID, originalGID, rootless);
-	darlingPreInit(prefixFD);
+	darlingPreInit(prefixFD, useEunionPrefix);
 	regain_privileges(rootless);
 
 	// Tell the parent we're ready
