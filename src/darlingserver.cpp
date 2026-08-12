@@ -44,6 +44,40 @@
 #include <darlingserver/server.hpp>
 #include <darlingserver/config.hpp>
 
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+#include <darling_lifecycle_cohort.h>
+
+class LifecycleCohortOwner {
+public:
+	LifecycleCohortOwner() = default;
+	~LifecycleCohortOwner() {
+		if (_controller)
+			darling_lifecycle_cohort_finish(_controller);
+	}
+	LifecycleCohortOwner(const LifecycleCohortOwner&) = delete;
+	LifecycleCohortOwner& operator=(const LifecycleCohortOwner&) = delete;
+
+	void reset(struct darling_lifecycle_cohort_controller* controller) {
+		if (_controller)
+			darling_lifecycle_cohort_finish(_controller);
+		_controller = controller;
+	}
+
+	explicit operator bool() const { return _controller != nullptr; }
+
+	int finish() {
+		if (!_controller)
+			return 0;
+		auto controller = _controller;
+		_controller = nullptr;
+		return darling_lifecycle_cohort_finish(controller);
+	}
+
+private:
+	struct darling_lifecycle_cohort_controller* _controller = nullptr;
+};
+#endif
+
 #ifndef DARLINGSERVER_INIT_PROCESS
 	#define DARLINGSERVER_INIT_PROCESS "/sbin/launchd"
 #endif
@@ -55,6 +89,34 @@
 #if DSERVER_ASAN
 	#include <sanitizer/lsan_interface.h>
 #endif
+
+static bool read_full(int fd, void* output, size_t size) {
+	char* cursor = static_cast<char*>(output);
+	while (size > 0) {
+		ssize_t count = read(fd, cursor, size);
+		if (count < 0 && errno == EINTR)
+			continue;
+		if (count <= 0)
+			return false;
+		cursor += count;
+		size -= static_cast<size_t>(count);
+	}
+	return true;
+}
+
+static bool write_full(int fd, const void* input, size_t size) {
+	const char* cursor = static_cast<const char*>(input);
+	while (size > 0) {
+		ssize_t count = write(fd, cursor, size);
+		if (count < 0 && errno == EINTR)
+			continue;
+		if (count <= 0)
+			return false;
+		cursor += count;
+		size -= static_cast<size_t>(count);
+	}
+	return true;
+}
 
 // TODO: most of the code here was ported over from startup/darling.c; we should C++-ify it.
 
@@ -510,6 +572,14 @@ int main(int argc, char** argv) {
 	FILE* nr_open_file = NULL;
 	int childWaitFDs[2];
 	struct rlimit core_limit;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	const bool lifecycleCohortEnabled = getenv("DARLING_LIFECYCLE_COHORT_V1") &&
+		strcmp(getenv("DARLING_LIFECYCLE_COHORT_V1"), "1") == 0;
+	LifecycleCohortOwner lifecycleController;
+	struct darling_lifecycle_cohort_bootstrap lifecycleBootstrap = {};
+#else
+	const bool lifecycleCohortEnabled = false;
+#endif
 
 	char *opts;
 	char putOld[4096];
@@ -679,9 +749,13 @@ int main(int argc, char** argv) {
 	darlingPreInit(prefix);
 	regain_privileges();
 
-	// Tell the parent we're ready
-	write(pipefd, ".", 1);
-	close(pipefd);
+	// The routed path publishes `.init.pid` and the Darlingserver endpoint
+	// before acknowledging readiness. The legacy path keeps its established
+	// ordering while the cohort is disabled.
+	if (!lifecycleCohortEnabled) {
+		write(pipefd, ".", 1);
+		close(pipefd);
+	}
 
 	if (pipe(childWaitFDs) != 0) {
 		std::cerr << "Failed to create child waiting pipe: " << strerror(errno) << std::endl;
@@ -738,8 +812,30 @@ int main(int argc, char** argv) {
 			//exit(1);
 		}
 
-		// wait for the parent to give us the green light
-		read(childWaitFDs[0], buf, 1);
+		// Wait for the parent to publish the controller-owned endpoints. The
+		// guest receives only a bounded transport envelope, never the prefix or
+		// lifecycle lock descriptors.
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+		if (lifecycleCohortEnabled) {
+			struct darling_lifecycle_cohort_bootstrap bootstrap = {};
+			if (!read_full(childWaitFDs[0], &bootstrap, sizeof(bootstrap)) ||
+				bootstrap.reserved != 0 || bootstrap.control_name_len == 0 ||
+				bootstrap.control_name_len >= DARLING_LIFECYCLE_CONTROL_NAME_CAPACITY) {
+				fprintf(stderr, "Invalid Rust lifecycle controller bootstrap\n");
+				exit(1);
+			}
+			char controlName[DARLING_LIFECYCLE_CONTROL_NAME_CAPACITY + 1] = {};
+			char nonce[DARLING_LIFECYCLE_NONCE_HEX_BYTES + 1] = {};
+			memcpy(controlName, bootstrap.control_name, bootstrap.control_name_len);
+			memcpy(nonce, bootstrap.nonce_hex, DARLING_LIFECYCLE_NONCE_HEX_BYTES);
+			setenv("DARLING_LIFECYCLE_CONTROL_NAME", controlName, 1);
+			setenv("DARLING_LIFECYCLE_CONTROL_NONCE", nonce, 1);
+		} else
+#endif
+		if (!read_full(childWaitFDs[0], buf, sizeof(buf))) {
+			fprintf(stderr, "Darlingserver startup barrier closed unexpectedly\n");
+			exit(1);
+		}
 		close(childWaitFDs[0]);
 
 		spawnLaunchd(prefix);
@@ -762,11 +858,45 @@ int main(int argc, char** argv) {
 	sigaction(SIGUSR1, &leak_info_action, NULL);
 #endif
 
-	// create the server
-	auto server = new DarlingServer::Server(prefix);
+	int lifecycleListenerSocket = -1;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (lifecycleCohortEnabled) {
+		lifecycleController.reset(darling_lifecycle_cohort_start(prefix, getpid(), &lifecycleBootstrap));
+		if (!lifecycleController) {
+			fprintf(stderr, "Rust lifecycle controller refused session acquisition\n");
+			exit(1);
+		}
+		lifecycleListenerSocket = lifecycleBootstrap.darlingserver_fd;
+	}
+#endif
 
-	// tell the child to go ahead; the socket has been created
-	write(childWaitFDs[1], ".", 1);
+	// Create the server. In the routed path the listener was already bound by
+	// Rust under the retained prefix and lifecycle-lock capabilities.
+	DarlingServer::Server* server = nullptr;
+	try {
+		server = new DarlingServer::Server(prefix, lifecycleListenerSocket);
+	} catch (const std::exception& error) {
+		if (!lifecycleCohortEnabled)
+			throw;
+		std::cerr << "Failed to initialize Darlingserver: " << error.what() << std::endl;
+		return 1;
+	}
+
+	// Tell the child to go ahead; the socket and controller transport exist.
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (lifecycleCohortEnabled) {
+		if (!write_full(childWaitFDs[1], &lifecycleBootstrap, sizeof(lifecycleBootstrap)) ||
+			!write_full(pipefd, ".", 1)) {
+			fprintf(stderr, "Failed to publish Rust lifecycle controller readiness\n");
+			return 1;
+		}
+		close(pipefd);
+	} else
+#endif
+	if (!write_full(childWaitFDs[1], ".", 1)) {
+		fprintf(stderr, "Failed to release launchd startup barrier\n");
+		exit(1);
+	}
 	close(childWaitFDs[1]);
 
 	// start the main loop
@@ -775,6 +905,12 @@ int main(int argc, char** argv) {
 	// this should never happen
 	std::cerr << "Server exited main loop!" << std::endl;
 	delete server;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (lifecycleController && lifecycleController.finish() != 0) {
+		std::cerr << "Rust lifecycle controller refused final cleanup" << std::endl;
+		return 1;
+	}
+#endif
 
 	return 1;
 };

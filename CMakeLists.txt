@@ -141,6 +141,62 @@ target_link_libraries(darlingserver PRIVATE
 	darlingserver_duct_tape
 )
 
+if(DARLING_LIFECYCLE_COHORT_V1)
+	find_program(DARLING_CARGO_EXECUTABLE cargo REQUIRED)
+	get_filename_component(DARLING_LIFECYCLE_CONTROLLER_CRATE "${DARLING_LIFECYCLE_CONTROLLER_CRATE}" ABSOLUTE)
+	set(DARLING_LIFECYCLE_RUST_TARGET "${CMAKE_BINARY_DIR}/lifecycle-rust-target")
+	set(DARLING_LIFECYCLE_STATICLIB "${DARLING_LIFECYCLE_RUST_TARGET}/release/libdarling_lifecycle_operation_boundary.a")
+	if(NOT EXISTS "${DARLING_LIFECYCLE_CONTROLLER_CRATE}/Cargo.toml")
+		message(FATAL_ERROR "DARLING_LIFECYCLE_CONTROLLER_CRATE is not a Rust crate: ${DARLING_LIFECYCLE_CONTROLLER_CRATE}")
+	endif()
+	file(GLOB_RECURSE DARLING_LIFECYCLE_RUST_SOURCES CONFIGURE_DEPENDS
+		"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/src/*.rs"
+		"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/include/*.h"
+	)
+	file(GLOB DARLING_LIFECYCLE_CONTROLLER_EVIDENCE CONFIGURE_DEPENDS
+		"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../docs/lifecycle-controller-*.md"
+		"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../docs/lifecycle-cohort-routing-v1.md"
+		"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../docs/rootless-namespace-writers-v1.md"
+		"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../schemas/rootless-lifecycle-controller-*.schema.json"
+		"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/fixtures/rootless-controller-v1/*.json"
+	)
+	add_custom_command(
+		OUTPUT "${DARLING_LIFECYCLE_STATICLIB}"
+		COMMAND "${CMAKE_COMMAND}" -E env
+			"CARGO_TARGET_DIR=${DARLING_LIFECYCLE_RUST_TARGET}"
+			"${DARLING_CARGO_EXECUTABLE}" build --locked --release --lib
+			--manifest-path "${DARLING_LIFECYCLE_CONTROLLER_CRATE}/Cargo.toml"
+		DEPENDS
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/Cargo.toml"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/Cargo.lock"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/build.rs"
+			${DARLING_LIFECYCLE_RUST_SOURCES}
+			${DARLING_LIFECYCLE_CONTROLLER_EVIDENCE}
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../lifecycle/rootless-controller-v1.json"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../lifecycle/namespace-writer-inventory-v1.json"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../lifecycle/namespace-writer-candidate-audit-v1.json"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../west_commands/lifecycle_controller_transport.py"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/west_test_contracts/lifecycle_controller_architecture_contract.py"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/west_test_contracts/lifecycle_cohort_routing_contract.py"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/west_test_contracts/namespace_writer_inventory_contract.py"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/run-lifecycle-controller-architecture-contract.sh"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/run-lifecycle-linux-backend-contract.sh"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/run-lifecycle-quarantine-gc-contract.sh"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/run-lifecycle-cohort-routing-contract.sh"
+			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/fixtures/lifecycle-cohort-v1/cohort_client_harness.c"
+		VERBATIM
+		COMMENT "Building Rust lifecycle cohort authority"
+	)
+	add_custom_target(darling_lifecycle_cohort_rust DEPENDS "${DARLING_LIFECYCLE_STATICLIB}")
+	add_library(darling_lifecycle_cohort STATIC IMPORTED GLOBAL)
+	set_target_properties(darling_lifecycle_cohort PROPERTIES IMPORTED_LOCATION "${DARLING_LIFECYCLE_STATICLIB}")
+	add_dependencies(darling_lifecycle_cohort darling_lifecycle_cohort_rust)
+	add_dependencies(darlingserver darling_lifecycle_cohort_rust)
+	target_include_directories(darlingserver PRIVATE "${DARLING_LIFECYCLE_CONTROLLER_CRATE}/include")
+	target_compile_definitions(darlingserver PRIVATE DARLING_LIFECYCLE_COHORT_V1=1)
+	target_link_libraries(darlingserver PRIVATE darling_lifecycle_cohort dl m rt)
+endif()
+
 target_compile_options(darlingserver PRIVATE
 	-pthread
 	-std=c++17

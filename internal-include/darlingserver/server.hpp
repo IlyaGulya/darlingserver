@@ -43,6 +43,7 @@ namespace DarlingServer {
 
 	private:
 		int _listenerSocket;
+		bool _lifecycleRoutedSocket = false;
 		std::string _prefix;
 		std::string _socketPath;
 		// perf #0 (dar-dar6x4-perf-5dq.6): dedicated stat socket. A SOCK_STREAM listener in
@@ -97,7 +98,7 @@ namespace DarlingServer {
 		friend struct ::DTapeHooks;
 
 	public:
-		Server(std::string prefix);
+		Server(std::string prefix, int lifecycleListenerSocket = -1);
 		~Server();
 
 		Server(const Server&) = delete;
