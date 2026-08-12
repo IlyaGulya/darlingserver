@@ -444,8 +444,11 @@ struct DTapeHooks {
 DarlingServer::Server::Server(
 	std::string prefix,
 	int prefixFD,
-	pid_t rootlessInitHostPID
+	pid_t rootlessInitHostPID,
+	int lifecycleListenerSocket
 ):
+	_listenerSocket(lifecycleListenerSocket),
+	_lifecycleRoutedSocket(lifecycleListenerSocket >= 0),
 	_prefix(prefix),
 	_prefixFD(prefixFD),
 	_rootlessInitHostPID(rootlessInitHostPID),
@@ -460,19 +463,20 @@ DarlingServer::Server::Server(
 	// perf #0 (dar-dar6x4-perf-5dq.6): record the server start time for uptime.
 	Metrics::shared().startMonoUs = Metrics::nowMonoUs();
 
-	// Remove the old socket relative to the already-retained prefix. The path
-	// spelling is used only by bind(2), which has no *at variant.
-	if (unlinkat(prefixFD, ".darlingserver.sock", 0) == -1 &&
-		errno != ENOENT) {
-		throw std::system_error(
-			errno, std::generic_category(),
-			"Failed to remove stale server socket");
-	}
-
-	// create the socket
-	_listenerSocket = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-	if (_listenerSocket < 0) {
-		throw std::system_error(errno, std::generic_category(), "Failed to create socket");
+	if (!_lifecycleRoutedSocket) {
+		// Legacy path retained while non-cohort namespace writers remain
+		// incompatible. The routed path receives an already-bound listener from
+		// the Rust controller and performs no pathname mutation here.
+		if (unlinkat(prefixFD, ".darlingserver.sock", 0) == -1 &&
+			errno != ENOENT) {
+			throw std::system_error(
+				errno, std::generic_category(),
+				"Failed to remove stale server socket");
+		}
+		_listenerSocket = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+		if (_listenerSocket < 0) {
+			throw std::system_error(errno, std::generic_category(), "Failed to create socket");
+		}
 	}
 
 	int passCred = 1;
@@ -480,13 +484,15 @@ DarlingServer::Server::Server(
 		throw std::system_error(errno, std::generic_category(), "Failed to set SO_PASSCRED on socket");
 	}
 
-	struct sockaddr_un addr;
-	addr.sun_family = AF_UNIX;
-	addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
-	strncpy(addr.sun_path, _socketPath.c_str(), sizeof(addr.sun_path) - 1);
+	if (!_lifecycleRoutedSocket) {
+		struct sockaddr_un addr;
+		addr.sun_family = AF_UNIX;
+		addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+		strncpy(addr.sun_path, _socketPath.c_str(), sizeof(addr.sun_path) - 1);
 
-	if (bind(_listenerSocket, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-		throw std::system_error(errno, std::generic_category(), "Failed to bind socket");
+		if (bind(_listenerSocket, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+			throw std::system_error(errno, std::generic_category(), "Failed to bind socket");
+		}
 	}
 
 	_wakeupFD = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -587,10 +593,12 @@ DarlingServer::Server::~Server() {
 	close(_epollFD);
 	close(_wakeupFD);
 	close(_listenerSocket);
-	if (unlinkat(_prefixFD, ".darlingserver.sock", 0) == -1 &&
-		errno != ENOENT) {
-		fprintf(stderr, "Failed to remove server socket: %s\n",
-			strerror(errno));
+	if (!_lifecycleRoutedSocket) {
+		if (unlinkat(_prefixFD, ".darlingserver.sock", 0) == -1 &&
+			errno != ENOENT) {
+			fprintf(stderr, "Failed to remove server socket: %s\n",
+				strerror(errno));
+		}
 	}
 	if (_statListenerSocket >= 0) {
 		// abstract socket: no filesystem entry to unlink; closing frees the name.

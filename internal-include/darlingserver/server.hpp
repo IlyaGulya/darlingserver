@@ -39,6 +39,7 @@ namespace DarlingServer {
 
 	private:
 		int _listenerSocket;
+		bool _lifecycleRoutedSocket = false;
 		std::string _prefix;
 		int _prefixFD;
 		pid_t _rootlessInitHostPID;
@@ -77,7 +78,8 @@ namespace DarlingServer {
 		Server(
 			std::string prefix,
 			int prefixFD,
-			pid_t rootlessInitHostPID = 0);
+			pid_t rootlessInitHostPID = 0,
+			int lifecycleListenerSocket = -1);
 		~Server();
 
 		Server(const Server&) = delete;
