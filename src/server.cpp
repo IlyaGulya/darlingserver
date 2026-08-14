@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <array>
 #include <sstream>
 #include <cstddef>
@@ -445,8 +446,10 @@ DarlingServer::Server::Server(
 	std::string prefix,
 	int prefixFD,
 	pid_t rootlessInitHostPID,
-	int lifecycleListenerSocket
+	int lifecycleListenerSocket,
+	FD lifecycleLogFD
 ):
+	_lifecycleLogFD(std::move(lifecycleLogFD)),
 	_listenerSocket(lifecycleListenerSocket),
 	_lifecycleRoutedSocket(lifecycleListenerSocket >= 0),
 	_prefix(prefix),
@@ -868,6 +871,10 @@ std::string DarlingServer::Server::prefix() const {
 
 int DarlingServer::Server::prefixFD() const {
 	return _prefixFD;
+};
+
+int DarlingServer::Server::lifecycleLogFD() const {
+	return _lifecycleLogFD.fd();
 };
 
 pid_t DarlingServer::Server::namespaceIDForPeer(pid_t peerHostPID, pid_t reportedNamespaceID) const {

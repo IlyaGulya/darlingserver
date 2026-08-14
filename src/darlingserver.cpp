@@ -1399,7 +1399,8 @@ int main(int argc, char** argv) {
 	int lifecycleListenerSocket = -1;
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (lifecycleCohortEnabled) {
-		lifecycleController.reset(darling_lifecycle_cohort_start(prefix, getpid(), &lifecycleBootstrap));
+		lifecycleController.reset(darling_lifecycle_cohort_start(
+			prefixFD, prefix, getpid(), &lifecycleBootstrap));
 		if (!lifecycleController) {
 			fprintf(stderr, "Rust lifecycle controller refused session acquisition\n");
 			exit(1);
@@ -1411,12 +1412,21 @@ int main(int argc, char** argv) {
 	// Create the server. In the routed path the listener was already bound by
 	// Rust under the retained prefix and lifecycle-lock capabilities.
 	DarlingServer::Server* server = nullptr;
+	DarlingServer::FD lifecycleLogOwner(
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+		lifecycleCohortEnabled ? lifecycleBootstrap.dserver_log_fd : -1
+#else
+		-1
+#endif
+	);
 	try {
 		server = new DarlingServer::Server(
 			prefix,
 			prefixFD,
 			rootless ? launchdGlobalPID : 0,
-			lifecycleListenerSocket);
+			lifecycleListenerSocket,
+			std::move(lifecycleLogOwner)
+		);
 	} catch (const std::exception& error) {
 		if (!lifecycleCohortEnabled)
 			throw;

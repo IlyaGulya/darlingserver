@@ -142,6 +142,9 @@ void DarlingServer::Log::_log(Type type, std::string message) const {
 	// NOTE: we use POSIX file APIs because we want to append each message to the log file atomically,
 	//       and as far as i can tell, C++ fstreams provide no such guarantee (that they won't write in chunks).
 	static int logFile = []() {
+		int lifecycleLog = Server::sharedInstance().lifecycleLogFD();
+		if (lifecycleLog >= 0)
+			return lifecycleLog;
 		const int directory =
 			openLogDirectoryAt(Server::sharedInstance().prefixFD());
 		if (directory == -1) {

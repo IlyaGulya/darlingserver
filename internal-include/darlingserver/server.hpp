@@ -38,6 +38,9 @@ namespace DarlingServer {
 		friend class Monitor;
 
 	private:
+		// Declared first so it is destroyed last. Process/Thread/monitor/work-queue
+		// destructors may log while the rest of Server is being torn down.
+		FD _lifecycleLogFD;
 		int _listenerSocket;
 		bool _lifecycleRoutedSocket = false;
 		std::string _prefix;
@@ -79,7 +82,8 @@ namespace DarlingServer {
 			std::string prefix,
 			int prefixFD,
 			pid_t rootlessInitHostPID = 0,
-			int lifecycleListenerSocket = -1);
+			int lifecycleListenerSocket = -1,
+			FD lifecycleLogFD = FD());
 		~Server();
 
 		Server(const Server&) = delete;
@@ -93,6 +97,7 @@ namespace DarlingServer {
 
 		std::string prefix() const;
 		int prefixFD() const;
+		int lifecycleLogFD() const;
 		pid_t namespaceIDForPeer(pid_t peerHostPID, pid_t reportedNamespaceID) const;
 
 		static Server& sharedInstance();
