@@ -49,36 +49,7 @@
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 #include <darling_lifecycle_cohort.h>
-
-class LifecycleCohortOwner {
-public:
-	LifecycleCohortOwner() = default;
-	~LifecycleCohortOwner() {
-		if (_controller)
-			darling_lifecycle_cohort_finish(_controller);
-	}
-	LifecycleCohortOwner(const LifecycleCohortOwner&) = delete;
-	LifecycleCohortOwner& operator=(const LifecycleCohortOwner&) = delete;
-
-	void reset(struct darling_lifecycle_cohort_controller* controller) {
-		if (_controller)
-			darling_lifecycle_cohort_finish(_controller);
-		_controller = controller;
-	}
-
-	explicit operator bool() const { return _controller != nullptr; }
-
-	int finish() {
-		if (!_controller)
-			return 0;
-		auto controller = _controller;
-		_controller = nullptr;
-		return darling_lifecycle_cohort_finish(controller);
-	}
-
-private:
-	struct darling_lifecycle_cohort_controller* _controller = nullptr;
-};
+#include <darlingserver/lifecycle-cohort-owner.hpp>
 #endif
 
 #ifndef DARLINGSERVER_INIT_PROCESS
@@ -1063,8 +1034,10 @@ int main(int argc, char** argv) {
 	int childWaitFDs[2];
 	struct rlimit core_limit;
 #ifdef DARLING_LIFECYCLE_COHORT_V1
-	const bool lifecycleCohortEnabled = getenv("DARLING_LIFECYCLE_COHORT_V1") &&
-		strcmp(getenv("DARLING_LIFECYCLE_COHORT_V1"), "1") == 0;
+	// This is a build-time product route, not guest-controlled process state.
+	// An opt-in build makes every created session require the authenticated Rust
+	// bootstrap; an OFF build preserves the legacy route.
+	const bool lifecycleCohortEnabled = true;
 	LifecycleCohortOwner lifecycleController;
 	struct darling_lifecycle_cohort_bootstrap lifecycleBootstrap = {};
 #else
@@ -1290,8 +1263,14 @@ int main(int argc, char** argv) {
 		close(pipefd);
 	}
 
-	if (pipe(childWaitFDs) != 0) {
-		std::cerr << "Failed to create child waiting pipe: " << strerror(errno) << std::endl;
+	#ifdef DARLING_LIFECYCLE_COHORT_V1
+	const int childWaitResult = socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC,
+		0, childWaitFDs);
+	#else
+	const int childWaitResult = pipe(childWaitFDs);
+	#endif
+	if (childWaitResult != 0) {
+		std::cerr << "Failed to create child bootstrap channel: " << strerror(errno) << std::endl;
 		exit(1);
 	}
 
@@ -1355,26 +1334,23 @@ int main(int argc, char** argv) {
 		// lifecycle lock descriptors.
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 		if (lifecycleCohortEnabled) {
-			struct darling_lifecycle_cohort_bootstrap bootstrap = {};
-			if (!read_full(childWaitFDs[0], &bootstrap, sizeof(bootstrap)) ||
-				bootstrap.reserved != 0 || bootstrap.control_name_len == 0 ||
-				bootstrap.control_name_len >= DARLING_LIFECYCLE_CONTROL_NAME_CAPACITY) {
-				fprintf(stderr, "Invalid Rust lifecycle controller bootstrap\n");
+			if (childWaitFDs[0] != DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD &&
+				dup2(childWaitFDs[0], DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD) < 0) {
+				fprintf(stderr, "Cannot retain Rust guest namespace bootstrap: %s\n",
+					strerror(errno));
 				exit(1);
 			}
-			char controlName[DARLING_LIFECYCLE_CONTROL_NAME_CAPACITY + 1] = {};
-			char nonce[DARLING_LIFECYCLE_NONCE_HEX_BYTES + 1] = {};
-			memcpy(controlName, bootstrap.control_name, bootstrap.control_name_len);
-			memcpy(nonce, bootstrap.nonce_hex, DARLING_LIFECYCLE_NONCE_HEX_BYTES);
-			setenv("DARLING_LIFECYCLE_CONTROL_NAME", controlName, 1);
-			setenv("DARLING_LIFECYCLE_CONTROL_NONCE", nonce, 1);
+			if (childWaitFDs[0] != DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD)
+				close(childWaitFDs[0]);
 		} else
 #endif
-		if (!read_full(childWaitFDs[0], buf, sizeof(buf))) {
-			fprintf(stderr, "Darlingserver startup barrier closed unexpectedly\n");
-			exit(1);
+		{
+			if (!read_full(childWaitFDs[0], buf, sizeof(buf))) {
+				fprintf(stderr, "Darlingserver startup barrier closed unexpectedly\n");
+				exit(1);
+			}
+			close(childWaitFDs[0]);
 		}
-		close(childWaitFDs[0]);
 
 		spawnLaunchd(prefix, runtimeMode, prefixFD);
 		__builtin_unreachable();
@@ -1399,8 +1375,14 @@ int main(int argc, char** argv) {
 	int lifecycleListenerSocket = -1;
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (lifecycleCohortEnabled) {
-		lifecycleController.reset(darling_lifecycle_cohort_start(
-			prefixFD, prefix, getpid(), &lifecycleBootstrap));
+		auto* acquiredLifecycleController = darling_lifecycle_cohort_start(
+			prefixFD, prefix, getpid(), &lifecycleBootstrap);
+		if (!lifecycleController.adopt(acquiredLifecycleController) && acquiredLifecycleController) {
+			LifecycleCohortOwner rejectedController;
+			if (!rejectedController.adopt(acquiredLifecycleController))
+				std::abort();
+			(void)rejectedController.finish();
+		}
 		if (!lifecycleController) {
 			fprintf(stderr, "Rust lifecycle controller refused session acquisition\n");
 			exit(1);
@@ -1437,7 +1419,8 @@ int main(int argc, char** argv) {
 	// Tell the child to go ahead; the socket and controller transport exist.
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (lifecycleCohortEnabled) {
-		if (!write_full(childWaitFDs[1], &lifecycleBootstrap, sizeof(lifecycleBootstrap)) ||
+		if (darling_lifecycle_cohort_send_guest_namespace_bootstrap(
+				lifecycleController.get(), childWaitFDs[1]) != 0 ||
 			!write_full(pipefd, ".", 1)) {
 			fprintf(stderr, "Failed to publish Rust lifecycle controller readiness\n");
 			return 1;
