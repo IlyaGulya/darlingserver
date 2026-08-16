@@ -166,6 +166,23 @@ calls = [
 		('directory_fd', '@fd'),
 	], []),
 
+	('guest_namespace_transaction', [
+		('operation', 'uint32_t'),
+		('transaction_hi', 'uint64_t'),
+		('transaction_lo', 'uint64_t'),
+		('source', 'const char*', 'uint64_t'),
+		('source_length', 'uint32_t'),
+		('destination', 'const char*', 'uint64_t'),
+		('destination_length', 'uint32_t'),
+		('flags', 'int32_t'),
+		('mode', 'uint32_t'),
+	], [
+		('disposition', 'uint32_t'),
+		('device', 'uint64_t'),
+		('inode', 'uint64_t'),
+		('created_fd', '@fd'),
+	]),
+
 	('mldr_path', [
 		('buffer', 'char*', 'uint64_t'),
 		('buffer_size', 'uint64_t'),

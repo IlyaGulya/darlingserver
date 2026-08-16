@@ -19,6 +19,9 @@
 
 #include <cstdint>
 #include <darlingserver/server.hpp>
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+#include <darling_lifecycle_cohort.h>
+#endif
 #include <sys/socket.h>
 #include <stdexcept>
 #include <errno.h>
@@ -447,7 +450,8 @@ DarlingServer::Server::Server(
 	int prefixFD,
 	pid_t rootlessInitHostPID,
 	int lifecycleListenerSocket,
-	FD lifecycleLogFD
+	FD lifecycleLogFD,
+	::darling_lifecycle_cohort_controller* lifecycleController
 ):
 	_lifecycleLogFD(std::move(lifecycleLogFD)),
 	_listenerSocket(lifecycleListenerSocket),
@@ -455,6 +459,7 @@ DarlingServer::Server::Server(
 	_prefix(prefix),
 	_prefixFD(prefixFD),
 	_rootlessInitHostPID(rootlessInitHostPID),
+	_lifecycleController(lifecycleController),
 	_socketPath(_prefix + "/.darlingserver.sock"),
 	// abstract-namespace name for the stat socket (see the stat-socket setup below for
 	// why abstract and not a pathname). Keyed off the prefix so distinct prefixes differ.
@@ -591,6 +596,52 @@ DarlingServer::Server::Server(
 		}
 	}
 };
+
+DarlingServer::GuestNamespaceTransactionResult DarlingServer::Server::guestNamespaceTransaction(
+	uint32_t operation,
+	uint64_t transactionHigh,
+	uint64_t transactionLow,
+	const void* source,
+	uint32_t sourceLength,
+	const void* destination,
+	uint32_t destinationLength,
+	int32_t flags,
+	uint32_t mode
+) {
+	GuestNamespaceTransactionResult output = {-ENOTSUP, 0, 0, 0, -1};
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (!_lifecycleController || !source || sourceLength == 0 ||
+		sourceLength > DARLING_GUEST_TRANSACTION_PATH_CAPACITY ||
+		destinationLength > DARLING_GUEST_TRANSACTION_PATH_CAPACITY)
+		return output;
+	struct darling_guest_namespace_transaction request = {};
+	memcpy(request.transaction_id, &transactionHigh, sizeof(transactionHigh));
+	memcpy(request.transaction_id + sizeof(transactionHigh), &transactionLow, sizeof(transactionLow));
+	request.operation = operation;
+	request.flags = flags;
+	request.mode = mode;
+	request.source_length = sourceLength;
+	request.destination_length = destinationLength;
+	memcpy(request.source, source, sourceLength);
+	if (destinationLength > 0 && destination)
+		memcpy(request.destination, destination, destinationLength);
+	struct darling_guest_namespace_transaction_result result = {};
+	result.created_fd = -1;
+	if (darling_lifecycle_guest_namespace_transaction(
+			_lifecycleController, &request, &result) != 0)
+		return output;
+	output.code = result.result;
+	output.disposition = result.disposition;
+	output.device = result.device;
+	output.inode = result.inode;
+	output.createdFD = result.created_fd;
+#else
+	(void)operation; (void)transactionHigh; (void)transactionLow;
+	(void)source; (void)sourceLength; (void)destination;
+	(void)destinationLength; (void)mode;
+#endif
+	return output;
+}
 
 DarlingServer::Server::~Server() {
 	close(_epollFD);

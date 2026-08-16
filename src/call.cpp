@@ -20,6 +20,8 @@
 #define _GNU_SOURCE 1
 #include <darlingserver/call.hpp>
 #include <darlingserver/rpc-error-reply.hpp>
+
+static constexpr uint32_t GuestTransactionPathCapacity = 1024;
 #include <darlingserver/push-reply-sync-pipe.hpp>
 #include <darlingserver/server.hpp>
 #include <sys/uio.h>
@@ -706,6 +708,45 @@ void DarlingServer::Call::Vchroot::processCall() {
 	}
 
 	_sendReply(code);
+};
+
+void DarlingServer::Call::GuestNamespaceTransaction::processCall() {
+	int code = -ESRCH;
+	uint32_t disposition = 0;
+	uint64_t device = 0;
+	uint64_t inode = 0;
+	int createdFD = -1;
+	if (_body.source_length > GuestTransactionPathCapacity ||
+		_body.destination_length > GuestTransactionPathCapacity) {
+		_sendReply(-E2BIG, disposition, device, inode, createdFD);
+		return;
+	}
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			char source[GuestTransactionPathCapacity];
+			char destination[GuestTransactionPathCapacity];
+			int memoryError = 0;
+			if (!process->readMemory(_body.source, source, _body.source_length, &memoryError)) {
+				code = -memoryError;
+			} else if (_body.destination_length > 0 &&
+				!process->readMemory(_body.destination, destination,
+					_body.destination_length, &memoryError)) {
+				code = -memoryError;
+			} else {
+				auto result = Server::sharedInstance().guestNamespaceTransaction(
+					_body.operation, _body.transaction_hi, _body.transaction_lo,
+					source, _body.source_length,
+					_body.destination_length > 0 ? destination : nullptr,
+					_body.destination_length, _body.flags, _body.mode);
+				code = result.code;
+				disposition = result.disposition;
+				device = result.device;
+				inode = result.inode;
+				createdFD = result.createdFD;
+			}
+		}
+	}
+	_sendReply(code, disposition, device, inode, createdFD);
 };
 
 void DarlingServer::Call::MldrPath::processCall() {

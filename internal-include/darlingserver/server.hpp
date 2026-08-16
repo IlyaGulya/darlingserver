@@ -32,7 +32,16 @@
 #include <darlingserver/utility.hpp>
 #include <darlingserver/monitor.hpp>
 
+struct darling_lifecycle_cohort_controller;
+
 namespace DarlingServer {
+	struct GuestNamespaceTransactionResult {
+		int code;
+		uint32_t disposition;
+		uint64_t device;
+		uint64_t inode;
+		int createdFD;
+	};
 	// NOTE: server instances MUST be created with `new` rather than as a normal local/stack variable
 	class Server {
 		friend class Monitor;
@@ -46,6 +55,7 @@ namespace DarlingServer {
 		std::string _prefix;
 		int _prefixFD;
 		pid_t _rootlessInitHostPID;
+		::darling_lifecycle_cohort_controller* _lifecycleController;
 		std::string _socketPath;
 		// perf #0 (dar-dar6x4-perf-5dq.6): dedicated stat socket. A SOCK_STREAM listener in
 		// the ABSTRACT namespace (the server is in a private mount namespace, so a pathname
@@ -83,7 +93,8 @@ namespace DarlingServer {
 			int prefixFD,
 			pid_t rootlessInitHostPID = 0,
 			int lifecycleListenerSocket = -1,
-			FD lifecycleLogFD = FD());
+			FD lifecycleLogFD = FD(),
+			::darling_lifecycle_cohort_controller* lifecycleController = nullptr);
 		~Server();
 
 		Server(const Server&) = delete;
@@ -99,6 +110,16 @@ namespace DarlingServer {
 		int prefixFD() const;
 		int lifecycleLogFD() const;
 		pid_t namespaceIDForPeer(pid_t peerHostPID, pid_t reportedNamespaceID) const;
+		GuestNamespaceTransactionResult guestNamespaceTransaction(
+			uint32_t operation,
+			uint64_t transactionHigh,
+			uint64_t transactionLow,
+			const void* source,
+			uint32_t sourceLength,
+			const void* destination,
+			uint32_t destinationLength,
+			int32_t flags,
+			uint32_t mode);
 
 		static Server& sharedInstance();
 

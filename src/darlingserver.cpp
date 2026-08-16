@@ -1387,6 +1387,11 @@ int main(int argc, char** argv) {
 			fprintf(stderr, "Rust lifecycle controller refused session acquisition\n");
 			exit(1);
 		}
+		if (darling_lifecycle_guest_namespace_configure(
+				lifecycleController.get(), LIBEXEC_PATH) != 0) {
+			fprintf(stderr, "Rust guest namespace transaction service refused lower root\n");
+			return 1;
+		}
 		lifecycleListenerSocket = lifecycleBootstrap.darlingserver_fd;
 	}
 #endif
@@ -1407,7 +1412,8 @@ int main(int argc, char** argv) {
 			prefixFD,
 			rootless ? launchdGlobalPID : 0,
 			lifecycleListenerSocket,
-			std::move(lifecycleLogOwner)
+			std::move(lifecycleLogOwner),
+			lifecycleController.get()
 		);
 	} catch (const std::exception& error) {
 		if (!lifecycleCohortEnabled)
@@ -1441,7 +1447,16 @@ int main(int argc, char** argv) {
 	std::cerr << "Server exited main loop!" << std::endl;
 	delete server;
 #ifdef DARLING_LIFECYCLE_COHORT_V1
-	if (lifecycleController && lifecycleController.finish() != 0) {
+	const int lifecycleFinish = lifecycleController ? lifecycleController.finish() : 0;
+	if (lifecycleFinish == DARLING_LIFECYCLE_FINISH_RECOVERY_PENDING) {
+		std::cerr << "Rust lifecycle recovery authority retained; forensic owner parked" << std::endl;
+		/* This process is the explicit durable owner of the Rust controller and
+		 * its exact recovery FDs. Admission is already revoked. Never enter
+		 * abandon or destroy the owner while recovery is outstanding. */
+		for (;;)
+			pause();
+	}
+	if (lifecycleFinish != 0) {
 		std::cerr << "Rust lifecycle controller refused final cleanup" << std::endl;
 		return 1;
 	}
