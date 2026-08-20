@@ -1,6 +1,8 @@
 #include <darlingserver/vchroot-session.hpp>
 
+#ifdef DARLING_LIFECYCLE_COHORT_V1
 #include <darling_lifecycle_cohort.h>
+#endif
 
 #include <cerrno>
 #include <cstring>
@@ -135,7 +137,13 @@ void VchrootSessionAuthority::validateAdmission() const
 	if (!_active.load(std::memory_order_acquire))
 		throw std::system_error(ESHUTDOWN, std::generic_category(),
 			"vchroot session revoked");
-	if (_controller && !darling_lifecycle_cohort_admission_open(_controller))
+	if (_controller &&
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+		!darling_lifecycle_cohort_admission_open(_controller)
+#else
+		true
+#endif
+	)
 		throw std::system_error(ESHUTDOWN, std::generic_category(),
 			"lifecycle controller revoked");
 	const auto prefix = inspectDirectoryIdentity(_prefix.fd(), "revalidate retained prefix");
@@ -150,6 +158,7 @@ void VchrootSessionAuthority::validateAdmission() const
 		throw std::system_error(ESTALE, std::generic_category(),
 			"named prefix identity mismatch");
 	if (_controller) {
+#ifdef DARLING_LIFECYCLE_COHORT_V1
 		const int authoritative = darling_lifecycle_guest_namespace_directory(_controller);
 		if (authoritative < 0)
 			throw std::system_error(ESHUTDOWN, std::generic_category(),
@@ -161,6 +170,10 @@ void VchrootSessionAuthority::validateAdmission() const
 			observed.inode != _directoryIdentity.inode)
 			throw std::system_error(ESTALE, std::generic_category(),
 				"controller runtime lower identity mismatch");
+#else
+		throw std::system_error(ESHUTDOWN, std::generic_category(),
+			"lifecycle controller unavailable in OFF build");
+#endif
 	} else {
 		struct stat namedDirectory;
 		if (fstatat(_parent.fd(), _directoryLeaf.data(), &namedDirectory,
@@ -226,7 +239,13 @@ bool VchrootSessionAuthority::active() const noexcept
 {
 	if (!_active.load(std::memory_order_acquire))
 		return false;
-	return !_controller || darling_lifecycle_cohort_admission_open(_controller);
+	if (!_controller)
+		return true;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	return darling_lifecycle_cohort_admission_open(_controller);
+#else
+	return false;
+#endif
 }
 
 uint64_t VchrootSessionAuthority::generation() const noexcept

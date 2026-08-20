@@ -601,10 +601,14 @@ void spawnLaunchd(
 	// putenv("KQUEUE_DEBUG=1");
 
 	char tmp[sizeof(((struct sockaddr_un*)nullptr)->sun_path)] = {};
-	const int encoded = lifecycleCohortEnabled
-		? snprintf(tmp, sizeof(tmp), "/proc/self/fd/%d/.darlingserver.sock",
-			DARLING_GUEST_NAMESPACE_PREFIX_FD)
-		: snprintf(tmp, sizeof(tmp), "%s/.darlingserver.sock", prefix);
+	int encoded;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (lifecycleCohortEnabled)
+		encoded = snprintf(tmp, sizeof(tmp), "/proc/self/fd/%d/.darlingserver.sock",
+			DARLING_GUEST_NAMESPACE_PREFIX_FD);
+	else
+#endif
+		encoded = snprintf(tmp, sizeof(tmp), "%s/.darlingserver.sock", prefix);
 	if (encoded <= 0 ||
 		strlen(tmp) >= sizeof(tmp)) {
 		fprintf(stderr, "Cannot encode retained Darlingserver endpoint capability\n");
@@ -1503,6 +1507,7 @@ int main(int argc, char** argv) {
 	// Create the server. In the routed path the listener was already bound by
 	// Rust under the retained prefix and lifecycle-lock capabilities.
 	DarlingServer::Server* server = nullptr;
+	struct darling_lifecycle_cohort_controller* lifecycleControllerPointer = nullptr;
 	DarlingServer::FD lifecycleLogOwner(
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 		lifecycleCohortEnabled ? lifecycleBootstrap.dserver_log_fd : -1
@@ -1510,6 +1515,9 @@ int main(int argc, char** argv) {
 		-1
 #endif
 	);
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	lifecycleControllerPointer = lifecycleController.get();
+#endif
 	try {
 		server = new DarlingServer::Server(
 			prefix,
@@ -1521,7 +1529,7 @@ int main(int argc, char** argv) {
 			rootless ? launchdGlobalPID : 0,
 			lifecycleListenerSocket,
 			std::move(lifecycleLogOwner),
-			lifecycleController.get()
+			lifecycleControllerPointer
 		);
 	} catch (const std::exception& error) {
 		if (!lifecycleCohortEnabled)
