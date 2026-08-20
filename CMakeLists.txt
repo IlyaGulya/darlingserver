@@ -163,6 +163,9 @@ target_compile_options(dserver_vchroot_session_tests PRIVATE
 	-std=c++17
 	-Werror
 )
+target_compile_definitions(dserver_vchroot_session_tests PRIVATE
+	DARLING_LIFECYCLE_COHORT_V1=1
+)
 target_include_directories(dserver_vchroot_session_tests PRIVATE
 	internal-include
 	"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/include"

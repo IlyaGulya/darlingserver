@@ -90,12 +90,15 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 
 		// inherit groups from parent process
 		_groups = parentProcess->_groups;
-	} else if (_nspid == ProcessIdentity::initNamespaceID) {
+	}
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	else if (_nspid == ProcessIdentity::initNamespaceID) {
 		// Only the server-authenticated session init mapping receives the root
 		// capability without a parent.  namespaceIDForPeer prevents an unrelated
 		// peer from claiming namespace PID 1.
 		_vchrootCapability = Server::sharedInstance().issueVchrootCapability();
 	}
+#endif
 
 	// NOTE: see thread.cpp for why it's okay to use `this` here
 	_dtapeTask = dtape_task_create(parentProcess ? parentProcess->_dtapeTask : nullptr, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
@@ -171,11 +174,16 @@ bool DarlingServer::Process::hasLiveHostIdentity(pid_t peerHostPID) const noexce
 }
 
 int DarlingServer::Process::duplicateVchrootDirectory() const {
+#ifndef DARLING_LIFECYCLE_COHORT_V1
+	throw std::system_error(ENOTSUP, std::generic_category(),
+		"retained vchroot RPC is disabled");
+#else
 	std::shared_lock lock(_rwlock);
 	if (!_vchrootCapability || !hasLiveHostIdentity(_pid))
 		throw std::system_error(ENXIO, std::generic_category(),
 			"process has no live vchroot session capability");
 	return _vchrootCapability->duplicateForTransfer();
+#endif
 };
 
 void DarlingServer::Process::setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor) {
