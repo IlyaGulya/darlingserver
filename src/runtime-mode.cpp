@@ -14,14 +14,19 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace DarlingServer {
 
 static constexpr const char* kCanonicalEnvironment = "DARLING_RUNTIME_MODE";
-static constexpr const char* kStateName = ".darling-prefix-state-v2";
-static constexpr const char* kStateHeader = "DARLING_PREFIX_STATE_V2";
+static constexpr const char* kStateNameV3 = ".darling-prefix-state-v3";
+static constexpr const char* kStateNameV2 = ".darling-prefix-state-v2";
+static constexpr const char* kStateHeaderV3 = "DARLING_PREFIX_STATE_V3";
+static constexpr const char* kStateHeaderV2 = "DARLING_PREFIX_STATE_V2";
 static constexpr const char* kStateProvenance =
 	"darling-runtime-prefix-lifecycle-v2";
+static constexpr const char* kStateProvenanceV3 =
+	"darling-runtime-prefix-sidecar-v1";
 
 static void closeOwnedFD(int& fd) noexcept
 {
@@ -34,11 +39,13 @@ InheritedRuntimePrefix::InheritedRuntimePrefix(
 	int prefixFD,
 	int parentFD,
 	const char* leaf,
-	int workdirFD
+	int workdirFD,
+	int sidecarFD
 ) :
 	prefixFD_(prefixFD),
 	parentFD_(parentFD),
-	workdirFD_(workdirFD)
+	workdirFD_(workdirFD),
+	sidecarFD_(sidecarFD)
 {
 	if (leaf == nullptr ||
 		*leaf == '\0' ||
@@ -49,6 +56,7 @@ InheritedRuntimePrefix::InheritedRuntimePrefix(
 		closeOwnedFD(prefixFD_);
 		closeOwnedFD(parentFD_);
 		closeOwnedFD(workdirFD_);
+		closeOwnedFD(sidecarFD_);
 		throw RuntimeModeError(
 			"inherited runtime prefix leaf is invalid");
 	}
@@ -62,6 +70,7 @@ InheritedRuntimePrefix::~InheritedRuntimePrefix()
 	closeOwnedFD(prefixFD_);
 	closeOwnedFD(parentFD_);
 	closeOwnedFD(workdirFD_);
+	closeOwnedFD(sidecarFD_);
 }
 
 InheritedRuntimePrefix::InheritedRuntimePrefix(
@@ -70,11 +79,13 @@ InheritedRuntimePrefix::InheritedRuntimePrefix(
 	prefixFD_(other.prefixFD_),
 	parentFD_(other.parentFD_),
 	leaf_(other.leaf_),
-	workdirFD_(other.workdirFD_)
+	workdirFD_(other.workdirFD_),
+	sidecarFD_(other.sidecarFD_)
 {
 	other.prefixFD_ = -1;
 	other.parentFD_ = -1;
 	other.workdirFD_ = -1;
+	other.sidecarFD_ = -1;
 	other.leaf_.fill('\0');
 }
 
@@ -86,13 +97,16 @@ InheritedRuntimePrefix& InheritedRuntimePrefix::operator=(
 		closeOwnedFD(prefixFD_);
 		closeOwnedFD(parentFD_);
 		closeOwnedFD(workdirFD_);
+		closeOwnedFD(sidecarFD_);
 		prefixFD_ = other.prefixFD_;
 		parentFD_ = other.parentFD_;
 		leaf_ = other.leaf_;
 		workdirFD_ = other.workdirFD_;
+		sidecarFD_ = other.sidecarFD_;
 		other.prefixFD_ = -1;
 		other.parentFD_ = -1;
 		other.workdirFD_ = -1;
+		other.sidecarFD_ = -1;
 		other.leaf_.fill('\0');
 	}
 	return *this;
@@ -100,16 +114,23 @@ InheritedRuntimePrefix& InheritedRuntimePrefix::operator=(
 
 RuntimePrefixCapability::RuntimePrefixCapability(
 	int prefixFD,
-	int workdirFD
+	int parentFD,
+	std::array<char, NAME_MAX + 1> leaf,
+	int workdirFD,
+	uint64_t generation
 ) noexcept :
 	prefixFD_(prefixFD),
-	workdirFD_(workdirFD)
+	parentFD_(parentFD),
+	leaf_(leaf),
+	workdirFD_(workdirFD),
+	generation_(generation)
 {
 }
 
 RuntimePrefixCapability::~RuntimePrefixCapability()
 {
 	closeOwnedFD(prefixFD_);
+	closeOwnedFD(parentFD_);
 	closeOwnedFD(workdirFD_);
 }
 
@@ -117,10 +138,16 @@ RuntimePrefixCapability::RuntimePrefixCapability(
 	RuntimePrefixCapability&& other
 ) noexcept :
 	prefixFD_(other.prefixFD_),
-	workdirFD_(other.workdirFD_)
+	parentFD_(other.parentFD_),
+	leaf_(other.leaf_),
+	workdirFD_(other.workdirFD_),
+	generation_(other.generation_)
 {
 	other.prefixFD_ = -1;
+	other.parentFD_ = -1;
+	other.leaf_.fill('\0');
 	other.workdirFD_ = -1;
+	other.generation_ = 0;
 }
 
 RuntimePrefixCapability& RuntimePrefixCapability::operator=(
@@ -129,11 +156,18 @@ RuntimePrefixCapability& RuntimePrefixCapability::operator=(
 {
 	if (this != &other) {
 		closeOwnedFD(prefixFD_);
+		closeOwnedFD(parentFD_);
 		closeOwnedFD(workdirFD_);
 		prefixFD_ = other.prefixFD_;
+		parentFD_ = other.parentFD_;
+		leaf_ = other.leaf_;
 		workdirFD_ = other.workdirFD_;
+		generation_ = other.generation_;
 		other.prefixFD_ = -1;
+		other.parentFD_ = -1;
+		other.leaf_.fill('\0');
 		other.workdirFD_ = -1;
+		other.generation_ = 0;
 	}
 	return *this;
 }
@@ -146,6 +180,21 @@ int RuntimePrefixCapability::prefixFD() const noexcept
 int RuntimePrefixCapability::workdirFD() const noexcept
 {
 	return workdirFD_;
+}
+
+int RuntimePrefixCapability::parentFD() const noexcept
+{
+	return parentFD_;
+}
+
+const char* RuntimePrefixCapability::leaf() const noexcept
+{
+	return leaf_.data();
+}
+
+uint64_t RuntimePrefixCapability::generation() const noexcept
+{
+	return generation_;
 }
 
 static uint64_t parseUnsignedField(
@@ -165,11 +214,12 @@ static uint64_t parseUnsignedField(
 	return value;
 }
 
-static std::array<std::string_view, 9> splitStateLines(
-	const std::string& content
+static std::vector<std::string_view> splitStateLines(
+	const std::string& content,
+	size_t count
 )
 {
-	std::array<std::string_view, 9> lines;
+	std::vector<std::string_view> lines(count);
 	size_t offset = 0;
 	for (size_t index = 0; index < lines.size(); ++index) {
 		size_t newline = content.find('\n', offset);
@@ -191,7 +241,13 @@ static std::string readPrefixState(
 )
 {
 	struct stat named;
-	if (fstatat(prefixFD, kStateName, &named,
+	const char* stateName = kStateNameV3;
+	if (fstatat(prefixFD, stateName, &named, AT_SYMLINK_NOFOLLOW) != 0) {
+		if (errno != ENOENT)
+			throw RuntimeModeError("cannot inspect runtime prefix state");
+		stateName = kStateNameV2;
+	}
+	if (fstatat(prefixFD, stateName, &named,
 			AT_SYMLINK_NOFOLLOW) != 0 ||
 		S_ISLNK(named.st_mode) ||
 		!S_ISREG(named.st_mode) ||
@@ -203,7 +259,7 @@ static std::string readPrefixState(
 		named.st_size >= 1024)
 		throw RuntimeModeError(
 			"runtime prefix has no valid typed state");
-	int fd = openat(prefixFD, kStateName,
+	int fd = openat(prefixFD, stateName,
 		O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
 	if (fd < 0)
 		throw RuntimeModeError(
@@ -240,9 +296,10 @@ static std::string readPrefixState(
 	return content;
 }
 
-static void validateTypedPrefixState(
+static uint64_t validateTypedPrefixState(
 	int prefixFD,
 	const struct stat& prefixStatus,
+	const struct stat& sidecarStatus,
 	RuntimeMode mode,
 	uid_t ownerUID,
 	gid_t ownerGID
@@ -250,13 +307,14 @@ static void validateTypedPrefixState(
 {
 	const std::string content =
 		readPrefixState(prefixFD, ownerUID, ownerGID);
-	auto lines = splitStateLines(content);
-	if (lines[0] != kStateHeader)
+	const bool v3 = content.rfind(kStateHeaderV3, 0) == 0;
+	auto lines = splitStateLines(content, v3 ? 11 : 9);
+	if (lines[0] != (v3 ? kStateHeaderV3 : kStateHeaderV2))
 		throw RuntimeModeError("runtime prefix state schema is malformed");
 	uint64_t schema = parseUnsignedField(lines[1], "schema_version=");
-	if (schema > 2)
+	if (schema > 3)
 		throw RuntimeModeError("runtime prefix state uses a newer schema");
-	if (schema != 2)
+	if (schema != (v3 ? 3 : 2))
 		throw RuntimeModeError("runtime prefix state schema is incompatible");
 	const std::string modeField = "runtime_mode=" +
 		std::string(runtimeModeName(mode));
@@ -265,20 +323,30 @@ static void validateTypedPrefixState(
 	uint64_t generation = parseUnsignedField(lines[3], "generation=");
 	uint64_t device = parseUnsignedField(lines[4], "prefix_device=");
 	uint64_t inode = parseUnsignedField(lines[5], "prefix_inode=");
-	uint64_t uid = parseUnsignedField(lines[6], "owner_uid=");
-	uint64_t gid = parseUnsignedField(lines[7], "owner_gid=");
+	uint64_t sidecarDevice = 1;
+	uint64_t sidecarInode = 1;
+	const size_t ownerOffset = v3 ? 2 : 0;
+	if (v3) {
+		sidecarDevice = parseUnsignedField(lines[6], "sidecar_device=");
+		sidecarInode = parseUnsignedField(lines[7], "sidecar_inode=");
+	}
+	uint64_t uid = parseUnsignedField(lines[6 + ownerOffset], "owner_uid=");
+	uint64_t gid = parseUnsignedField(lines[7 + ownerOffset], "owner_gid=");
 	const std::string provenanceField =
-		"provenance=" + std::string(kStateProvenance);
+		"provenance=" + std::string(v3 ? kStateProvenanceV3 : kStateProvenance);
 	if (generation == 0 ||
+		(v3 && (sidecarDevice != static_cast<uint64_t>(sidecarStatus.st_dev) ||
+			sidecarInode != static_cast<uint64_t>(sidecarStatus.st_ino))) ||
 		prefixStatus.st_uid != ownerUID ||
 		prefixStatus.st_gid != ownerGID ||
 		device != static_cast<uint64_t>(prefixStatus.st_dev) ||
 		inode != static_cast<uint64_t>(prefixStatus.st_ino) ||
 		uid != static_cast<uint64_t>(ownerUID) ||
 		gid != static_cast<uint64_t>(ownerGID) ||
-		lines[8] != provenanceField)
+		lines[8 + ownerOffset] != provenanceField)
 		throw RuntimeModeError(
 			"runtime prefix typed state is incompatible");
+	return generation;
 }
 
 std::string_view runtimeModeName(RuntimeMode mode)
@@ -382,8 +450,9 @@ RuntimePrefixCapability anchorRuntimeModePrefix(
 	const int prefixFD = inherited.prefixFD_;
 	const int parentFD = inherited.parentFD_;
 	const int workdirFD = inherited.workdirFD_;
+	const int sidecarFD = inherited.sidecarFD_;
 	const char* leaf = inherited.leaf_.data();
-	if (prefixFD < 0 || parentFD < 0 || workdirFD < 0)
+	if (prefixFD < 0 || parentFD < 0 || workdirFD < 0 || sidecarFD < 0)
 		throw RuntimeModeError("inherited runtime prefix handle is invalid");
 
 	struct stat opened;
@@ -391,6 +460,8 @@ RuntimePrefixCapability anchorRuntimeModePrefix(
 	struct stat named;
 	struct stat workdirOpened;
 	struct stat workdirNamed;
+	struct stat sidecarOpened;
+	struct stat sidecarNamed;
 	if (fstat(prefixFD, &opened) != 0 ||
 		fstat(parentFD, &parent) != 0 ||
 		!S_ISDIR(opened.st_mode) ||
@@ -421,18 +492,34 @@ RuntimePrefixCapability anchorRuntimeModePrefix(
 		workdirNamed.st_ino != workdirOpened.st_ino)
 		throw RuntimeModeError(
 			"runtime prefix workdir changed before darlingserver handoff");
-
-	validateTypedPrefixState(
-		prefixFD, opened, mode, ownerUID, ownerGID);
-
-	if (close(inherited.parentFD_) != 0)
+	std::string sidecarLeaf(leaf);
+	sidecarLeaf += ".eunion-sidecar-v1";
+	if (sidecarLeaf.size() > NAME_MAX ||
+		fstat(sidecarFD, &sidecarOpened) != 0 ||
+		!S_ISDIR(sidecarOpened.st_mode) ||
+		(sidecarOpened.st_mode & 07777) != 0700 ||
+		sidecarOpened.st_uid != ownerUID ||
+		sidecarOpened.st_gid != ownerGID ||
+		fstatat(parentFD, sidecarLeaf.c_str(), &sidecarNamed,
+			AT_SYMLINK_NOFOLLOW) != 0 ||
+		S_ISLNK(sidecarNamed.st_mode) ||
+		!S_ISDIR(sidecarNamed.st_mode) ||
+		sidecarNamed.st_dev != sidecarOpened.st_dev ||
+		sidecarNamed.st_ino != sidecarOpened.st_ino)
 		throw RuntimeModeError(
-			"cannot close validated runtime prefix parent descriptor");
+			"runtime prefix sidecar changed before darlingserver handoff");
+
+	const uint64_t generation = validateTypedPrefixState(
+		prefixFD, opened, sidecarOpened, mode, ownerUID, ownerGID);
+
+	const auto retainedLeaf = inherited.leaf_;
 	inherited.parentFD_ = -1;
 	inherited.prefixFD_ = -1;
 	inherited.workdirFD_ = -1;
+	closeOwnedFD(inherited.sidecarFD_);
 	inherited.leaf_.fill('\0');
-	return RuntimePrefixCapability(prefixFD, workdirFD);
+	return RuntimePrefixCapability(
+		prefixFD, parentFD, retainedLeaf, workdirFD, generation);
 }
 
 static std::string runtimePrefixProcPath(int prefixFD)

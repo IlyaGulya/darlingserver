@@ -49,6 +49,9 @@
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 #include <darling_lifecycle_cohort.h>
+#if DARLING_LIFECYCLE_COHORT_ABI_VERSION != 3
+#error "Darlingserver requires lifecycle cohort ABI v3"
+#endif
 #include <darlingserver/lifecycle-cohort-owner.hpp>
 #endif
 
@@ -1046,7 +1049,7 @@ int main(int argc, char** argv) {
 
 	char *opts;
 	char putOld[4096];
-	if (argc != 9) {
+	if (argc != 11) {
 		fprintf(stderr, "darlingserver is not meant to be started manually\n");
 		exit(1);
 	}
@@ -1058,11 +1061,14 @@ int main(int argc, char** argv) {
 	}
 #endif
 
-	sscanf(argv[5], "%d", &originalUID);
-	sscanf(argv[6], "%d", &originalGID);
-	sscanf(argv[7], "%d", &pipefd);
+	// argv[5] and argv[6] are the retained lifecycle sidecar and lock
+	// descriptors.  Keep the launcher/Dserver bootstrap layout exact: the
+	// invoking credentials and readiness pipe follow those capabilities.
+	sscanf(argv[7], "%d", &originalUID);
+	sscanf(argv[8], "%d", &originalGID);
+	sscanf(argv[9], "%d", &pipefd);
 
-	if (argv[8][0] == '1') {
+	if (argv[10][0] == '1') {
 		fix_permissions = true;
 	}
 
@@ -1077,7 +1083,8 @@ int main(int argc, char** argv) {
 			parseInheritedFD(argv[1], "prefix"),
 			parseInheritedFD(argv[2], "prefix parent"),
 			argv[3],
-			parseInheritedFD(argv[4], "prefix workdir")
+			parseInheritedFD(argv[4], "prefix workdir"),
+			parseInheritedFD(argv[5], "prefix sidecar")
 		);
 		auto anchored = DarlingServer::anchorRuntimeModePrefix(
 			std::move(inherited), runtimeMode, originalUID, originalGID);
@@ -1388,7 +1395,7 @@ int main(int argc, char** argv) {
 			exit(1);
 		}
 		if (darling_lifecycle_guest_namespace_configure(
-				lifecycleController.get(), LIBEXEC_PATH) != 0) {
+				lifecycleController.get()) != 0) {
 			fprintf(stderr, "Rust guest namespace transaction service refused lower root\n");
 			return 1;
 		}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <limits.h>
 #include <stdexcept>
 #include <string>
@@ -29,7 +30,8 @@ public:
 		int prefixFD,
 		int parentFD,
 		const char* leaf,
-		int workdirFD
+		int workdirFD,
+		int sidecarFD
 	);
 	~InheritedRuntimePrefix();
 	InheritedRuntimePrefix(const InheritedRuntimePrefix&) = delete;
@@ -50,6 +52,7 @@ private:
 	int parentFD_;
 	std::array<char, NAME_MAX + 1> leaf_;
 	int workdirFD_;
+	int sidecarFD_;
 };
 
 class RuntimePrefixCapability final {
@@ -61,7 +64,10 @@ public:
 	RuntimePrefixCapability& operator=(RuntimePrefixCapability&& other) noexcept;
 
 	int prefixFD() const noexcept;
+	int parentFD() const noexcept;
 	int workdirFD() const noexcept;
+	const char* leaf() const noexcept;
+	uint64_t generation() const noexcept;
 	std::string prefixProcPath() const;
 	std::string workdirProcPath() const;
 
@@ -72,10 +78,18 @@ private:
 		uid_t,
 		gid_t
 	);
-	RuntimePrefixCapability(int prefixFD, int workdirFD) noexcept;
+	RuntimePrefixCapability(
+		int prefixFD,
+		int parentFD,
+		std::array<char, NAME_MAX + 1> leaf,
+		int workdirFD,
+		uint64_t generation) noexcept;
 
 	int prefixFD_;
+	int parentFD_;
+	std::array<char, NAME_MAX + 1> leaf_;
 	int workdirFD_;
+	uint64_t generation_;
 };
 
 RuntimeMode requireRuntimeModeFromEnvironment(bool eunionCapable);

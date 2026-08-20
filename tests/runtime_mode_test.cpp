@@ -5,6 +5,7 @@
 #include <fstream>
 #include <fcntl.h>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <sys/stat.h>
 #include <type_traits>
@@ -68,17 +69,48 @@ static void writeState(const std::filesystem::path& directory)
 		"restrict typed runtime prefix state fixture");
 }
 
+static void writeStateV3(
+	const std::filesystem::path& directory,
+	const std::filesystem::path& sidecar
+)
+{
+	struct stat status;
+	struct stat sidecarStatus;
+	require(stat(directory.c_str(), &status) == 0 &&
+			stat(sidecar.c_str(), &sidecarStatus) == 0,
+		"stat schema-v3 runtime prefix fixture");
+	std::ofstream output(directory / ".darling-prefix-state-v3");
+	output << "DARLING_PREFIX_STATE_V3\n";
+	output << "schema_version=3\n";
+	output << "runtime_mode=rootless-eunion\n";
+	output << "generation=2\n";
+	output << "prefix_device=" << status.st_dev << '\n';
+	output << "prefix_inode=" << status.st_ino << '\n';
+	output << "sidecar_device=" << sidecarStatus.st_dev << '\n';
+	output << "sidecar_inode=" << sidecarStatus.st_ino << '\n';
+	output << "owner_uid=" << getuid() << '\n';
+	output << "owner_gid=" << getgid() << '\n';
+	output << "provenance=darling-runtime-prefix-sidecar-v1\n";
+	require(output.good(), "write schema-v3 runtime prefix state fixture");
+	output.close();
+	require(chmod(
+			(directory / ".darling-prefix-state-v3").c_str(), 0600) == 0,
+		"restrict schema-v3 runtime prefix state fixture");
+}
+
 static void requireRejectedPrefixFD(
 	int prefixFD,
 	int parentFD,
 	const char* leaf,
 	int workdirFD,
+	int sidecarFD,
 	const char* message
 )
 {
 	try {
 		InheritedRuntimePrefix inherited(
-			dup(prefixFD), dup(parentFD), leaf, dup(workdirFD));
+			dup(prefixFD), dup(parentFD), leaf, dup(workdirFD),
+			dup(sidecarFD));
 		(void)anchorRuntimeModePrefix(
 			std::move(inherited), RuntimeMode::RootlessEunion,
 			getuid(), getgid());
@@ -92,16 +124,19 @@ static RuntimePrefixCapability requireAnchoredPrefix(
 	int parentFD,
 	const char* leaf,
 	int workdirFD,
+	int sidecarFD,
 	RuntimeMode mode = RuntimeMode::RootlessEunion
 )
 {
 	const int prefixCopy = dup(prefixFD);
 	const int parentCopy = dup(parentFD);
 	const int workdirCopy = dup(workdirFD);
-	require(prefixCopy >= 0 && parentCopy >= 0 && workdirCopy >= 0,
+	const int sidecarCopy = dup(sidecarFD);
+	require(prefixCopy >= 0 && parentCopy >= 0 && workdirCopy >= 0 &&
+			sidecarCopy >= 0,
 		"duplicate inherited descriptor fixture");
 	InheritedRuntimePrefix inherited(
-		prefixCopy, parentCopy, leaf, workdirCopy);
+		prefixCopy, parentCopy, leaf, workdirCopy, sidecarCopy);
 	return anchorRuntimeModePrefix(
 		std::move(inherited), mode, getuid(), getgid());
 }
@@ -114,7 +149,6 @@ int main()
 	static_assert(!std::is_copy_constructible_v<RuntimePrefixCapability>);
 	static_assert(!std::is_copy_assignable_v<RuntimePrefixCapability>);
 	static_assert(std::is_nothrow_move_constructible_v<RuntimePrefixCapability>);
-	static_assert(sizeof(RuntimePrefixCapability) == 2 * sizeof(int));
 
 	requireMode("privileged-overlay", RuntimeMode::PrivilegedOverlay);
 	requireMode("privileged-copy", RuntimeMode::PrivilegedCopy);
@@ -152,8 +186,12 @@ int main()
 	const std::filesystem::path workdir =
 		std::filesystem::path(root) / "prefix.workdir";
 	std::filesystem::create_directory(workdir);
+	const std::filesystem::path sidecar =
+		std::filesystem::path(root) / "prefix.eunion-sidecar-v1";
+	std::filesystem::create_directory(sidecar);
 	require(chmod(prefix.c_str(), 0755) == 0 &&
-			chmod(workdir.c_str(), 0755) == 0,
+			chmod(workdir.c_str(), 0755) == 0 &&
+			chmod(sidecar.c_str(), 0700) == 0,
 		"normalize prefix fixture directory modes");
 	const std::string marker =
 		(prefix / ".darling-prefix-state-v2").string();
@@ -163,12 +201,14 @@ int main()
 		open(prefix.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	const int workdirFD =
 		open(workdir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-	require(parentFD >= 0 && prefixFD >= 0 && workdirFD >= 0,
+	const int sidecarFD =
+		open(sidecar.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	require(parentFD >= 0 && prefixFD >= 0 && workdirFD >= 0 && sidecarFD >= 0,
 		"open prefix fixture descriptors");
 
 	try {
 		(void)requireAnchoredPrefix(
-			prefixFD, parentFD, "prefix", workdirFD);
+			prefixFD, parentFD, "prefix", workdirFD, sidecarFD);
 		require(false, "missing marker was accepted");
 	} catch (const RuntimeModeError&) {
 		require(!std::filesystem::exists(marker),
@@ -177,7 +217,33 @@ int main()
 
 	writeState(prefix);
 	auto validated = requireAnchoredPrefix(
-		prefixFD, parentFD, "prefix", workdirFD);
+		prefixFD, parentFD, "prefix", workdirFD, sidecarFD);
+	writeStateV3(prefix, sidecar);
+	auto validatedV3 = requireAnchoredPrefix(
+		prefixFD, parentFD, "prefix", workdirFD, sidecarFD);
+	require(validatedV3.prefixFD() >= 0,
+		"schema-v3 runtime prefix state was not accepted");
+	{
+		const auto stateV3 = prefix / ".darling-prefix-state-v3";
+		std::ifstream input(stateV3);
+		std::string content(
+			(std::istreambuf_iterator<char>(input)),
+			std::istreambuf_iterator<char>());
+		const auto key = content.find("sidecar_inode=");
+		const auto end = content.find('\n', key);
+		content.replace(key, end - key, "sidecar_inode=0");
+		std::ofstream output(stateV3, std::ios::trunc);
+		output << content;
+	}
+	try {
+		(void)requireAnchoredPrefix(
+			prefixFD, parentFD, "prefix", workdirFD, sidecarFD);
+		require(false, "forged schema-v3 sidecar identity was accepted");
+	} catch (const RuntimeModeError&) {
+	}
+	writeStateV3(prefix, sidecar);
+	require(std::filesystem::remove(prefix / ".darling-prefix-state-v3"),
+		"remove schema-v3 fixture before v2 compatibility cases");
 	const std::string retainedAlias = validated.prefixProcPath();
 	struct stat aliasStatus;
 	struct stat prefixStatus;
@@ -189,7 +255,7 @@ int main()
 		"retained prefix alias does not name exact descriptor");
 	try {
 		(void)requireAnchoredPrefix(
-			prefixFD, parentFD, "prefix", workdirFD,
+			prefixFD, parentFD, "prefix", workdirFD, sidecarFD,
 			RuntimeMode::PrivilegedOverlay);
 		require(false, "mismatched marker was accepted");
 	} catch (const RuntimeModeError&) {
@@ -215,7 +281,7 @@ int main()
 	require(symlink(target.c_str(), prefix.c_str()) == 0,
 		"replace inspected prefix with symlink");
 	requireRejectedPrefixFD(
-		prefixFD, parentFD, "prefix", workdirFD,
+		prefixFD, parentFD, "prefix", workdirFD, sidecarFD,
 		"rename-swap runtime prefix symlink was accepted");
 	struct stat retainedStatus;
 	require(stat(retainedAlias.c_str(), &retainedStatus) == 0 &&
@@ -233,7 +299,7 @@ int main()
 		rename(parked.c_str(), prefix.c_str()) == 0,
 		"restore inspected prefix fixture");
 	(void)requireAnchoredPrefix(
-		prefixFD, parentFD, "prefix", workdirFD);
+		prefixFD, parentFD, "prefix", workdirFD, sidecarFD);
 	const std::filesystem::path parkedWorkdir =
 		std::filesystem::path(root) / "prefix.workdir.parked";
 	require(rename(workdir.c_str(), parkedWorkdir.c_str()) == 0,
@@ -241,29 +307,31 @@ int main()
 	require(symlink(target.c_str(), workdir.c_str()) == 0,
 		"replace inspected workdir with symlink");
 	requireRejectedPrefixFD(
-		prefixFD, parentFD, "prefix", workdirFD,
+		prefixFD, parentFD, "prefix", workdirFD, sidecarFD,
 		"rename-swap runtime workdir symlink was accepted");
 	require(unlink(workdir.c_str()) == 0 &&
 		rename(parkedWorkdir.c_str(), workdir.c_str()) == 0,
 		"restore inspected workdir fixture");
 	(void)requireAnchoredPrefix(
-		prefixFD, parentFD, "prefix", workdirFD);
+		prefixFD, parentFD, "prefix", workdirFD, sidecarFD);
 
 	std::filesystem::remove(marker);
 	require(symlink(target.c_str(), marker.c_str()) == 0,
 		"create marker symlink");
 	requireRejectedPrefixFD(
-		prefixFD, parentFD, "prefix", workdirFD,
+		prefixFD, parentFD, "prefix", workdirFD, sidecarFD,
 		"runtime marker symlink was accepted");
 	require(!std::filesystem::exists(target / "mutated"),
 		"marker symlink rejection mutated target");
 
 	close(prefixFD);
 	close(workdirFD);
+	close(sidecarFD);
 	close(parentFD);
 	std::filesystem::remove_all(target);
 	std::filesystem::remove_all(prefix);
 	std::filesystem::remove_all(workdir);
+	std::filesystem::remove_all(sidecar);
 	std::filesystem::remove(root);
 	std::cout << "DSERVER_RUNTIME_MODE_CONTRACT_OK\n";
 	return 0;
