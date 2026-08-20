@@ -31,6 +31,7 @@
 #include <darlingserver/registry.hpp>
 #include <darlingserver/utility.hpp>
 #include <darlingserver/monitor.hpp>
+#include <darlingserver/vchroot-session.hpp>
 
 struct darling_lifecycle_cohort_controller;
 
@@ -50,6 +51,7 @@ namespace DarlingServer {
 		// Declared first so it is destroyed last. Process/Thread/monitor/work-queue
 		// destructors may log while the rest of Server is being torn down.
 		FD _lifecycleLogFD;
+		std::shared_ptr<VchrootSessionAuthority> _vchrootSession;
 		int _listenerSocket;
 		bool _lifecycleRoutedSocket = false;
 		std::string _prefix;
@@ -91,6 +93,10 @@ namespace DarlingServer {
 		Server(
 			std::string prefix,
 			int prefixFD,
+			int prefixParentFD,
+			const char* prefixLeaf,
+			int vchrootDirectoryFD,
+			uint64_t sessionGeneration,
 			pid_t rootlessInitHostPID = 0,
 			int lifecycleListenerSocket = -1,
 			FD lifecycleLogFD = FD(),
@@ -110,6 +116,9 @@ namespace DarlingServer {
 		int prefixFD() const;
 		int lifecycleLogFD() const;
 		pid_t namespaceIDForPeer(pid_t peerHostPID, pid_t reportedNamespaceID) const;
+		std::shared_ptr<VchrootDirectoryCapability> issueVchrootCapability();
+		std::shared_ptr<VchrootDirectoryCapability> adoptVchrootCapability(int descriptor);
+		std::shared_ptr<VchrootSessionAuthority> vchrootSession() const;
 		GuestNamespaceTransactionResult guestNamespaceTransaction(
 			uint32_t operation,
 			uint64_t transactionHigh,

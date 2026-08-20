@@ -32,6 +32,7 @@ static constexpr uint32_t GuestTransactionPathCapacity = 1024;
 #include <darlingserver/config.hpp>
 #include <darlingserver/metrics.hpp>
 #include <darlingserver/test-diagnostics.hpp>
+
 #include <sys/fcntl.h>
 #include <sys/syscall.h>
 #include <darlingserver/kqchan.hpp>
@@ -86,13 +87,18 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 			try {
 				tmp = std::make_shared<Process>(requestMessage.pid(), namespaceID, static_cast<Process::Architecture>(header->architecture), lifetimePipe);
-			} catch (std::system_error e) {
+			} catch (const std::system_error& error) {
+				callLog.error() << "Cannot bind authenticated process identity: "
+					<< error.what() << callLog.endLog;
 				return tmp;
 			}
 
 			Server::sharedInstance().monitorProcess(tmp);
 			return tmp;
 		});
+		if (process && !process->hasLiveHostIdentity(requestMessage.pid())) {
+			process = nullptr;
+		}
 
 		if (TestDiagnostics::consumeFault("ingest.force_missing_process")) {
 			TestDiagnostics::traceLine(
@@ -131,7 +137,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 			try {
 				tmp = std::make_shared<Thread>(process, header->tid, stackHint);
-			} catch (std::system_error e) {
+			} catch (const std::system_error& error) {
 				return tmp;
 			}
 
@@ -550,6 +556,26 @@ void DarlingServer::Call::VchrootPath::processCall() {
 	}
 
 	_sendReply(code, fullLength);
+};
+
+void DarlingServer::Call::VchrootDirectory::processCall() {
+	int code = -ESRCH;
+	int directoryFD = -1;
+
+	try {
+		if (auto thread = _thread.lock()) {
+			if (auto process = thread->process()) {
+				directoryFD = process->duplicateVchrootDirectory();
+				code = 0;
+			}
+		}
+	} catch (const std::system_error& error) {
+		code = -error.code().value();
+	} catch (...) {
+		code = -EIO;
+	}
+
+	_sendReply(code, directoryFD);
 };
 
 void DarlingServer::Call::TaskSelfTrap::processCall() {

@@ -35,6 +35,7 @@
 #include <darlingserver/rpc.h>
 #include <darlingserver/logging.hpp>
 #include <darlingserver/registry.hpp>
+#include <darlingserver/vchroot-session.hpp>
 
 struct DTapeHooks;
 
@@ -89,10 +90,11 @@ namespace DarlingServer {
 		pid_t _nspid;
 		EternalID _eid;
 		std::shared_ptr<FD> _pidfd;
+		FD _identityPidfd;
 		mutable std::shared_mutex _rwlock;
 		std::unordered_map<uint64_t, std::weak_ptr<Thread>> _threads;
 		std::string _cachedVchrootPath;
-		std::shared_ptr<FD> _vchrootDescriptor;
+		std::shared_ptr<VchrootDirectoryCapability> _vchrootCapability;
 		dtape_task_t* _dtapeTask;
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
@@ -163,6 +165,8 @@ namespace DarlingServer {
 		std::vector<std::shared_ptr<Thread>> threads() const;
 
 		std::string vchrootPath() const;
+		bool hasLiveHostIdentity(pid_t peerHostPID) const noexcept;
+		int duplicateVchrootDirectory() const;
 		void setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor);
 
 		std::shared_ptr<Process> parentProcess() const;

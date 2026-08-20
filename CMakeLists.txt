@@ -124,6 +124,7 @@ add_executable(darlingserver
 	src/metrics.cpp
 	src/test-diagnostics.cpp
 	src/runtime-mode.cpp
+	src/vchroot-session.cpp
 )
 target_compile_definitions(darlingserver PRIVATE
 	DARLING_RUNTIME_EUNION_CAPABLE=$<BOOL:${DARLING_EUNION}>
@@ -151,6 +152,25 @@ target_compile_options(dserver_runtime_mode_tests PRIVATE
 )
 target_include_directories(dserver_runtime_mode_tests PRIVATE
 	include
+)
+
+add_executable(dserver_vchroot_session_tests
+	tests/vchroot_session_test.cpp
+	src/vchroot-session.cpp
+	src/utility.cpp
+)
+target_compile_options(dserver_vchroot_session_tests PRIVATE
+	-std=c++17
+	-Werror
+)
+target_include_directories(dserver_vchroot_session_tests PRIVATE
+	internal-include
+	"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/include"
+)
+
+add_custom_target(dserver_vchroot_session_tests_run
+	COMMAND $<TARGET_FILE:dserver_vchroot_session_tests>
+	DEPENDS dserver_vchroot_session_tests
 )
 
 add_dependencies(darlingserver

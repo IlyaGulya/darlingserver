@@ -21,6 +21,7 @@
 #include <darlingserver/fork-checkin.hpp>
 #include <darlingserver/process-identity.hpp>
 #include <darlingserver/registry.hpp>
+#include <darlingserver/server.hpp>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -46,6 +47,11 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 	}
 
 	_pidfd = std::make_shared<FD>(pidfd);
+	const int identityPidfd = syscall(SYS_pidfd_open, _pid, 0);
+	if (identityPidfd < 0)
+		throw std::system_error(errno, std::generic_category(),
+			"Failed to retain process identity pidfd");
+	_identityPidfd = FD(identityPidfd);
 
 	// we could use stat instead of status, but it's more complicated with comm potentially getting in the way of parsing (it can include whitespace and parentheses)
 	std::ifstream statusFile("/proc/" + std::to_string(id) + "/status");
@@ -79,11 +85,16 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 		std::shared_lock parentLock(parentProcess->_rwlock);
 
 		// inherit vchroot from parent process
-		_vchrootDescriptor = parentProcess->_vchrootDescriptor;
+		_vchrootCapability = parentProcess->_vchrootCapability;
 		_cachedVchrootPath = parentProcess->_cachedVchrootPath;
 
 		// inherit groups from parent process
 		_groups = parentProcess->_groups;
+	} else if (_nspid == ProcessIdentity::initNamespaceID) {
+		// Only the server-authenticated session init mapping receives the root
+		// capability without a parent.  namespaceIDForPeer prevents an unrelated
+		// peer from claiming namespace PID 1.
+		_vchrootCapability = Server::sharedInstance().issueVchrootCapability();
 	}
 
 	// NOTE: see thread.cpp for why it's okay to use `this` here
@@ -153,23 +164,41 @@ std::string DarlingServer::Process::vchrootPath() const {
 	return _cachedVchrootPath;
 };
 
+bool DarlingServer::Process::hasLiveHostIdentity(pid_t peerHostPID) const noexcept {
+	if (_pid != peerHostPID || _identityPidfd.fd() < 0)
+		return false;
+	return syscall(SYS_pidfd_send_signal, _identityPidfd.fd(), 0, nullptr, 0) == 0;
+}
+
+int DarlingServer::Process::duplicateVchrootDirectory() const {
+	std::shared_lock lock(_rwlock);
+	if (!_vchrootCapability || !hasLiveHostIdentity(_pid))
+		throw std::system_error(ENXIO, std::generic_category(),
+			"process has no live vchroot session capability");
+	return _vchrootCapability->duplicateForTransfer();
+};
+
 void DarlingServer::Process::setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor) {
 	std::unique_lock lock(_rwlock);
-	_vchrootDescriptor = directoryDescriptor;
+	if (!directoryDescriptor)
+		throw std::system_error(EBADF, std::generic_category(),
+			"missing vchroot directory descriptor");
+	const int descriptor = directoryDescriptor->extract();
+	_vchrootCapability = Server::sharedInstance().adoptVchrootCapability(descriptor);
 
-	char* tmp = new char[4096];
-
-	auto fdPath = "/proc/self/fd/" + std::to_string(_vchrootDescriptor->fd());
-	auto len = readlink(fdPath.c_str(), tmp, 4095);
+	const int retained = _vchrootCapability->duplicateForTransfer();
+	auto fdPath = "/proc/self/fd/" + std::to_string(retained);
+	std::array<char, 4096> tmp{};
+	auto len = readlink(fdPath.c_str(), tmp.data(), tmp.size() - 1);
+	close(retained);
 
 	if (len < 0) {
 		throw std::system_error(errno, std::generic_category(), "readlink");
 	}
 
-	tmp[len] = '\0';
+	tmp[static_cast<size_t>(len)] = '\0';
 
-	_cachedVchrootPath = std::string(tmp);
-	delete[] tmp;
+	_cachedVchrootPath = std::string(tmp.data());
 };
 
 std::shared_ptr<DarlingServer::Process> DarlingServer::Process::currentProcess() {

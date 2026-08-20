@@ -39,6 +39,7 @@
 #include <linux/fs.h>
 #include <sys/syscall.h>
 #include <sys/signal.h>
+#include <sys/socket.h>
 #include <climits>
 
 #include <darling-config.h>
@@ -94,6 +95,64 @@ static bool write_full(int fd, const void* input, size_t size) {
 	}
 	return true;
 }
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+static bool sendRetainedDirectory(int socket, int directoryFD) {
+	char payload = 'V';
+	struct iovec iov = {&payload, sizeof(payload)};
+	char control[CMSG_SPACE(sizeof(int))] = {};
+	struct msghdr message = {};
+	message.msg_iov = &iov;
+	message.msg_iovlen = 1;
+	message.msg_control = control;
+	message.msg_controllen = sizeof(control);
+	struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+	header->cmsg_level = SOL_SOCKET;
+	header->cmsg_type = SCM_RIGHTS;
+	header->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(header), &directoryFD, sizeof(directoryFD));
+	ssize_t result;
+	do {
+		result = sendmsg(socket, &message, MSG_NOSIGNAL);
+	} while (result < 0 && errno == EINTR);
+	return result == 1;
+}
+
+static int receiveRetainedDirectory(int socket) {
+	char payload = 0;
+	struct iovec iov = {&payload, sizeof(payload)};
+	char control[CMSG_SPACE(sizeof(int))] = {};
+	struct msghdr message = {};
+	message.msg_iov = &iov;
+	message.msg_iovlen = 1;
+	message.msg_control = control;
+	message.msg_controllen = sizeof(control);
+	ssize_t result;
+	do {
+		result = recvmsg(socket, &message, MSG_CMSG_CLOEXEC);
+	} while (result < 0 && errno == EINTR);
+	struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+	int descriptor = -1;
+	if (header && header->cmsg_level == SOL_SOCKET &&
+		header->cmsg_type == SCM_RIGHTS && header->cmsg_len >= CMSG_LEN(sizeof(int)))
+		memcpy(&descriptor, CMSG_DATA(header), sizeof(descriptor));
+	if (result != 1 || payload != 'V' || (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
+		!header || CMSG_NXTHDR(&message, header) ||
+		header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+		header->cmsg_len != CMSG_LEN(sizeof(int))) {
+		if (descriptor >= 0)
+			close(descriptor);
+		return -1;
+	}
+	struct stat status;
+	if (descriptor < 0 || fstat(descriptor, &status) != 0 || !S_ISDIR(status.st_mode)) {
+		if (descriptor >= 0)
+			close(descriptor);
+		return -1;
+	}
+	return descriptor;
+}
+#endif
 
 // TODO: most of the code here was ported over from startup/darling.c; we should C++-ify it.
 
@@ -533,14 +592,24 @@ void darlingPreInit(int prefixFD)
 void spawnLaunchd(
 	const char* prefix,
 	DarlingServer::RuntimeMode runtimeMode,
-	int prefixFD
+	bool lifecycleCohortEnabled,
+	int vchrootDirectoryFD
 )
 {
 	puts("Bootstrapping the container with launchd...");
 
 	// putenv("KQUEUE_DEBUG=1");
 
-	auto tmp = (std::string(prefix) + "/.darlingserver.sock");
+	char tmp[sizeof(((struct sockaddr_un*)nullptr)->sun_path)] = {};
+	const int encoded = lifecycleCohortEnabled
+		? snprintf(tmp, sizeof(tmp), "/proc/self/fd/%d/.darlingserver.sock",
+			DARLING_GUEST_NAMESPACE_PREFIX_FD)
+		: snprintf(tmp, sizeof(tmp), "%s/.darlingserver.sock", prefix);
+	if (encoded <= 0 ||
+		strlen(tmp) >= sizeof(tmp)) {
+		fprintf(stderr, "Cannot encode retained Darlingserver endpoint capability\n");
+		abort();
+	}
 
 	const char* initPath = getenv("DSERVER_INIT");
 
@@ -549,7 +618,7 @@ void spawnLaunchd(
 	}
 
 	setenv("__mldr_DYLD_ROOT_PATH", LIBEXEC_PATH, 1);
-	setenv("__mldr_sockpath", tmp.c_str(), 1);
+	setenv("__mldr_sockpath", tmp, 1);
 	const std::string runtimeModeName(
 		DarlingServer::runtimeModeName(runtimeMode));
 	setenv("__mldr_runtime_mode", runtimeModeName.c_str(), 1);
@@ -557,14 +626,21 @@ void spawnLaunchd(
 	unsetenv("DARLING_ROOTLESS");
 	unsetenv("DARLING_NOOVERLAYFS");
 	unsetenv("DARLING_EUNION");
-	const int prefixFlags = fcntl(prefixFD, F_GETFD);
+	const int prefixFlags = fcntl(vchrootDirectoryFD, F_GETFD);
 	if (prefixFlags == -1 ||
-		fcntl(prefixFD, F_SETFD, prefixFlags & ~FD_CLOEXEC) == -1) {
+		fcntl(vchrootDirectoryFD, F_SETFD, prefixFlags & ~FD_CLOEXEC) == -1) {
 		fprintf(stderr, "Failed to retain trusted prefix descriptor for launchd: %s\n",
 			strerror(errno));
 		abort();
 	}
-	execl(DarlingServer::Config::defaultMldrPath.data(), "mldr!" LIBEXEC_PATH "/usr/libexec/darling/vchroot", "vchroot", prefix, initPath, NULL);
+	char retainedPrefix[32];
+	if (snprintf(retainedPrefix, sizeof(retainedPrefix), "%d", vchrootDirectoryFD) <= 0) {
+		fprintf(stderr, "Failed to encode retained vchroot descriptor\n");
+		abort();
+	}
+	execl(DarlingServer::Config::defaultMldrPath.data(),
+		"mldr!" LIBEXEC_PATH "/usr/libexec/darling/vchroot",
+		"vchroot", retainedPrefix, initPath, NULL);
 
 	fprintf(stderr, "Failed to exec launchd: %s\n", strerror(errno));
 	abort();
@@ -1341,6 +1417,17 @@ int main(int argc, char** argv) {
 		// lifecycle lock descriptors.
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 		if (lifecycleCohortEnabled) {
+			const int receivedVchrootFD = receiveRetainedDirectory(childWaitFDs[0]);
+			if (receivedVchrootFD < 0 ||
+				dup2(receivedVchrootFD, DARLING_GUEST_NAMESPACE_VCHROOT_FD) < 0) {
+				fprintf(stderr, "Cannot retain authenticated vchroot directory: %s\n",
+					strerror(errno));
+				if (receivedVchrootFD >= 0)
+					close(receivedVchrootFD);
+				exit(1);
+			}
+			if (receivedVchrootFD != DARLING_GUEST_NAMESPACE_VCHROOT_FD)
+				close(receivedVchrootFD);
 			if (childWaitFDs[0] != DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD &&
 				dup2(childWaitFDs[0], DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD) < 0) {
 				fprintf(stderr, "Cannot retain Rust guest namespace bootstrap: %s\n",
@@ -1349,6 +1436,9 @@ int main(int argc, char** argv) {
 			}
 			if (childWaitFDs[0] != DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD)
 				close(childWaitFDs[0]);
+			spawnLaunchd(prefix, runtimeMode, true,
+				DARLING_GUEST_NAMESPACE_VCHROOT_FD);
+			__builtin_unreachable();
 		} else
 #endif
 		{
@@ -1359,7 +1449,7 @@ int main(int argc, char** argv) {
 			close(childWaitFDs[0]);
 		}
 
-		spawnLaunchd(prefix, runtimeMode, prefixFD);
+		spawnLaunchd(prefix, runtimeMode, false, prefixFD);
 		__builtin_unreachable();
 	}
 
@@ -1380,6 +1470,7 @@ int main(int argc, char** argv) {
 #endif
 
 	int lifecycleListenerSocket = -1;
+	int retainedVchrootDirectory = prefixFD;
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (lifecycleCohortEnabled) {
 		auto* acquiredLifecycleController = darling_lifecycle_cohort_start(
@@ -1397,6 +1488,12 @@ int main(int argc, char** argv) {
 		if (darling_lifecycle_guest_namespace_configure(
 				lifecycleController.get()) != 0) {
 			fprintf(stderr, "Rust guest namespace transaction service refused lower root\n");
+			return 1;
+		}
+		retainedVchrootDirectory = darling_lifecycle_guest_namespace_directory(
+			lifecycleController.get());
+		if (retainedVchrootDirectory < 0) {
+			fprintf(stderr, "Rust controller refused retained vchroot directory\n");
 			return 1;
 		}
 		lifecycleListenerSocket = lifecycleBootstrap.darlingserver_fd;
@@ -1417,6 +1514,10 @@ int main(int argc, char** argv) {
 		server = new DarlingServer::Server(
 			prefix,
 			prefixFD,
+			runtimePrefix.parentFD(),
+			runtimePrefix.leaf(),
+			retainedVchrootDirectory,
+			runtimePrefix.generation(),
 			rootless ? launchdGlobalPID : 0,
 			lifecycleListenerSocket,
 			std::move(lifecycleLogOwner),
@@ -1432,7 +1533,8 @@ int main(int argc, char** argv) {
 	// Tell the child to go ahead; the socket and controller transport exist.
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (lifecycleCohortEnabled) {
-		if (darling_lifecycle_cohort_send_guest_namespace_bootstrap(
+		if (!sendRetainedDirectory(childWaitFDs[1], retainedVchrootDirectory) ||
+			darling_lifecycle_cohort_send_guest_namespace_bootstrap(
 				lifecycleController.get(), childWaitFDs[1]) != 0 ||
 			!write_full(pipefd, ".", 1)) {
 			fprintf(stderr, "Failed to publish Rust lifecycle controller readiness\n");
@@ -1446,6 +1548,8 @@ int main(int argc, char** argv) {
 		exit(1);
 	}
 	close(childWaitFDs[1]);
+	if (lifecycleCohortEnabled)
+		close(retainedVchrootDirectory);
 
 	// start the main loop
 	server->start();

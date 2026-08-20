@@ -448,12 +448,20 @@ struct DTapeHooks {
 DarlingServer::Server::Server(
 	std::string prefix,
 	int prefixFD,
+	int prefixParentFD,
+	const char* prefixLeaf,
+	int vchrootDirectoryFD,
+	uint64_t sessionGeneration,
 	pid_t rootlessInitHostPID,
 	int lifecycleListenerSocket,
 	FD lifecycleLogFD,
 	::darling_lifecycle_cohort_controller* lifecycleController
 ):
 	_lifecycleLogFD(std::move(lifecycleLogFD)),
+	_vchrootSession(VchrootSessionAuthority::create(
+		prefixFD, prefixParentFD, prefixLeaf, vchrootDirectoryFD,
+		lifecycleController ? nullptr : prefixLeaf,
+		sessionGeneration, lifecycleController)),
 	_listenerSocket(lifecycleListenerSocket),
 	_lifecycleRoutedSocket(lifecycleListenerSocket >= 0),
 	_prefix(prefix),
@@ -644,6 +652,7 @@ DarlingServer::GuestNamespaceTransactionResult DarlingServer::Server::guestNames
 }
 
 DarlingServer::Server::~Server() {
+	_vchrootSession->revoke();
 	close(_epollFD);
 	close(_wakeupFD);
 	close(_listenerSocket);
@@ -932,6 +941,21 @@ pid_t DarlingServer::Server::namespaceIDForPeer(pid_t peerHostPID, pid_t reporte
 	return ProcessIdentity::namespaceIDForPeer(_rootlessInitHostPID, peerHostPID, reportedNamespaceID);
 };
 
+std::shared_ptr<DarlingServer::VchrootDirectoryCapability>
+DarlingServer::Server::issueVchrootCapability() {
+	return _vchrootSession->issue();
+}
+
+std::shared_ptr<DarlingServer::VchrootDirectoryCapability>
+DarlingServer::Server::adoptVchrootCapability(int descriptor) {
+	return _vchrootSession->adopt(descriptor);
+}
+
+std::shared_ptr<DarlingServer::VchrootSessionAuthority>
+DarlingServer::Server::vchrootSession() const {
+	return _vchrootSession;
+}
+
 void DarlingServer::Server::_worker(std::shared_ptr<Thread> thread) {
 	thread->doWork();
 };
@@ -948,7 +972,7 @@ void DarlingServer::Server::addMonitor(std::shared_ptr<Monitor> monitor) {
 		if (_monitors[i].get() == monitor.get()) {
 			valid = false;
 			break;
-		}
+}
 	}
 
 	if (!valid) {

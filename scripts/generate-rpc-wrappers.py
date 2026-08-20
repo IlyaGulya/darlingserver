@@ -166,6 +166,13 @@ calls = [
 		('directory_fd', '@fd'),
 	], []),
 
+	# Return a duplicate of the calling process's retained, session-bound
+	# vchroot directory.  The server owns the authoritative descriptor; the
+	# generated transport transfers only a new SCM_RIGHTS reference.
+	('vchroot_directory', [], [
+		('directory_fd', '@fd'),
+	]),
+
 	('guest_namespace_transaction', [
 		('operation', 'uint32_t'),
 		('transaction_hi', 'uint64_t'),
