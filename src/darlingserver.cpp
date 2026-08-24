@@ -45,13 +45,17 @@
 #include <darling-config.h>
 
 #include <darlingserver/server.hpp>
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+#include <darlingserver/lifecycle-bootstrap.hpp>
+#include <darlingserver/rootless-session-drain.hpp>
+#endif
 #include <darlingserver/config.hpp>
 #include <darlingserver/runtime-mode.hpp>
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 #include <darling_lifecycle_cohort.h>
-#if DARLING_LIFECYCLE_COHORT_ABI_VERSION != 3
-#error "Darlingserver requires lifecycle cohort ABI v3"
+#if DARLING_LIFECYCLE_COHORT_ABI_VERSION != 4
+#error "Darlingserver requires lifecycle cohort ABI v4"
 #endif
 #include <darlingserver/lifecycle-cohort-owner.hpp>
 #endif
@@ -95,64 +99,6 @@ static bool write_full(int fd, const void* input, size_t size) {
 	}
 	return true;
 }
-
-#ifdef DARLING_LIFECYCLE_COHORT_V1
-static bool sendRetainedDirectory(int socket, int directoryFD) {
-	char payload = 'V';
-	struct iovec iov = {&payload, sizeof(payload)};
-	char control[CMSG_SPACE(sizeof(int))] = {};
-	struct msghdr message = {};
-	message.msg_iov = &iov;
-	message.msg_iovlen = 1;
-	message.msg_control = control;
-	message.msg_controllen = sizeof(control);
-	struct cmsghdr* header = CMSG_FIRSTHDR(&message);
-	header->cmsg_level = SOL_SOCKET;
-	header->cmsg_type = SCM_RIGHTS;
-	header->cmsg_len = CMSG_LEN(sizeof(int));
-	memcpy(CMSG_DATA(header), &directoryFD, sizeof(directoryFD));
-	ssize_t result;
-	do {
-		result = sendmsg(socket, &message, MSG_NOSIGNAL);
-	} while (result < 0 && errno == EINTR);
-	return result == 1;
-}
-
-static int receiveRetainedDirectory(int socket) {
-	char payload = 0;
-	struct iovec iov = {&payload, sizeof(payload)};
-	char control[CMSG_SPACE(sizeof(int))] = {};
-	struct msghdr message = {};
-	message.msg_iov = &iov;
-	message.msg_iovlen = 1;
-	message.msg_control = control;
-	message.msg_controllen = sizeof(control);
-	ssize_t result;
-	do {
-		result = recvmsg(socket, &message, MSG_CMSG_CLOEXEC);
-	} while (result < 0 && errno == EINTR);
-	struct cmsghdr* header = CMSG_FIRSTHDR(&message);
-	int descriptor = -1;
-	if (header && header->cmsg_level == SOL_SOCKET &&
-		header->cmsg_type == SCM_RIGHTS && header->cmsg_len >= CMSG_LEN(sizeof(int)))
-		memcpy(&descriptor, CMSG_DATA(header), sizeof(descriptor));
-	if (result != 1 || payload != 'V' || (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
-		!header || CMSG_NXTHDR(&message, header) ||
-		header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
-		header->cmsg_len != CMSG_LEN(sizeof(int))) {
-		if (descriptor >= 0)
-			close(descriptor);
-		return -1;
-	}
-	struct stat status;
-	if (descriptor < 0 || fstat(descriptor, &status) != 0 || !S_ISDIR(status.st_mode)) {
-		if (descriptor >= 0)
-			close(descriptor);
-		return -1;
-	}
-	return descriptor;
-}
-#endif
 
 // TODO: most of the code here was ported over from startup/darling.c; we should C++-ify it.
 
@@ -1129,10 +1075,24 @@ int main(int argc, char** argv) {
 
 	char *opts;
 	char putOld[4096];
-	if (argc != 11) {
+	const int expectedArgumentCount = lifecycleCohortEnabled ? 12 : 11;
+	if (argc != expectedArgumentCount) {
 		fprintf(stderr, "darlingserver is not meant to be started manually\n");
 		exit(1);
 	}
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	// This must precede controller acquisition: acquisition publishes .init.pid,
+	// and shutdown may begin as soon as that identity becomes visible.
+	const int terminationMaskError =
+		DarlingServer::blockRootlessLifecycleTerminationSignals();
+	if (terminationMaskError != 0) {
+		errno = terminationMaskError;
+		fprintf(stderr, "Cannot block lifecycle termination signals: %s\n",
+			strerror(errno));
+		exit(1);
+	}
+#endif
 
 #if DSERVER_EXTENDED_DEBUG
 	if (getenv("DSERVER_WAIT4DEBUGGER")) {
@@ -1142,13 +1102,19 @@ int main(int argc, char** argv) {
 #endif
 
 	// argv[5] and argv[6] are the retained lifecycle sidecar and lock
-	// descriptors.  Keep the launcher/Dserver bootstrap layout exact: the
+	// descriptors. An ON build additionally receives the authenticated
+	// deployment-prefix descriptor in argv[7]. Keep the bootstrap layout exact: the
 	// invoking credentials and readiness pipe follow those capabilities.
-	sscanf(argv[7], "%d", &originalUID);
-	sscanf(argv[8], "%d", &originalGID);
-	sscanf(argv[9], "%d", &pipefd);
+	int credentialIndex = 7;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	const int deploymentPrefixFD = parseInheritedFD(argv[7], "deployment prefix");
+	credentialIndex = 8;
+#endif
+	sscanf(argv[credentialIndex], "%d", &originalUID);
+	sscanf(argv[credentialIndex + 1], "%d", &originalGID);
+	sscanf(argv[credentialIndex + 2], "%d", &pipefd);
 
-	if (argv[10][0] == '1') {
+	if (argv[credentialIndex + 3][0] == '1') {
 		fix_permissions = true;
 	}
 
@@ -1181,6 +1147,9 @@ int main(int argc, char** argv) {
 	const int workdirFD = runtimePrefix.workdirFD();
 	makeDescriptorCloseOnExec(prefixFD, "prefix");
 	makeDescriptorCloseOnExec(workdirFD, "prefix workdir");
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	makeDescriptorCloseOnExec(deploymentPrefixFD, "deployment prefix");
+#endif
 	prefix = prefixPath.c_str();
 	const bool rootless = DarlingServer::runtimeModeIsRootless(runtimeMode);
 
@@ -1421,7 +1390,9 @@ int main(int argc, char** argv) {
 		// lifecycle lock descriptors.
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 		if (lifecycleCohortEnabled) {
-			const int receivedVchrootFD = receiveRetainedDirectory(childWaitFDs[0]);
+			const auto childBootstrap =
+				DarlingServer::receiveLifecycleBootstrap(childWaitFDs[0]);
+			const int receivedVchrootFD = childBootstrap.directoryFD;
 			if (receivedVchrootFD < 0 ||
 				dup2(receivedVchrootFD, DARLING_GUEST_NAMESPACE_VCHROOT_FD) < 0) {
 				fprintf(stderr, "Cannot retain authenticated vchroot directory: %s\n",
@@ -1432,6 +1403,11 @@ int main(int argc, char** argv) {
 			}
 			if (receivedVchrootFD != DARLING_GUEST_NAMESPACE_VCHROOT_FD)
 				close(receivedVchrootFD);
+			if (!DarlingServer::installLifecycleEnvelope(childBootstrap.envelope)) {
+				fprintf(stderr, "Cannot install authenticated lifecycle envelope: %s\n",
+					strerror(errno));
+				exit(1);
+			}
 			if (childWaitFDs[0] != DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD &&
 				dup2(childWaitFDs[0], DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD) < 0) {
 				fprintf(stderr, "Cannot retain Rust guest namespace bootstrap: %s\n",
@@ -1478,7 +1454,7 @@ int main(int argc, char** argv) {
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (lifecycleCohortEnabled) {
 		auto* acquiredLifecycleController = darling_lifecycle_cohort_start(
-			prefixFD, prefix, getpid(), &lifecycleBootstrap);
+			prefixFD, deploymentPrefixFD, prefix, getpid(), &lifecycleBootstrap);
 		if (!lifecycleController.adopt(acquiredLifecycleController) && acquiredLifecycleController) {
 			LifecycleCohortOwner rejectedController;
 			if (!rejectedController.adopt(acquiredLifecycleController))
@@ -1502,6 +1478,9 @@ int main(int argc, char** argv) {
 		}
 		lifecycleListenerSocket = lifecycleBootstrap.darlingserver_fd;
 	}
+#endif
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	close(deploymentPrefixFD);
 #endif
 
 	// Create the server. In the routed path the listener was already bound by
@@ -1541,7 +1520,8 @@ int main(int argc, char** argv) {
 	// Tell the child to go ahead; the socket and controller transport exist.
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (lifecycleCohortEnabled) {
-		if (!sendRetainedDirectory(childWaitFDs[1], retainedVchrootDirectory) ||
+		if (!DarlingServer::sendLifecycleBootstrap(
+				childWaitFDs[1], retainedVchrootDirectory, lifecycleBootstrap) ||
 			darling_lifecycle_cohort_send_guest_namespace_bootstrap(
 				lifecycleController.get(), childWaitFDs[1]) != 0 ||
 			!write_full(pipefd, ".", 1)) {
@@ -1562,8 +1542,22 @@ int main(int argc, char** argv) {
 	// start the main loop
 	server->start();
 
-	// this should never happen
-	std::cerr << "Server exited main loop!" << std::endl;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (lifecycleCohortEnabled && rootless) {
+		const pid_t controllerWorker = darling_lifecycle_cohort_worker_pid(
+			lifecycleController.get());
+		const int drainError = DarlingServer::drainRootlessSessionChildren(
+			controllerWorker,
+			std::chrono::seconds(5), std::chrono::seconds(5));
+		if (drainError != 0) {
+			std::cerr << "Rootless lifecycle process drain requires forensic recovery: "
+				<< strerror(drainError) << std::endl;
+			for (;;)
+				pause();
+		}
+	}
+#endif
+
 	delete server;
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	const int lifecycleFinish = lifecycleController ? lifecycleController.finish() : 0;

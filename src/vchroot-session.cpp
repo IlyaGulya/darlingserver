@@ -162,14 +162,14 @@ void VchrootSessionAuthority::validateAdmission() const
 		const int authoritative = darling_lifecycle_guest_namespace_directory(_controller);
 		if (authoritative < 0)
 			throw std::system_error(ESHUTDOWN, std::generic_category(),
-				"runtime lower authority unavailable");
+				"vchroot directory authority unavailable");
 		FD retained(authoritative);
 		const auto observed = inspectDirectoryIdentity(
-			retained.fd(), "revalidate controller runtime lower");
+			retained.fd(), "revalidate controller vchroot directory");
 		if (observed.device != _directoryIdentity.device ||
 			observed.inode != _directoryIdentity.inode)
 			throw std::system_error(ESTALE, std::generic_category(),
-				"controller runtime lower identity mismatch");
+				"controller vchroot directory identity mismatch");
 #else
 		throw std::system_error(ESHUTDOWN, std::generic_category(),
 			"lifecycle controller unavailable in OFF build");

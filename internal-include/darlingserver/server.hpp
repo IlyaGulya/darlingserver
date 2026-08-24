@@ -76,6 +76,7 @@ namespace DarlingServer {
 		bool _canWrite = true;
 		int _wakeupFD;
 		int _timerFD;
+		int _terminationFD = -1;
 		uint64_t _currentTimerDeadline = 0;
 		std::mutex _timerLock;
 		std::vector<std::shared_ptr<Monitor>> _monitors;

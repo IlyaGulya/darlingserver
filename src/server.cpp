@@ -43,6 +43,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/signalfd.h>
 
 #include <darlingserver/logging.hpp>
 #include <darlingserver/metrics.hpp>
@@ -555,6 +556,19 @@ DarlingServer::Server::Server(
 	if (epoll_ctl(_epollFD, EPOLL_CTL_ADD, _timerFD, &settings) < 0) {
 		throw std::system_error(errno, std::generic_category(), "Failed to add timer descriptor to epoll context");
 	}
+	if (_lifecycleController) {
+		sigset_t terminationSignals;
+		sigemptyset(&terminationSignals);
+		sigaddset(&terminationSignals, SIGTERM);
+		sigaddset(&terminationSignals, SIGINT);
+		_terminationFD = signalfd(-1, &terminationSignals, SFD_CLOEXEC | SFD_NONBLOCK);
+		if (_terminationFD < 0)
+			throw std::system_error(errno, std::generic_category(), "Failed to create lifecycle termination descriptor");
+		settings.data.ptr = &_terminationFD;
+		settings.events = EPOLLIN;
+		if (epoll_ctl(_epollFD, EPOLL_CTL_ADD, _terminationFD, &settings) < 0)
+			throw std::system_error(errno, std::generic_category(), "Failed to monitor lifecycle termination descriptor");
+	}
 
 	// perf #0 (dar-dar6x4-perf-5dq.6): set up the stat socket. Best-effort: any failure
 	// here logs and leaves _statListenerSocket == -1; the server runs normally without it.
@@ -655,6 +669,8 @@ DarlingServer::Server::~Server() {
 	_vchrootSession->revoke();
 	close(_epollFD);
 	close(_wakeupFD);
+	if (_terminationFD >= 0)
+		close(_terminationFD);
 	close(_listenerSocket);
 	if (!_lifecycleRoutedSocket) {
 		if (unlinkat(_prefixFD, ".darlingserver.sock", 0) == -1 &&
@@ -730,7 +746,8 @@ void DarlingServer::Server::start() {
 	// perform dtape initialization that requires a microthread context
 	Thread::kernelSync(dtape_init_in_thread);
 
-	while (true) {
+	bool running = true;
+	while (running) {
 		if (_canRead) {
 			_canRead = _inbox.receiveMany(_listenerSocket);
 
@@ -859,6 +876,12 @@ void DarlingServer::Server::start() {
 
 				// dtape_timer_fired() calls duct-taped functions that may need to wait (briefly), so it needs to be called in a microthread
 				Thread::kernelAsync(dtape_timer_fired);
+			} else if (event->data.ptr == &_terminationFD) {
+				struct signalfd_siginfo signalInfo;
+				ssize_t count = read(_terminationFD, &signalInfo, sizeof(signalInfo));
+				if (count == sizeof(signalInfo) &&
+					(signalInfo.ssi_signo == SIGTERM || signalInfo.ssi_signo == SIGINT))
+					running = false;
 			} else {
 				Monitor* monitor = static_cast<Monitor*>(event->data.ptr);
 				std::shared_ptr<Monitor> aliveMonitor = nullptr;

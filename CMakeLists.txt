@@ -108,8 +108,17 @@ add_custom_target(generate_dserver_rpc_wrappers
 		${CMAKE_CURRENT_BINARY_DIR}/src/rpc.c
 )
 
+set(DARLINGSERVER_LIFECYCLE_SOURCES)
+if(DARLING_LIFECYCLE_COHORT_V1)
+	list(APPEND DARLINGSERVER_LIFECYCLE_SOURCES
+		src/lifecycle-bootstrap.cpp
+		src/rootless-session-drain.cpp
+	)
+endif()
+
 add_executable(darlingserver
 	src/darlingserver.cpp
+	${DARLINGSERVER_LIFECYCLE_SOURCES}
 	src/server.cpp
 	src/message.cpp
 	src/call.cpp
