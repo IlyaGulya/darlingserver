@@ -54,8 +54,8 @@
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 #include <darling_lifecycle_cohort.h>
-#if DARLING_LIFECYCLE_COHORT_ABI_VERSION != 4
-#error "Darlingserver requires lifecycle cohort ABI v4"
+#if DARLING_LIFECYCLE_COHORT_ABI_VERSION != 5
+#error "Darlingserver requires lifecycle cohort ABI v5"
 #endif
 #include <darlingserver/lifecycle-cohort-owner.hpp>
 #endif
@@ -1308,7 +1308,10 @@ int main(int argc, char** argv) {
 
 	// temporarily drop privileges and do some prefix work
 	temp_drop_privileges(originalUID, originalGID, rootless);
-	darlingPreInit(prefixFD);
+	// The opt-in lifecycle controller owns var/run rotation. Keep the exact
+	// legacy tmp+run wipe only when the compile-time cohort route is inactive.
+	if (!lifecycleCohortEnabled)
+		darlingPreInit(prefixFD);
 	regain_privileges(rootless);
 
 	// The routed path publishes `.init.pid` and the Darlingserver endpoint
@@ -1464,6 +1467,17 @@ int main(int argc, char** argv) {
 		if (!lifecycleController) {
 			fprintf(stderr, "Rust lifecycle controller refused session acquisition\n");
 			exit(1);
+		}
+		if (darling_lifecycle_cohort_prepare_var_run(
+				lifecycleController.get()) != 0) {
+			fprintf(stderr, "Rust controller refused generation var/run preparation\n");
+			const int recovery = lifecycleController.finish();
+			if (recovery == DARLING_LIFECYCLE_FINISH_RECOVERY_PENDING) {
+				fprintf(stderr, "Rust var/run recovery authority retained; forensic owner parked\n");
+				for (;;)
+					pause();
+			}
+			return 1;
 		}
 		if (darling_lifecycle_guest_namespace_configure(
 				lifecycleController.get()) != 0) {
