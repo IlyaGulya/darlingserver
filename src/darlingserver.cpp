@@ -41,6 +41,9 @@
 #include <sys/signal.h>
 #include <sys/socket.h>
 #include <climits>
+#include <array>
+#include <optional>
+#include <string>
 
 #include <darling-config.h>
 
@@ -54,8 +57,8 @@
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 #include <darling_lifecycle_cohort.h>
-#if DARLING_LIFECYCLE_COHORT_ABI_VERSION != 5
-#error "Darlingserver requires lifecycle cohort ABI v5"
+#if DARLING_LIFECYCLE_COHORT_ABI_VERSION != 6
+#error "Darlingserver requires lifecycle cohort ABI v6"
 #endif
 #include <darlingserver/lifecycle-cohort-owner.hpp>
 #endif
@@ -365,7 +368,7 @@ const char* xdgDirectory(const char* name)
 	return dir;
 }
 
-void setupUserHome(int prefixFD, uid_t originalUID)
+void setupUserHomeLegacy(int prefixFD, uid_t originalUID)
 {
 	char buf[4096];
 
@@ -447,6 +450,55 @@ void setupUserHome(int prefixFD, uid_t originalUID)
 	}
 	close(userFD);
 }
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+struct LifecycleUserHomePlan {
+	darling_lifecycle_user_home_plan abi = {};
+	std::string login;
+	std::array<std::optional<std::string>,
+		DARLING_LIFECYCLE_USER_HOME_LINK_COUNT> targets;
+
+	void bindPointers() {
+		abi.login = login.c_str();
+		for (size_t index = 0; index < targets.size(); ++index)
+			abi.targets[index] = targets[index] ? targets[index]->c_str() : nullptr;
+	}
+};
+
+static LifecycleUserHomePlan collectLifecycleUserHomePlan(
+	uid_t originalUID,
+	gid_t originalGID
+) {
+	LifecycleUserHomePlan result;
+	const char* home = getenv("HOME");
+	const char* login = nullptr;
+	if (struct passwd* pw = getpwuid(originalUID))
+		login = pw->pw_name;
+	if (!login)
+		login = getlogin();
+	if (!login || !home) {
+		fprintf(stderr, "Cannot determine persistent guest home inputs\n");
+		exit(1);
+	}
+	result.login = login;
+	result.targets[0] = std::string("/Volumes/SystemRoot") + home;
+	static const char* xdgNames[] = {
+		"DESKTOP", "DOWNLOAD", "PUBLICSHARE", "DOCUMENTS",
+		"MUSIC", "PICTURES", "VIDEOS",
+	};
+	for (size_t index = 0; index < std::size(xdgNames); ++index) {
+		if (const char* directory = xdgDirectory(xdgNames[index]))
+			result.targets[index + 1] =
+				std::string("/Volumes/SystemRoot") + directory;
+	}
+	result.abi.schema_version = DARLING_LIFECYCLE_USER_HOME_SCHEMA_V1;
+	result.abi.owner_uid = originalUID;
+	result.abi.owner_gid = originalGID;
+	result.abi.shared_mode = DARLING_LIFECYCLE_USER_HOME_SHARED_MODE;
+	result.abi.user_mode = DARLING_LIFECYCLE_USER_HOME_USER_MODE;
+	return result;
+}
+#endif
 
 void setupCoredumpPattern(void)
 {
@@ -1172,9 +1224,20 @@ int main(int argc, char** argv) {
 		exit(1);
 	}
 
-	// temporarily drop privileges to perform some prefix work
+	// Resolve the complete home plan before any routed mutation. OFF retains the
+	// exact legacy implementation; ON passes the immutable plan to Rust after
+	// the controller has acquired the lifecycle lease.
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	std::optional<LifecycleUserHomePlan> lifecycleUserHomePlan;
+#endif
 	temp_drop_privileges(originalUID, originalGID, rootless);
-	setupUserHome(prefixFD, originalUID);
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	lifecycleUserHomePlan.emplace(
+		collectLifecycleUserHomePlan(originalUID, originalGID));
+	lifecycleUserHomePlan->bindPointers();
+#else
+	setupUserHomeLegacy(prefixFD, originalUID);
+#endif
 	//setupCoredumpPattern();
 	regain_privileges(rootless);
 
@@ -1477,6 +1540,12 @@ int main(int argc, char** argv) {
 				for (;;)
 					pause();
 			}
+			return 1;
+		}
+		if (!lifecycleUserHomePlan ||
+			darling_lifecycle_cohort_prepare_user_home(
+				lifecycleController.get(), &lifecycleUserHomePlan->abi) != 0) {
+			fprintf(stderr, "Rust controller refused persistent guest home preparation\n");
 			return 1;
 		}
 		if (darling_lifecycle_guest_namespace_configure(
