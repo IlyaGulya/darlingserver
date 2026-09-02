@@ -199,6 +199,7 @@ if(DARLING_LIFECYCLE_COHORT_V1)
 	get_filename_component(DARLING_LIFECYCLE_CONTROLLER_CRATE "${DARLING_LIFECYCLE_CONTROLLER_CRATE}" ABSOLUTE)
 	set(DARLING_LIFECYCLE_RUST_TARGET "${CMAKE_BINARY_DIR}/lifecycle-rust-target")
 	set(DARLING_LIFECYCLE_STATICLIB "${DARLING_LIFECYCLE_RUST_TARGET}/release/libdarling_lifecycle_operation_boundary.a")
+	set(DARLING_LIFECYCLE_CONTROLLER_WORKER "${DARLING_LIFECYCLE_RUST_TARGET}/release/darling-lifecycle-controller-worker")
 	if(NOT EXISTS "${DARLING_LIFECYCLE_CONTROLLER_CRATE}/Cargo.toml")
 		message(FATAL_ERROR "DARLING_LIFECYCLE_CONTROLLER_CRATE is not a Rust crate: ${DARLING_LIFECYCLE_CONTROLLER_CRATE}")
 	endif()
@@ -214,10 +215,11 @@ if(DARLING_LIFECYCLE_COHORT_V1)
 		"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/../../tests/fixtures/rootless-controller-v1/*.json"
 	)
 	add_custom_command(
-		OUTPUT "${DARLING_LIFECYCLE_STATICLIB}"
+		OUTPUT "${DARLING_LIFECYCLE_STATICLIB}" "${DARLING_LIFECYCLE_CONTROLLER_WORKER}"
 		COMMAND "${CMAKE_COMMAND}" -E env
 			"CARGO_TARGET_DIR=${DARLING_LIFECYCLE_RUST_TARGET}"
 			"${DARLING_CARGO_EXECUTABLE}" build --locked --release --lib
+			--bin darling-lifecycle-controller-worker
 			--manifest-path "${DARLING_LIFECYCLE_CONTROLLER_CRATE}/Cargo.toml"
 		DEPENDS
 			"${DARLING_LIFECYCLE_CONTROLLER_CRATE}/Cargo.toml"
@@ -240,7 +242,9 @@ if(DARLING_LIFECYCLE_COHORT_V1)
 		VERBATIM
 		COMMENT "Building Rust lifecycle cohort authority"
 	)
-	add_custom_target(darling_lifecycle_cohort_rust DEPENDS "${DARLING_LIFECYCLE_STATICLIB}")
+	add_custom_target(darling_lifecycle_cohort_rust DEPENDS
+		"${DARLING_LIFECYCLE_STATICLIB}"
+		"${DARLING_LIFECYCLE_CONTROLLER_WORKER}")
 	add_library(darling_lifecycle_cohort STATIC IMPORTED GLOBAL)
 	set_target_properties(darling_lifecycle_cohort PROPERTIES IMPORTED_LOCATION "${DARLING_LIFECYCLE_STATICLIB}")
 	add_dependencies(darling_lifecycle_cohort darling_lifecycle_cohort_rust)
@@ -248,6 +252,7 @@ if(DARLING_LIFECYCLE_COHORT_V1)
 	target_include_directories(darlingserver PRIVATE "${DARLING_LIFECYCLE_CONTROLLER_CRATE}/include")
 	target_compile_definitions(darlingserver PRIVATE DARLING_LIFECYCLE_COHORT_V1=1)
 	target_link_libraries(darlingserver PRIVATE darling_lifecycle_cohort dl m rt)
+	install(PROGRAMS "${DARLING_LIFECYCLE_CONTROLLER_WORKER}" DESTINATION libexec)
 endif()
 
 target_compile_options(darlingserver PRIVATE
